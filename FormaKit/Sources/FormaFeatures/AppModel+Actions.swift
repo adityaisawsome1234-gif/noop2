@@ -21,8 +21,9 @@ extension AppModel {
         let session = Session(kind: .sleep, range: range, origin: .manual, deviceID: selectedDevice?.id,
                               createdAt: timeSource.now(), updatedAt: timeSource.now())
         do {
-            _ = try store.insertSession(session)
-            _ = try store.invalidateDerived(overlapping: range)
+            let id = try store.insertSession(session)
+            try supersedeCandidates(overlapping: range, keeping: id, in: store)
+            invalidateDerived(in: store, overlapping: range)
         } catch { alertMessage = "Saving the sleep window failed: \(error)" }
         await refreshNow()
     }
@@ -46,7 +47,7 @@ extension AppModel {
         guard let store, let id = session.id else { return }
         do {
             let affected = try store.softDeleteSession(id: id)
-            _ = try store.invalidateDerived(overlapping: affected)
+            invalidateDerived(in: store, overlapping: affected)
         } catch { alertMessage = "Updating the sleep window failed: \(error)" }
         await refreshNow()
     }
@@ -55,9 +56,21 @@ extension AppModel {
         guard let store else { return }
         do {
             let affected = try store.updateSession(session)
-            _ = try store.invalidateDerived(overlapping: affected)
+            if session.isConfirmed { try supersedeCandidates(overlapping: session.range, keeping: session.id, in: store) }
+            invalidateDerived(in: store, overlapping: affected)
         } catch { alertMessage = "Saving the change failed: \(error)" }
         await refreshNow()
+    }
+
+    /// Once the user has a confirmed window for a night, a detected candidate overlapping it is
+    /// superseded (soft-deleted, so it is neither offered for review nor proposed again, and cannot be
+    /// confirmed on top of the user's own window and counted twice).
+    func supersedeCandidates(overlapping range: TimeRange, keeping id: Int64?, in store: FormaStore) throws {
+        let candidates = try store.sessions(kind: .sleep, in: range, includeCandidates: true, includeDeleted: false)
+            .filter { $0.origin == .detectedCandidate && $0.id != id && $0.range.overlaps(range) }
+        for candidate in candidates {
+            if let candidateID = candidate.id { _ = try store.softDeleteSession(id: candidateID) }
+        }
     }
 
     // MARK: Workouts
@@ -86,8 +99,9 @@ extension AppModel {
     }
 
     func updateLiveWorkout() {
-        guard let start = liveWorkoutStart, let ctx = loaderContext() else { return }
-        let live = ScreenLoader.liveWorkout(ctx, start: start, recentSamples: liveWorkoutSamples, sourceLabel: lastLiveSource?.description)
+        guard let start = liveWorkoutStart, let ctx = loaderContext(resolveHistoryValidation: false) else { return }
+        let live = ScreenLoader.liveWorkout(ctx, start: start, recentSamples: liveWorkoutSamples, sourceLabel: lastLiveSource?.description,
+                                            overnightRestingHeartRate: overnightRestingHeartRate)
         if var a = activity {
             a.live = live
             activity = a
@@ -98,38 +112,66 @@ extension AppModel {
 
     // MARK: Demo mode
 
+    /// Demo data is older than this after a while in Demo mode (or across launches); it is then
+    /// generated again so the demo always ends "now".
+    static let demoDataMaxAgeMillis: Int64 = 6 * 3_600_000
+
     public func enterDemo() async {
+        if liveWorkoutStart != nil { await stopWorkout(save: true) }
         stopEngine()
         central.disconnect()
         isDemo = true
         platform.setPreference("1", forKey: "demo")
+        beginNewDataContext()
         connection = ConnectionSummary(isDemo: true)
         openDemoStore()
-        if let demo = demoStore, (try? demo.dataBounds()) == nil {
-            let output = DemoDataGenerator(end: timeSource.now(), calendar: calendar).generate()
+        await prepareDemoData()
+        await refreshNow()
+    }
+
+    /// Generates the demo data (a few seconds of work) off the main actor when the demo store is empty or
+    /// its data has gone stale.
+    func prepareDemoData() async {
+        guard let demo = demoStore, !isPreparingDemo else { return }
+        isPreparingDemo = true
+        defer { isPreparingDemo = false }
+        let end = timeSource.now()
+        let calendar = self.calendar
+        let maxAge = Self.demoDataMaxAgeMillis
+        let failure: String? = await Task.detached(priority: .userInitiated) { () -> String? in
             do {
+                if let bounds = try demo.dataBounds() {
+                    if bounds.end > end - maxAge { return nil }
+                    try demo.deleteAllData(keepSettings: false)
+                }
+                let output = DemoDataGenerator(end: end, calendar: calendar).generate()
                 try demo.upsertDevice(output.device)
                 for b in output.batches { _ = try demo.ingest(b) }
                 for s in output.sessions { _ = try demo.insertSession(s) }
-            } catch { alertMessage = "Creating demo data failed: \(error)" }
-        }
-        await refreshNow()
+                return nil
+            } catch {
+                return "Creating demo data failed: \(error)"
+            }
+        }.value
+        if let failure { alertMessage = failure }
     }
 
     public func exitDemo() async {
         isDemo = false
         platform.setPreference("0", forKey: "demo")
+        beginNewDataContext()
         connection = ConnectionSummary(deviceName: selectedDevice?.name, family: selectedDevice?.family,
-                                       link: selectedDevice == nil ? .noDeviceSelected : .searching, isDemo: false)
+                                       link: idleLinkState(), isDemo: false)
         if collectionEnabled, selectedDevice != nil { central.connectSelected(profile: Self.connectionProfile) }
         await refreshNow()
     }
 
     // MARK: Export, import, delete
 
-    /// CSV files for every table, archived (zip on iOS). Returns the archive bytes for a user-chosen destination.
+    /// CSV files for every table of the user's own (live) data, archived (zip on iOS). Demo data is never
+    /// exported. Returns the archive bytes for a user-chosen destination.
     public func exportCSVArchive() async throws -> Data {
-        guard let store else { throw AppModelError.storeUnavailable }
+        guard let store = liveStore else { throw AppModelError.storeUnavailable }
         let platform = self.platform
         return try await Task.detached {
             let dir = try platform.makeStagingDirectory()
@@ -139,9 +181,10 @@ extension AppModel {
         }.value
     }
 
-    /// Versioned NDJSON backup of everything in the active store.
+    /// Versioned NDJSON backup of the user's own (live) data. Demo data is never exported, also not while
+    /// Demo mode is showing, so a backup can always be trusted to hold real records.
     public func exportBackup() async throws -> Data {
-        guard let store else { throw AppModelError.storeUnavailable }
+        guard let store = liveStore else { throw AppModelError.storeUnavailable }
         let platform = self.platform
         return try await Task.detached {
             let dir = try platform.makeStagingDirectory()
@@ -153,6 +196,12 @@ extension AppModel {
     }
 
     /// Imports a backup into the live store and returns a human-readable report.
+    ///
+    /// - A file containing demo records is refused as a whole: demo data never mixes with live data.
+    /// - Per-phone choices in the backup (history sync, unvalidated motion, field-validation verdicts) are
+    ///   never applied: history sync stays opt-in on this iPhone.
+    /// - Other settings the backup adds (profile, zone method, readiness) take effect immediately, and
+    ///   cached values they or the new records affect are recomputed.
     public func importBackup(from url: URL) async -> String {
         guard let store = liveStore else { return "The database is not open." }
         #if canImport(Darwin)
@@ -160,41 +209,108 @@ extension AppModel {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         #endif
         do {
+            if try await Task.detached(operation: { try BackupInspector.containsDemoData(at: url) }).value {
+                return "This file contains Forma demo data. Demo data is never added to your own records, so nothing was imported."
+            }
+            let keysBefore = Set(try store.allSettings().keys)
             let report = try await Task.detached { try store.importBackup(from: url) }.value
-            if let range = report.importedRange { _ = try? store.invalidateDerived(overlapping: range) }
+            var withheld = 0
+            for key in try store.allSettings().keys where !keysBefore.contains(key) && SettingKey.isPerPhoneChoice(key) {
+                if try store.removeSetting(forKey: key) { withheld += 1 }
+            }
+            let settingsAdded = (report.inserted[.setting] ?? 0) > withheld
+            if settingsAdded {
+                invalidateAllDerived()
+            } else if let range = report.importedRange {
+                invalidateDerived(in: store, overlapping: Self.affectedByRecords(in: range))
+            }
+            loadSettingsFromStore()
+            await engine?.setOptions(syncOptions())
             await refreshNow()
-            var text = "Imported \(report.totalInserted) records; \(report.totalDuplicates) were already present."
+            var text = "Imported \(report.totalInserted - withheld) records; \(report.totalDuplicates) were already present."
             if report.invalidLines > 0 { text += " \(report.invalidLines) invalid lines were skipped." }
             if !report.cursorsNotApplied.isEmpty { text += " Sync positions from the backup were not applied to your band." }
+            if withheld > 0 {
+                text += " History sync, unvalidated-motion and field-validation choices in the backup were not applied; they are made on each iPhone."
+            }
             return text
         } catch {
             return "Import failed: \(error)"
         }
     }
 
-    /// Erases every table of the active store and removes its files; reopens an empty store.
+    /// Erases everything Forma stores on this iPhone — the live and the demo database files, the raw
+    /// capture and the connection history — then starts with an empty database. Demo mode ends. The
+    /// selected band stays selected (its identity only; Forget band removes it).
     public func deleteAllData() async -> String {
-        stopEngine()
-        do {
-            if isDemo {
-                try demoStore?.deleteAllData(keepSettings: false)
-            } else {
-                try liveStore?.deleteAllData(keepSettings: false)
-                if let path = liveStore?.path {
-                    liveStore?.close()
-                    liveStore = nil
-                    try FormaStore.destroyDatabaseFiles(at: path)
-                }
-                recorder.clear()
-                openStores()
-                loadSettingsFromStore()
-                if collectionEnabled, selectedDevice != nil { central.connectSelected(profile: Self.connectionProfile) }
-            }
-        } catch {
-            return "Deleting failed: \(error)"
+        if liveWorkoutStart != nil {
+            liveWorkoutStart = nil
+            liveWorkoutSamples.removeAll()
+            startTicking()
         }
+        stopEngine()
+        beginNewDataContext()
+        let wasDemo = isDemo
+        var problems: [String] = []
+        let livePath = liveStore?.path ?? ((try? platform.databasePath(demo: false)) ?? nil)
+        let demoPath = demoStore?.path ?? ((try? platform.databasePath(demo: true)) ?? nil)
+        let liveWasUnopenable = liveStore == nil && livePath.map { FileManager.default.fileExists(atPath: $0) } == true
+        // Close both stores and remove their files (an in-memory store is discarded by closing it).
+        liveStore?.close()
+        liveStore = nil
+        demoStore?.close()
+        demoStore = nil
+        var undeletedFiles: [String] = []
+        for path in [livePath, demoPath].compactMap({ $0 }) {
+            do { try FormaStore.destroyDatabaseFiles(at: path) } catch { undeletedFiles.append(path) }
+        }
+        // Nothing from before survives in memory either.
+        recorder.clear()
+        connectionEvents = []
+        countersBase = DiagnosticsCounters()
+        diagnostics = DiagnosticsState(services: diagnostics.services, advertisement: diagnostics.advertisement,
+                                       firmware: diagnostics.firmware, adapterID: diagnostics.adapterID,
+                                       parserVersion: diagnostics.parserVersion)
+        historyRunRange = nil
+        historyChunksAcknowledged = 0
+        autoValidationPending = false
+        lastLiveUpdateAt = nil
+        isDemo = false
+        platform.setPreference("0", forKey: "demo")
+        openStores()
+        if liveStore == nil { problems.append("a new database could not be created") }
+        // Files that could not be removed are emptied instead.
+        for path in undeletedFiles {
+            let store: FormaStore? = path == livePath ? liveStore : (try? FormaStore(path: path, timeSource: timeSource))
+            let erased: Bool
+            if let store {
+                erased = await Task.detached { (try? store.deleteAllData(keepSettings: false)) != nil }.value
+                if path != livePath { store.close() }
+            } else {
+                erased = false
+            }
+            if !erased { problems.append("\(URL(fileURLWithPath: path).lastPathComponent) could not be removed") }
+        }
+        // Settings are read only now that every store is empty (history sync is off again, and so on).
+        loadSettingsFromStore()
+        if let device = selectedDevice {
+            // Keep the selection itself (no measurements) so the band is still recognised after a relaunch.
+            try? liveStore?.upsertDevice(DeviceRecord(id: device.id, family: device.family, name: device.name,
+                                                      firmwareVersion: device.firmwareVersion, hardwareRevision: device.hardwareRevision,
+                                                      firstSeen: timeSource.now()))
+        }
+        connection = ConnectionSummary(deviceName: selectedDevice?.name, family: selectedDevice?.family, link: idleLinkState(),
+                                       isDemo: false)
+        if collectionEnabled, selectedDevice != nil { central.connectSelected(profile: Self.connectionProfile) }
         await refreshNow()
-        return "All Forma data on this iPhone was deleted."
+        guard problems.isEmpty else {
+            return "Deleting did not finish: " + problems.joined(separator: "; ") + "."
+        }
+        let demoNote = wasDemo ? " Demo mode was turned off." : ""
+        if liveWasUnopenable {
+            return "Forma's database could not be opened, so its files were removed and a new, empty database was created.\(demoNote)"
+        }
+        return "All Forma data on this iPhone was deleted.\(demoNote)"
     }
 
     // MARK: Connection history

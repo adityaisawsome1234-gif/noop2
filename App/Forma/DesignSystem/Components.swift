@@ -137,15 +137,23 @@ struct MetricTile: View {
     var confidence: Confidence = .none
     var footnote: String? = nil
     var onExplain: (() -> Void)? = nil
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
-            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.xs) {
-                Text(title)
-                    .font(Theme.Typeface.label)
-                    .foregroundStyle(Theme.textSecondary)
-                Spacer(minLength: Theme.Space.xxs)
-                StatusTag(status: status)
+            // At accessibility text sizes the title gets the full width and the tag goes below it, so
+            // neither wraps mid-word in narrow tiles.
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: Theme.Space.xxs) {
+                    titleText
+                    StatusTag(status: status)
+                }
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: Theme.Space.xs) {
+                    titleText
+                    Spacer(minLength: Theme.Space.xxs)
+                    StatusTag(status: status)
+                }
             }
             if let valueText, availability.isAvailable {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -170,13 +178,16 @@ struct MetricTile: View {
                     .foregroundStyle(Theme.textSecondary)
             }
             if let onExplain {
-                Button("How this is calculated", action: onExplain)
-                    .font(Theme.Typeface.caption)
-                    .foregroundStyle(Theme.accent)
-                    .buttonStyle(.borderless)
+                ExplainButton(subject: title, action: onExplain)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var titleText: some View {
+        Text(title)
+            .font(Theme.Typeface.label)
+            .foregroundStyle(Theme.textSecondary)
     }
 
     private var spokenUnit: String {
@@ -230,8 +241,7 @@ struct StateMessage: View {
                 .fixedSize(horizontal: false, vertical: true)
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
-                    .tint(Theme.accent)
+                    .buttonStyle(.formaProminent)
             }
         }
         .padding(Theme.Space.m)
@@ -301,9 +311,36 @@ struct ConnectionControl: View {
     }
 }
 
+extension BluetoothUnavailableReason {
+    /// Plain-language status line ("Bluetooth is off"), instead of the raw state name.
+    var statusLine: String {
+        switch self {
+        case .poweredOff: return "Bluetooth is off"
+        case .unauthorized: return "Bluetooth permission is off for Forma"
+        case .unsupported: return "This iPhone does not support Bluetooth Low Energy"
+        default: return "Bluetooth is starting"
+        }
+    }
+}
+
+extension ConnectionSummary {
+    /// The model's three status lines (link, last device sample, last sync), with the Bluetooth state in
+    /// plain language.
+    func displayLines(now: EpochMillis, calendar: Calendar) -> [String] {
+        var lines = detailLines(now: now, formatter: RelativeTimeFormatter(calendar: calendar))
+        if case .bluetoothUnavailable(let reason) = link, !lines.isEmpty {
+            lines[0] = reason.statusLine
+        }
+        return lines
+    }
+}
+
 // MARK: - Coverage bar
 
 /// Horizontal bar showing which parts of a window are recorded, pending sync, or unavailable.
+///
+/// Colour is never the only signal: the three states also differ in height (full bar, half bar, thin
+/// line), which survives grayscale and colour-blindness, and every mark is ≥ 5:1 against the card.
 struct CoverageBar: View {
     struct Segment: Identifiable, Hashable {
         enum Kind: Hashable { case recorded, pendingSync, notRecorded }
@@ -316,29 +353,38 @@ struct CoverageBar: View {
     let segments: [Segment]
     let accessibilitySummary: String
 
+    static let height: CGFloat = 12
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Theme.surfaceMuted)
                 ForEach(segments) { s in
                     Rectangle()
-                        .fill(color(s.kind))
-                        .frame(width: max(1, geo.size.width * (s.fractionEnd - s.fractionStart)))
+                        .fill(Self.color(s.kind))
+                        .frame(width: max(1, geo.size.width * (s.fractionEnd - s.fractionStart)), height: Self.markHeight(s.kind))
                         .offset(x: geo.size.width * s.fractionStart)
                 }
             }
-            .clipShape(Capsule())
+            .frame(width: geo.size.width, height: Self.height, alignment: .leading)
         }
-        .frame(height: 8)
+        .frame(height: Self.height)
         .accessibilityElement()
         .accessibilityLabel(accessibilitySummary)
     }
 
-    private func color(_ kind: Segment.Kind) -> Color {
+    static func markHeight(_ kind: Segment.Kind) -> CGFloat {
+        switch kind {
+        case .recorded: return height
+        case .pendingSync: return height / 2
+        case .notRecorded: return 2
+        }
+    }
+
+    static func color(_ kind: Segment.Kind) -> Color {
         switch kind {
         case .recorded: return Theme.accent
         case .pendingSync: return Theme.caution
-        case .notRecorded: return Theme.border
+        case .notRecorded: return Theme.textSecondary
         }
     }
 }
@@ -367,5 +413,150 @@ struct Page<Content: View>: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             if isDemo { DemoBanner() }
         }
+    }
+}
+
+// MARK: - Buttons
+
+/// Filled accent button for a screen's primary action. The label uses `Theme.onAccent`, which stays
+/// ≥ 5.9:1 on the accent fill in light, dark and increased-contrast modes (`.borderedProminent` draws a
+/// white label, which is only 2.2:1 on the light dark-mode accent).
+struct FormaProminentButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.body.weight(.semibold))
+            .foregroundStyle(Theme.onAccent)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, Theme.Space.m)
+            .padding(.vertical, Theme.Space.xs)
+            .frame(minHeight: 44)
+            .background(Theme.accent, in: RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
+    }
+}
+
+extension ButtonStyle where Self == FormaProminentButtonStyle {
+    /// Forma's filled primary-action style (see `FormaProminentButtonStyle`).
+    static var formaProminent: FormaProminentButtonStyle { FormaProminentButtonStyle() }
+}
+
+/// A small text-only action (footnote size) whose tap area is still at least 44 pt tall.
+struct InlineButton: View {
+    let title: String
+    var accessibilityTitle: String? = nil
+    var tint: Color = Theme.accent
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(Theme.Typeface.caption)
+                .foregroundStyle(tint)
+                .multilineTextAlignment(.leading)
+                .frame(minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(accessibilityTitle ?? title)
+    }
+}
+
+/// "How this is calculated", named after the metric for VoiceOver (a screen has many of these).
+struct ExplainButton: View {
+    var title = "How this is calculated"
+    let subject: String
+    let action: () -> Void
+
+    var body: some View {
+        InlineButton(title: title, accessibilityTitle: "How \(subject) is calculated", action: action)
+    }
+}
+
+// MARK: - Loading and problems
+
+/// Placeholder while a screen's data is computed. If nothing has arrived after a while (a load that
+/// failed or a database that could not be opened), it says so and offers a retry instead of spinning
+/// forever.
+struct LoadingPlaceholder: View {
+    let retry: () async -> Void
+    @State private var slow = false
+
+    var body: some View {
+        Group {
+            if slow {
+                StateMessage(systemImage: "exclamationmark.triangle",
+                             title: "Your data has not loaded",
+                             message: "Loading is taking much longer than usual, or it failed; if Forma reported a problem, the reason was shown in a message. Try again. If this keeps happening, close Forma in the app switcher and open it again.",
+                             actionTitle: "Try again",
+                             action: { Task { await retry() } })
+            } else {
+                ProgressView("Loading")
+                    .frame(maxWidth: .infinity, minHeight: 200)
+            }
+        }
+        .task {
+            // Cancelled (and never marked slow) when the data arrives and this placeholder goes away.
+            do {
+                try await Task.sleep(nanoseconds: 15_000_000_000)
+                slow = true
+            } catch {}
+        }
+    }
+}
+
+/// Explains why Bluetooth cannot be used and what to do about it.
+struct BluetoothProblemMessage: View {
+    let reason: BluetoothUnavailableReason
+
+    var body: some View {
+        StateMessage(systemImage: "exclamationmark.triangle", title: title, message: message)
+    }
+
+    private var title: String {
+        switch reason {
+        case .poweredOff: return "Bluetooth is off"
+        case .unauthorized: return "Bluetooth permission is off"
+        case .unsupported: return "Bluetooth is not supported"
+        default: return "Bluetooth is not ready"
+        }
+    }
+
+    private var message: String {
+        switch reason {
+        case .poweredOff:
+            return "Turn on Bluetooth in Control Center or Settings. Forma reconnects to your band once Bluetooth is back on."
+        case .unauthorized:
+            return "Forma needs Bluetooth permission to read your band. Turn it on in Settings → Privacy & Security → Bluetooth → Forma."
+        case .unsupported:
+            return "This iPhone cannot connect to Bluetooth Low Energy devices."
+        default:
+            return "iOS is still starting Bluetooth. This usually takes a moment."
+        }
+    }
+}
+
+// MARK: - Alerts
+
+extension View {
+    /// Presents the app model's messages (errors and guidance) from this presentation. SwiftUI shows an
+    /// alert only from the presentation on top, so every sheet root attaches its own, and the root's is
+    /// inactive while a sheet is up — otherwise a message raised inside a sheet (pairing guidance, a failed
+    /// save) would not appear until the sheet closed.
+    func modelAlert(_ model: AppModel, isActive: Bool = true) -> some View {
+        alert("Forma", isPresented: Binding(get: { isActive && model.alertMessage != nil },
+                                            set: { if !$0 { model.alertMessage = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.alertMessage ?? "")
+        }
+    }
+
+    /// Lists and forms use Forma's warm page background instead of the system grouped background.
+    func formaListBackground() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Theme.background)
     }
 }

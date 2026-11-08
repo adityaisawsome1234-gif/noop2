@@ -61,6 +61,7 @@ public struct EnvironmentValues {
     public var dismiss: DismissAction { DismissAction() }
     public var scenePhase: ScenePhase { .active }
     public var dynamicTypeSize: DynamicTypeSize { get { .large } set {} }
+    public var isEnabled: Bool { get { true } set {} }
 }
 @propertyWrapper public struct Environment<Value> {
     public init(_ kp: KeyPath<EnvironmentValues, Value>) {}
@@ -84,7 +85,8 @@ public enum UIKeyboardType { case `default`, numberPad, decimalPad }
 public enum ButtonRole { case destructive, cancel }
 public struct PresentationDetent: Hashable { public static let medium = Self(), large = Self() }
 public struct AccessibilityTraits: OptionSet { public let rawValue: Int; public init(rawValue: Int) { self.rawValue = rawValue }
-    public static let isHeader = Self(rawValue: 1), isSelected = Self(rawValue: 2), isStaticText = Self(rawValue: 4), isButton = Self(rawValue: 8) }
+    public static let isHeader = Self(rawValue: 1), isSelected = Self(rawValue: 2), isStaticText = Self(rawValue: 4), isButton = Self(rawValue: 8),
+                      isModal = Self(rawValue: 16) }
 public struct AccessibilityChildBehavior { public static let ignore = Self(), combine = Self(), contain = Self() }
 public struct NavigationBarItem { public enum TitleDisplayMode { case automatic, inline, large } }
 public struct ToolbarItemPlacement { public static let topBarTrailing = Self(), topBarLeading = Self(), confirmationAction = Self(), cancellationAction = Self() }
@@ -93,7 +95,7 @@ public struct DatePickerComponents: OptionSet { public let rawValue: Int; public
 public struct StrokeStyle { public init(lineWidth: CGFloat = 1) {} }
 
 // MARK: Fonts & colors
-public struct Font: Hashable {
+public struct Font: Hashable, Sendable {
     public enum TextStyle { case largeTitle, title, title2, title3, headline, subheadline, body, callout, footnote, caption, caption2 }
     public enum Design { case `default`, rounded, monospaced, serif }
     public struct Weight: Hashable { public static let regular = Self(), medium = Self(), semibold = Self(), bold = Self() }
@@ -105,11 +107,14 @@ public struct Font: Hashable {
     public func monospaced() -> Font { self }
 }
 public protocol ShapeStyle {}
-public struct Color: View, ShapeStyle, Hashable {
+// As in the real SDK: Sendable, with the View conformance in an extension (so `init(_: UIColor)` is not
+// main-actor isolated).
+public struct Color: Hashable, Sendable, ShapeStyle {
     public init(_ ui: UIColor) {}
     public static let clear = Color(UIColor(red: 0, green: 0, blue: 0, alpha: 0))
-    public var body: Never { fatalError() }
+    public func opacity(_ opacity: Double) -> Color { self }
 }
+extension Color: View { public var body: Never { fatalError() } }
 
 // MARK: Shapes
 public protocol Shape: View {}
@@ -189,6 +194,17 @@ public struct GeometryReader<C: View>: View { public init(@ViewBuilder content: 
 public struct ToolbarItem<C: View>: View { public init(placement: ToolbarItemPlacement, @ViewBuilder content: () -> C) {}; public var body: Never { fatalError() } }
 
 // MARK: Button & picker styles
+@MainActor @preconcurrency public protocol ButtonStyle {
+    associatedtype Body: View
+    @ViewBuilder @MainActor func makeBody(configuration: Self.Configuration) -> Self.Body
+    typealias Configuration = ButtonStyleConfiguration
+}
+public struct ButtonStyleConfiguration {
+    public struct Label: View { public var body: Never { fatalError() } }
+    public let role: ButtonRole?
+    public let label: ButtonStyleConfiguration.Label
+    public let isPressed: Bool
+}
 public protocol PrimitiveButtonStyle {}
 public struct BorderedProminentButtonStyle: PrimitiveButtonStyle {}
 public struct BorderedButtonStyle: PrimitiveButtonStyle {}
@@ -229,6 +245,10 @@ extension View {
     public func padding() -> some View { ModifiedView<Self>() }
     public func environment<O: AnyObject & Observable>(_ o: O?) -> some View { ModifiedView<Self>() }
     public func buttonStyle<S: PrimitiveButtonStyle>(_ s: S) -> some View { ModifiedView<Self>() }
+    public func buttonStyle<S: ButtonStyle>(_ s: S) -> some View { ModifiedView<Self>() }
+    public func opacity(_ o: Double) -> some View { ModifiedView<Self>() }
+    public func contentShape<S: Shape>(_ s: S) -> some View { ModifiedView<Self>() }
+    public func scrollContentBackground(_ v: Visibility) -> some View { ModifiedView<Self>() }
     public func navigationTitle<S: StringProtocol>(_ s: S) -> some View { ModifiedView<Self>() }
     public func accessibilityElement(children: AccessibilityChildBehavior = .ignore) -> some View { ModifiedView<Self>() }
     public func tag<V: Hashable>(_ v: V) -> some View { ModifiedView<Self>() }
@@ -269,4 +289,9 @@ extension View {
     public func onDisappear(perform: (() -> Void)? = nil) -> some View { ModifiedView<Self>() }
     public func toolbar<C: View>(@ViewBuilder content: () -> C) -> some View { ModifiedView<Self>() }
     public func monospacedDigit() -> some View { ModifiedView<Self>() }
+}
+
+// MARK: UIKit hosting
+@MainActor @preconcurrency open class UIHostingController<Content: View>: UIViewController {
+    public init(rootView: Content) { super.init() }
 }

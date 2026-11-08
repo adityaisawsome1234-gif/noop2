@@ -98,14 +98,19 @@ public struct CoverageTimeline: Hashable, Sendable {
         return Double(total) / Double(window.durationMillis)
     }
 
-    /// One-sentence summary for VoiceOver and captions.
+    /// One-sentence summary for VoiceOver and captions. Shares are rounded down, so "100% recorded"
+    /// always means there is no gap at all, and any non-zero share below 1% reads "<1%" instead of
+    /// disappearing.
     public var accessibilitySummary: String {
-        let rec = Int((fraction(of: .recorded) * 100).rounded())
-        let pend = Int((fraction(of: .pendingSync) * 100).rounded())
-        let none = Int((fraction(of: .notRecorded) * 100).rounded())
-        var parts = ["\(rec)% recorded"]
-        if pend > 0 { parts.append("\(pend)% waiting to sync from the band") }
-        if none > 0 { parts.append("\(none)% not recorded") }
+        func share(_ state: State) -> String? {
+            let f = fraction(of: state)
+            guard f > 0 else { return nil }
+            let whole = (f * 100 + 1e-9).rounded(.down)
+            return whole < 1 ? "<1%" : "\(Int(whole))%"
+        }
+        var parts = ["\(share(.recorded) ?? "0%") recorded"]
+        if let pend = share(.pendingSync) { parts.append("\(pend) waiting to sync from the band") }
+        if let none = share(.notRecorded) { parts.append("\(none) not recorded") }
         return parts.joined(separator: ", ")
     }
 }

@@ -1,11 +1,13 @@
 import SwiftUI
 import FormaCore
+import FormaAnalytics
 import FormaFeatures
 
 struct SleepView: View {
     @Environment(AppModel.self) private var model
     @State private var editing: EditTarget?
     @State private var explainedMetricID: String?
+    @State private var deleting: Session?
 
     enum EditTarget: Identifiable {
         case new
@@ -25,7 +27,7 @@ struct SleepView: View {
                 if let state = model.sleep {
                     content(state)
                 } else {
-                    ProgressView("Loading").frame(maxWidth: .infinity, minHeight: 200)
+                    LoadingPlaceholder { await model.refreshNow() }
                 }
             }
             .navigationTitle("Sleep")
@@ -52,6 +54,17 @@ struct SleepView: View {
             .sheet(item: Binding(get: { explainedMetricID.map(IdentifiedString.init) },
                                  set: { explainedMetricID = $0?.value })) { item in
                 MethodologyDetailSheet(specID: item.value)
+            }
+            .confirmationDialog("Delete this sleep window?",
+                                isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                                titleVisibility: .visible) {
+                Button("Delete window", role: .destructive) {
+                    if let session = deleting { Task { await model.rejectSleep(session) } }
+                    deleting = nil
+                }
+                Button("Cancel", role: .cancel) { deleting = nil }
+            } message: {
+                Text("Overnight heart rate, HRV, sleep and readiness values are recalculated without it. Heart-rate samples are not deleted.")
             }
         }
     }
@@ -81,6 +94,7 @@ struct SleepView: View {
                           onConfirm: { Task { await model.confirmSleep(night.session) } },
                           onAdjust: { editing = .existing(night.session) },
                           onReject: { Task { await model.rejectSleep(night.session) } },
+                          onDelete: { deleting = night.session },
                           onExplain: { explainedMetricID = $0 })
             }
         }
@@ -94,7 +108,9 @@ struct NightCard: View {
     let onConfirm: () -> Void
     let onAdjust: () -> Void
     let onReject: () -> Void
+    let onDelete: () -> Void
     let onExplain: (String) -> Void
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         Card(DisplayFormat.dayLabel(LocalDay(night.session.range.end, calendar: calendar), calendar: calendar),
@@ -108,38 +124,79 @@ struct NightCard: View {
                     .foregroundStyle(Theme.textSecondary)
             }
             if night.isCandidate {
-                Text("Detected candidate\(night.session.confidence.map { " (confidence \(DisplayFormat.percent($0)))" } ?? ""). Not counted until you confirm it.")
+                Text(candidateText)
                     .font(Theme.Typeface.caption)
                     .foregroundStyle(Theme.caution)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button("Confirm", action: onConfirm).buttonStyle(.borderedProminent).tint(Theme.accent)
-                    Button("Adjust", action: onAdjust).buttonStyle(.bordered).tint(Theme.accent)
-                    Button("Not sleep", role: .destructive, action: onReject).buttonStyle(.bordered)
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: Theme.Space.xs) { candidateButtons }
+                } else {
+                    HStack { candidateButtons }
                 }
             } else {
-                Button("Adjust window", action: onAdjust)
-                    .font(Theme.Typeface.caption)
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(Theme.accent)
+                HStack(spacing: Theme.Space.l) {
+                    InlineButton(title: "Adjust window", action: onAdjust)
+                    InlineButton(title: "Delete window", tint: Theme.critical, action: onDelete)
+                }
             }
-            SeriesChart(series: night.heartRate, highlight: night.wakeBouts, highlightLabel: "Wake bout", height: 140)
+            SeriesChart(series: night.heartRate, title: "Overnight heart rate", highlight: night.wakeBouts,
+                        highlightLabel: "Wake bout", height: 140)
             CoverageBar(segments: CoverageSegments.make(night.coverage), accessibilitySummary: night.coverage.accessibilitySummary)
             Text(night.coverage.accessibilitySummary)
                 .font(Theme.Typeface.caption)
                 .foregroundStyle(Theme.textSecondary)
             Divider().overlay(Theme.border)
-            Grid(alignment: .leading, horizontalSpacing: Theme.Space.m, verticalSpacing: Theme.Space.s) {
-                GridRow {
-                    metric("Sleep estimate", night.sleepEstimate, unit: "h", digits: 1, status: .estimate)
-                    metric("Continuity", night.continuity, unit: "%", digits: 0, status: .estimate, asPercent: true)
+            if dynamicTypeSize.isAccessibilitySize {
+                // One tile per row: two tiles side by side leave too little width at these text sizes.
+                VStack(alignment: .leading, spacing: Theme.Space.s) {
+                    sleepTile
+                    continuityTile
+                    restingTile
+                    hrvTile
                 }
-                GridRow {
-                    metric("Resting HR", night.restingHR, unit: "bpm", digits: 0, status: .estimate)
-                    metric("HRV (RMSSD)", night.hrv, unit: "ms", digits: 0, status: .estimate)
+            } else {
+                Grid(alignment: .leading, horizontalSpacing: Theme.Space.m, verticalSpacing: Theme.Space.s) {
+                    GridRow {
+                        sleepTile
+                        continuityTile
+                    }
+                    GridRow {
+                        restingTile
+                        hrvTile
+                    }
                 }
             }
         }
+    }
+
+    /// The detector's confidence as the level its specification defines (high / moderate / low); the
+    /// underlying score is an uncalibrated heuristic, not a probability, so it is not shown as a percentage.
+    private var candidateText: String {
+        let level = night.session.confidence.map { " (confidence \(SleepDetector.confidenceLabel($0).rawValue))" } ?? ""
+        return "Detected candidate\(level). Not counted until you confirm it."
+    }
+
+    @ViewBuilder
+    private var candidateButtons: some View {
+        Button("Confirm", action: onConfirm).buttonStyle(.formaProminent)
+        Button("Adjust", action: onAdjust).buttonStyle(.bordered).tint(Theme.accent)
+        Button("Not sleep", role: .destructive, action: onReject).buttonStyle(.bordered)
+    }
+
+    private var sleepTile: some View {
+        metric("Sleep estimate", night.sleepEstimate, unit: "h", digits: 1, status: .estimate)
+    }
+
+    private var continuityTile: some View {
+        metric("Continuity", night.continuity, unit: "%", digits: 0, status: .estimate, asPercent: true)
+    }
+
+    private var restingTile: some View {
+        metric("Resting HR", night.restingHR, unit: "bpm", digits: 0, status: .estimate)
+    }
+
+    private var hrvTile: some View {
+        metric("HRV (RMSSD)", night.hrv, unit: "ms", digits: 0, status: .estimate)
     }
 
     private var originTag: some View {
@@ -212,6 +269,7 @@ struct SleepWindowEditor: View {
                     }
                 }
             }
+            .formaListBackground()
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

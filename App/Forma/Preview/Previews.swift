@@ -45,6 +45,23 @@ enum PreviewModels {
     }
 }
 
+/// Hand-built screen states for previews that a model cannot reach without a band.
+enum PreviewStates {
+    static var liveWorkout: LiveWorkoutState {
+        let now = EpochMillis(date: Date())
+        let start = now - 754_000
+        let points = (0..<60).map { i in
+            ChartPoint(t: start + Int64(i) * 12_000, value: 120 + Double(i % 20), segment: i < 40 ? 0 : 1)
+        }
+        return LiveWorkoutState(
+            start: start, now: now, currentHR: 152, currentZone: 3, signalStale: false,
+            zones: [ZoneTimeDisplay(zone: 2, label: "Zone 2", rangeText: "114–133 bpm", millis: 300_000, fraction: 0.4),
+                    ZoneTimeDisplay(zone: 3, label: "Zone 3", rangeText: "133–152 bpm", millis: 454_000, fraction: 0.6)],
+            heartRate: SeriesDisplay(points: points, unit: "bpm", window: TimeRange(start: start, end: now), gapCount: 1),
+            sourceLabel: "standard heart-rate service")
+    }
+}
+
 #Preview("Today · demo") {
     TodayView().environment(PreviewModels.demo()).environment(AppLock())
 }
@@ -63,8 +80,23 @@ enum PreviewModels {
     SleepView().environment(PreviewModels.demo()).environment(AppLock())
 }
 
+#Preview("Sleep · demo, accessibility size") {
+    SleepView().environment(PreviewModels.demo()).environment(AppLock())
+        .dynamicTypeSize(.accessibility3)
+}
+
 #Preview("Activity · demo") {
     ActivityView().environment(PreviewModels.demo()).environment(AppLock())
+}
+
+#Preview("Activity · live workout, dark, accessibility size") {
+    ScrollView {
+        LiveWorkoutCard(live: PreviewStates.liveWorkout, calendar: .current, onStop: {})
+            .padding()
+    }
+    .background(Theme.background)
+    .preferredColorScheme(.dark)
+    .dynamicTypeSize(.accessibility3)
 }
 
 #Preview("Trends · demo") {
@@ -132,6 +164,25 @@ enum PreviewModels {
         .padding()
     }
     .background(Theme.background)
+}
+
+#Preview("Problem, loading and lock states") {
+    ScrollView {
+        VStack(spacing: Theme.Space.m) {
+            BluetoothProblemMessage(reason: .unauthorized)
+            BluetoothProblemMessage(reason: .poweredOff)
+            LoadingPlaceholder {}
+            StateMessage(systemImage: "exclamationmark.triangle", title: "Your data has not loaded",
+                         message: "Loading is taking much longer than usual, or it failed.",
+                         actionTitle: "Try again", action: {})
+            LockScreen(onUnlock: {})
+                .frame(height: 260)
+        }
+        .padding()
+    }
+    .background(Theme.background)
+    .environment(AppLock())
+    .preferredColorScheme(.dark)
 }
 
 #Preview("Connection control states") {

@@ -23,6 +23,10 @@ enum Theme {
 
     /// Restrained teal accent (≥ 4.5:1 on background as text).
     static let accent = dynamic(light: 0x1C6F69, dark: 0x5BBDB2, lightHC: 0x0E4F4A, darkHC: 0x8ADCD2)
+    /// Text and icons drawn on an `accent` fill (primary buttons). White on the dark teal of light mode,
+    /// near-black on the light teal of dark mode: ≥ 5.9:1 in all four variants (white on the dark-mode
+    /// accent would be only 2.2:1).
+    static let onAccent = dynamic(light: 0xFFFFFF, dark: 0x0B1F1D, lightHC: 0xFFFFFF, darkHC: 0x0B1F1D)
     /// Low-emphasis accent fill (selected chips, live indicator halo).
     static let accentSoft = dynamic(light: 0xDDEDEA, dark: 0x1D3533, lightHC: 0xC9E3DF, darkHC: 0x204440)
 
@@ -101,6 +105,15 @@ extension AppearancePreference {
     var colorScheme: ColorScheme? {
         switch self {
         case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+
+    /// The same preference for UIKit windows (the App Lock window).
+    var userInterfaceStyle: UIUserInterfaceStyle {
+        switch self {
+        case .system: return .unspecified
         case .light: return .light
         case .dark: return .dark
         }

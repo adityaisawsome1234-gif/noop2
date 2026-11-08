@@ -20,6 +20,7 @@ struct MethodologyListView: View {
                 }
             }
         }
+        .formaListBackground()
         .navigationTitle("Methodology")
     }
 }
@@ -70,6 +71,7 @@ struct MethodologyDetailView: View {
                 Section("References") { ForEach(spec.references, id: \.self) { Text($0).font(.footnote) } }
             }
         }
+        .formaListBackground()
         .navigationTitle(spec.name)
         .navigationBarTitleDisplayMode(.inline)
     }

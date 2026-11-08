@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import LocalAuthentication
 import FormaCore
 import FormaFeatures
 
@@ -9,6 +10,11 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if model.isDemo {
+                Section {
+                    DemoModeNote(text: "Demo mode is on: Forma's screens show generated demo data, not data from your band.")
+                }
+            }
             ProfileSection()
             Section {
                 Picker("Zone method", selection: Binding(get: { model.zoneMethod }, set: { m in Task { await model.setZoneMethod(m) } })) {
@@ -38,8 +44,9 @@ struct SettingsView: View {
                 }
             }
             Section {
-                Toggle("Require Face ID or passcode", isOn: Binding(get: { appLock.isEnabled },
-                                                                    set: { appLock.setEnabled($0) }))
+                Toggle("Require Face ID or passcode", isOn: Binding(get: { appLock.isEnabled }, set: { on in
+                    if on { appLock.setEnabled(true) } else { Task { await turnOffAppLock() } }
+                }))
                     .tint(Theme.accent)
             } header: {
                 Text("Privacy")
@@ -54,7 +61,34 @@ struct SettingsView: View {
                 NavigationLink("About Forma") { AboutView() }
             }
         }
+        .formaListBackground()
         .navigationTitle("Settings")
+    }
+
+    /// Turning App Lock off needs the same Face ID or passcode it protects, so a phone left unlocked with
+    /// Forma open cannot be used to switch the lock off quietly. Without a device passcode there is nothing
+    /// to authenticate against, and the lock is simply turned off.
+    private func turnOffAppLock() async {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+            appLock.setEnabled(false)
+            return
+        }
+        let confirmed = (try? await context.evaluatePolicy(.deviceOwnerAuthentication,
+                                                           localizedReason: "Turn off App Lock for Forma.")) ?? false
+        if confirmed { appLock.setEnabled(false) }
+    }
+}
+
+/// Row stating that Demo mode is on (screens outside the four tabs have no demo banner).
+struct DemoModeNote: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "theatermasks")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Theme.demo)
     }
 }
 
@@ -67,8 +101,7 @@ struct ProfileSection: View {
 
     var body: some View {
         Section {
-            TextField("Birth year (optional)", text: $birthYearText)
-                .keyboardType(.numberPad)
+            numberField("Birth year", text: $birthYearText, unit: nil, spokenUnit: nil)
             Picker("Sex (optional)", selection: Binding(get: { model.profile.sex }, set: { s in
                 var p = model.profile
                 p.sex = s
@@ -78,16 +111,15 @@ struct ProfileSection: View {
                 Text("Female").tag(UserProfile.Sex.female)
                 Text("Male").tag(UserProfile.Sex.male)
             }
-            TextField("Max heart rate (bpm, optional)", text: $maxHRText)
-                .keyboardType(.numberPad)
-            TextField("Resting heart rate (bpm, optional)", text: $restingHRText)
-                .keyboardType(.numberPad)
+            numberField("Max heart rate", text: $maxHRText, unit: "bpm", spokenUnit: "beats per minute")
+            numberField("Resting heart rate", text: $restingHRText, unit: "bpm", spokenUnit: "beats per minute")
             Button("Save profile") { save() }
-                .disabled(!isValid)
+                .disabled(!isValid || !hasUnsavedChanges)
         } header: {
             Text("Profile")
         } footer: {
-            Text(validationMessage ?? "Used only for heart-rate zones and Forma Load. A max heart rate you enter is preferred over the age-based estimate (208 − 0.7 × age). Sex is used only by the optional Banister load and is never assumed.")
+            Text(validationMessage ?? ((hasUnsavedChanges ? "Not saved yet: tap Save profile to use these values. " : "")
+                + "Used only for heart-rate zones and Forma Load. A max heart rate you enter is preferred over the age-based estimate (208 − 0.7 × age). Sex is used only by the optional Banister load and is never assumed."))
         }
         .onAppear {
             guard !loaded else { return }
@@ -96,6 +128,31 @@ struct ProfileSection: View {
             maxHRText = model.profile.maxHeartRateOverride.map(String.init) ?? ""
             restingHRText = model.profile.restingHeartRateOverride.map(String.init) ?? ""
         }
+    }
+
+    /// A labelled number field: the label stays visible after a value is entered (a bare text field shows
+    /// its title only as a placeholder).
+    private func numberField(_ title: String, text: Binding<String>, unit: String?, spokenUnit: String?) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: Theme.Space.xxs) {
+                TextField("Optional", text: text)
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+                    .accessibilityLabel(spokenUnit.map { "\(title) in \($0)" } ?? title)
+                if let unit {
+                    Text(unit)
+                        .foregroundStyle(Theme.textSecondary)
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+    }
+
+    private var hasUnsavedChanges: Bool {
+        guard loaded else { return false }
+        return parse(birthYearText, range: 1900...currentYear).value != model.profile.birthYear
+            || parse(maxHRText, range: 100...230).value != model.profile.maxHeartRateOverride
+            || parse(restingHRText, range: 25...120).value != model.profile.restingHeartRateOverride
     }
 
     private func parse(_ text: String, range: ClosedRange<Int>) -> (ok: Bool, value: Int?) {
@@ -137,6 +194,11 @@ struct DataManagementView: View {
 
     var body: some View {
         Form {
+            if model.isDemo {
+                Section {
+                    DemoModeNote(text: "Demo mode is on. Export and import below use your own band data only: demo data is never exported or imported. Delete all data also removes the demo data and turns Demo mode off.")
+                }
+            }
             Section {
                 Button("Export CSV files…") { run { (try await model.exportCSVArchive(), "forma-csv.zip", .zip) } }
                 Button("Export full backup…") { run { (try await model.exportBackup(), "forma-backup.formabackup.jsonl", .json) } }
@@ -144,7 +206,7 @@ struct DataManagementView: View {
             } header: {
                 Text("Export and import")
             } footer: {
-                Text("You choose where exported files go. A backup can be imported on this or another iPhone; duplicates are skipped and summaries are recalculated.")
+                Text("You choose where exported files go. Exports contain your own band data, never demo data. A backup can be imported on this or another iPhone; duplicates are skipped, a file containing demo data is refused, and summaries are recalculated.")
             }
             Section {
                 Toggle("Include in iCloud and computer backups", isOn: Binding(get: { model.includeInDeviceBackups },
@@ -169,12 +231,13 @@ struct DataManagementView: View {
             Section {
                 Button("Delete all data", role: .destructive) { confirmDelete = true }
             } footer: {
-                Text("Erases every measurement, session, setting and capture stored by Forma on this iPhone. This cannot be undone.")
+                Text("Erases every measurement, session, setting and capture stored by Forma on this iPhone, including demo data. This cannot be undone.")
             }
             if let message {
                 Section { Text(message).font(.subheadline) }
             }
         }
+        .formaListBackground()
         .navigationTitle("Your data")
         .disabled(working)
         .overlay { if working { ProgressView() } }

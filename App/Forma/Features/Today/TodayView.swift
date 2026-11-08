@@ -19,8 +19,7 @@ struct TodayView: View {
                 if let state = model.today {
                     content(state)
                 } else {
-                    ProgressView("Loading")
-                        .frame(maxWidth: .infinity, minHeight: 200)
+                    LoadingPlaceholder { await model.refreshNow() }
                 }
             }
             .navigationTitle("Today")
@@ -29,7 +28,9 @@ struct TodayView: View {
                     ConnectionControl(summary: model.connection) { model.showDeviceHub = true }
                 }
             }
-            .refreshable { await model.refresh(requestSync: true) }
+            // Pulling to refresh downloads band history only in "Automatically" mode; with "When I tap
+            // Sync" the download (and what it may do on the band) stays behind the explicit Sync now button.
+            .refreshable { await model.refresh(requestSync: model.historySyncMode == .automatic) }
             .sheet(item: Binding(get: { explainedMetricID.map(IdentifiedString.init) },
                                  set: { explainedMetricID = $0?.value })) { item in
                 MethodologyDetailSheet(specID: item.value)
@@ -39,7 +40,11 @@ struct TodayView: View {
 
     @ViewBuilder
     private func content(_ state: TodayState) -> some View {
-        if !state.hasAnyData {
+        if !model.isDemo, case .bluetoothUnavailable(let reason) = model.connection.link {
+            BluetoothProblemMessage(reason: reason)
+        }
+        // Live heart rate can arrive before the first full refresh has stored anything.
+        if !state.hasAnyData && state.latestHeartRate == nil {
             StateMessage(
                 systemImage: "sensor.tag.radiowaves.forward",
                 title: model.connection.link == .noDeviceSelected ? "Connect your band" : "No data yet",
@@ -50,9 +55,13 @@ struct TodayView: View {
                 action: model.connection.link == .noDeviceSelected ? { model.showDeviceHub = true } : nil
             )
             if model.connection.link == .noDeviceSelected && !model.isDemo {
-                Button("Explore demo data") { Task { await model.enterDemo() } }
-                    .buttonStyle(.bordered)
-                    .tint(Theme.demo)
+                if model.isPreparingDemo {
+                    ProgressView("Preparing demo data…")
+                } else {
+                    Button("Explore demo data") { Task { await model.enterDemo() } }
+                        .buttonStyle(.bordered)
+                        .tint(Theme.demo)
+                }
             }
         } else {
             latestHeartRateCard(state.latestHeartRate)
@@ -93,13 +102,20 @@ struct TodayView: View {
                 CoverageLegend()
             }
         }
-        StatusFooter(summary: model.connection, now: model.now)
+        StatusFooter(summary: model.connection, now: model.now, calendar: model.calendar)
     }
 
     @ViewBuilder
     private func latestHeartRateCard(_ latest: LatestHeartRate?) -> some View {
         Card("Heart rate", accessory: AnyView(StatusTag(status: .measured))) {
             if let latest {
+                // "Live"/"Current" only while samples are arriving and this one is recent; the model
+                // re-evaluates `isStale` on every tick, so a value that stops updating turns into "Last".
+                let isLive = !latest.isStale && model.connection.liveStreaming
+                let ago = RelativeTimeFormatter(calendar: model.calendar).string(from: latest.at, now: model.now)
+                let spoken: String = isLive
+                    ? "Current heart rate \(latest.bpm) beats per minute"
+                    : "Last heart rate \(latest.bpm) beats per minute, measured \(ago)"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("\(latest.bpm)")
                         .font(Theme.Typeface.metricValueLarge)
@@ -108,17 +124,18 @@ struct TodayView: View {
                         .font(Theme.Typeface.metricUnit)
                         .foregroundStyle(Theme.textSecondary)
                     Spacer()
-                    if !latest.isStale && model.connection.liveStreaming {
+                    if isLive {
                         Label("Live", systemImage: "dot.radiowaves.left.and.right")
                             .font(Theme.Typeface.label)
                             .foregroundStyle(Theme.accent)
                     }
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(latest.isStale ? "Last" : "Current") heart rate \(latest.bpm) beats per minute")
-                Text("\(latest.isStale ? "Last sample" : "Sample") \(RelativeTimeFormatter().string(from: latest.at, now: model.now)) · \(latest.sourceLabel)")
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(spoken)
+                Text("\(latest.isStale ? "Last sample" : "Sample") \(ago) · \(latest.sourceLabel)")
                     .font(Theme.Typeface.caption)
                     .foregroundStyle(Theme.textSecondary)
+                    .accessibilityHidden(true)
             } else {
                 AvailabilityNote(availability: .insufficientData(detail: "No heart-rate samples yet"))
             }
@@ -155,6 +172,8 @@ struct ReadinessCard: View {
                         .font(Theme.Typeface.metricUnit)
                         .foregroundStyle(Theme.textSecondary)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Readiness index \(DisplayFormat.signed(value, digits: 1)) standard deviations versus your baseline")
                 if let band = state.bandText {
                     Text(band)
                         .font(.body.weight(.medium))
@@ -180,10 +199,7 @@ struct ReadinessCard: View {
             } else {
                 AvailabilityNote(availability: state.metric.availability)
             }
-            Button("How this is calculated", action: onExplain)
-                .font(Theme.Typeface.caption)
-                .foregroundStyle(Theme.accent)
-                .buttonStyle(.borderless)
+            ExplainButton(subject: "the readiness index", action: onExplain)
         }
     }
 }
@@ -192,10 +208,11 @@ struct ReadinessCard: View {
 struct StatusFooter: View {
     let summary: ConnectionSummary
     let now: EpochMillis
+    var calendar: Calendar = .current
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(summary.detailLines(now: now).enumerated()), id: \.offset) { _, line in
+            ForEach(Array(summary.displayLines(now: now, calendar: calendar).enumerated()), id: \.offset) { _, line in
                 Text(line)
                     .font(Theme.Typeface.caption)
                     .foregroundStyle(Theme.textSecondary)
@@ -208,20 +225,35 @@ struct StatusFooter: View {
 }
 
 struct CoverageLegend: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
-        HStack(spacing: Theme.Space.m) {
-            legend(Theme.accent, "Recorded")
-            legend(Theme.caution, "Pending sync")
-            legend(Theme.border, "Not recorded")
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: Theme.Space.xxs) { items }
+            } else {
+                HStack(spacing: Theme.Space.m) { items }
+            }
         }
         .font(Theme.Typeface.caption)
         .foregroundStyle(Theme.textSecondary)
         .accessibilityHidden(true)
     }
 
-    private func legend(_ color: Color, _ text: String) -> some View {
+    @ViewBuilder
+    private var items: some View {
+        legend(.recorded, "Recorded")
+        legend(.pendingSync, "Pending sync")
+        legend(.notRecorded, "Not recorded")
+    }
+
+    /// Same mark as in the bar: full height, half height or a thin line.
+    private func legend(_ kind: CoverageBar.Segment.Kind, _ text: String) -> some View {
         HStack(spacing: 4) {
-            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 10, height: 10)
+            Rectangle()
+                .fill(CoverageBar.color(kind))
+                .frame(width: 12, height: CoverageBar.markHeight(kind))
+                .frame(width: 12, height: CoverageBar.height)
             Text(text)
         }
     }

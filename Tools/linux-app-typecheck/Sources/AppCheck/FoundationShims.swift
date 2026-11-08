@@ -10,7 +10,7 @@ extension FileAttributeKey { public static let protectionKey = FileAttributeKey(
 extension URLResourceValues { public var isExcludedFromBackup: Bool? { get { nil } set {} } }
 extension URLResourceKey { public static let isExcludedFromBackupKey = URLResourceKey(rawValue: "NSURLIsExcludedFromBackupKey") }
 public final class NSFileCoordinator {
-    public struct ReadingOptions: OptionSet { public let rawValue: UInt; public init(rawValue: UInt) { self.rawValue = rawValue }; public static let forUploading = ReadingOptions(rawValue: 8) }
+    public struct ReadingOptions: OptionSet, Sendable { public let rawValue: UInt; public init(rawValue: UInt) { self.rawValue = rawValue }; public static let forUploading = ReadingOptions(rawValue: 8) }
     public init() {}
     public func coordinate(readingItemAt url: URL, options: ReadingOptions = [], error outError: UnsafeMutablePointer<NSError?>?, byAccessor reader: (URL) -> Void) { reader(url) }
 }

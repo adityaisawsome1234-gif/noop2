@@ -26,19 +26,19 @@ struct DiagnosticsView: View {
             } header: {
                 Text("Compatibility test")
             } footer: {
-                Text("The test only reads data and sends read-only or stream on/off requests. It never resets, updates or reconfigures the band.")
+                Text("The test reads data and sends only read-only or stream on/off requests; it never resets, updates or reconfigures the band. If band history is set to download (Band → History), the test also downloads history once, exactly like Sync now — see the History explanation for what that means for the band.")
             }
 
             Section {
-                Toggle("Use unvalidated motion data for sleep windows", isOn: Binding(get: { model.allowUnvalidatedMotion },
-                                                                                     set: { v in Task { await model.setAllowUnvalidatedMotion(v) } }))
+                Toggle("Use unvalidated motion to propose sleep windows", isOn: Binding(get: { model.allowUnvalidatedMotion },
+                                                                                       set: { v in Task { await model.setAllowUnvalidatedMotion(v) } }))
                     .tint(Theme.accent)
                 Button("Check band-history heart rate against live heart rate") { Task { await model.validateHistoryHeartRate() } }
                     .disabled(model.selectedDevice == nil || model.isDemo)
             } header: {
                 Text("Field validation")
             } footer: {
-                Text("Decoded band fields are only used in metrics once validated. Motion values are raw sensor counts with an unpublished scale; allowing them lets Forma propose sleep windows that you then confirm. History heart rate is validated automatically when it matches live standard heart rate for at least 10 minutes.")
+                Text("Decoded band fields are used in metrics only once validated. Motion values are raw sensor counts with an unpublished scale: allowing them only lets Forma propose sleep windows for you to confirm; time asleep, wake bouts, continuity, trends and readiness never use them. Band-history heart rate is used only after it agrees with live standard heart rate over at least 10 shared minutes. Forma runs this check after a history download when your band and firmware have no result yet; you can also run it here.")
             }
 
             Section("Band") {
@@ -120,6 +120,7 @@ struct DiagnosticsView: View {
                 }
             }
         }
+        .formaListBackground()
         .navigationTitle("Diagnostics")
         .fileExporter(isPresented: Binding(get: { exportDocument != nil }, set: { if !$0 { exportDocument = nil } }),
                       document: exportDocument,
