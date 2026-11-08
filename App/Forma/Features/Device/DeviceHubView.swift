@@ -118,8 +118,41 @@ struct DevicePickerView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var includeUnfiltered = false
+    @State private var accessorySetup = AccessorySetupController()
 
     var body: some View {
+        if AccessorySetupController.isConfigured {
+            accessorySetupPicker
+        } else {
+            scanList
+        }
+    }
+
+    /// AccessorySetupKit mode: the system picker chooses the band (see BUILD_AND_INSTALL.md §6).
+    private var accessorySetupPicker: some View {
+        List {
+            Section {
+                Button("Choose band with the system picker") {
+                    accessorySetup.showPicker { id, name in
+                        let device = DiscoveredDevice(id: id, name: name, rssi: nil, family: .unknown, advertisedServiceUUIDs: [],
+                                                      manufacturerDataHex: nil, connectedToThisPhone: false, lastSeen: model.now)
+                        Task {
+                            await model.selectDevice(device)
+                            dismiss()
+                        }
+                    }
+                }
+                if let error = accessorySetup.lastError {
+                    Text(error).font(.footnote).foregroundStyle(Theme.critical)
+                }
+            } footer: {
+                Text("This build uses AccessorySetupKit: iOS shows its own picker and gives Forma access only to the band you choose.")
+            }
+        }
+        .navigationTitle("Choose band")
+    }
+
+    private var scanList: some View {
         List {
             Section {
                 if model.isScanning {

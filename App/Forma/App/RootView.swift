@@ -2,10 +2,6 @@ import SwiftUI
 import FormaCore
 import FormaFeatures
 
-enum AppTab: Hashable {
-    case today, sleep, activity, trends
-}
-
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(AppLock.self) private var appLock

@@ -29,6 +29,18 @@ struct DiagnosticsView: View {
                 Text("The test only reads data and sends read-only or stream on/off requests. It never resets, updates or reconfigures the band.")
             }
 
+            Section {
+                Toggle("Use unvalidated motion data for sleep windows", isOn: Binding(get: { model.allowUnvalidatedMotion },
+                                                                                     set: { v in Task { await model.setAllowUnvalidatedMotion(v) } }))
+                    .tint(Theme.accent)
+                Button("Check band-history heart rate against live heart rate") { Task { await model.validateHistoryHeartRate() } }
+                    .disabled(model.selectedDevice == nil || model.isDemo)
+            } header: {
+                Text("Field validation")
+            } footer: {
+                Text("Decoded band fields are only used in metrics once validated. Motion values are raw sensor counts with an unpublished scale; allowing them lets Forma propose sleep windows that you then confirm. History heart rate is validated automatically when it matches live standard heart rate for at least 10 minutes.")
+            }
+
             Section("Band") {
                 LabeledContent("Adapter", value: state.adapterID ?? "—")
                 LabeledContent("Parser version", value: state.parserVersion ?? "—")

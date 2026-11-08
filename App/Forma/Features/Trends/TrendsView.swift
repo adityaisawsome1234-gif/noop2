@@ -1,5 +1,6 @@
 import SwiftUI
 import FormaCore
+import FormaAnalytics
 import FormaFeatures
 
 struct TrendsView: View {
