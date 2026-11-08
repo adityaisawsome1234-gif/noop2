@@ -1,0 +1,3 @@
+Sources/AppCheck/*
+!Sources/AppCheck/FoundationShims.swift
+.build/
