@@ -1,6 +1,6 @@
 # Continuous integration for Forma. Runs only when you push this repository to GitHub.
 #  - linux: FormaKit tests with Swift 6.4 + no-network audit
-#  - ios:   FormaKit tests on macOS and an unsigned iOS Simulator build of the app with Xcode 27
+#  - ios:   FormaKit tests on macOS and an unsigned iOS Simulator build of the app with the newest Xcode 26+
 # No secrets are needed; nothing is signed or uploaded.
 name: CI
 on:
@@ -25,10 +25,10 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 27
+      - name: Select the newest Xcode (26 or later)
         run: |
-          XC=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
-          if [ -z "$XC" ]; then echo "Xcode 27 not found on this runner image"; ls /Applications; exit 1; fi
+          XC=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then echo "::error::No Xcode 26 or later on this runner image"; exit 1; fi
           sudo xcode-select -s "$XC"
           xcodebuild -version
       - name: FormaKit tests (macOS)

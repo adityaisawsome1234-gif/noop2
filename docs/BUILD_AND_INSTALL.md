@@ -61,6 +61,30 @@ The first build compiles the Swift package and the app. FormaKit (all parsing, s
 
 Neither route is an app subscription. Forma has no in-app purchases, accounts or recurring charges.
 
+## 3a. Without Xcode: GitHub build + Sideloadly
+
+You don't need a Mac or Xcode. GitHub builds the app, and Sideloadly (Windows or macOS) signs it with your Apple ID and installs it over USB.
+
+1. **Get the `.ipa`.**
+   1. Open the repository on GitHub → **Actions** → **Build IPA**.
+   2. Open the newest green run and download the **Forma-ipa** artifact. It's a zip containing `Forma.ipa`; unzip it.
+   3. Every push to `main` builds a new one, and **Run workflow** builds one on demand.
+2. **Install Sideloadly** from sideloadly.io.
+   - On Windows, also install iTunes and iCloud from apple.com (not the Microsoft Store versions). Sideloadly needs their device drivers.
+3. **Connect the iPhone** by USB, unlock it, and tap **Trust** when asked.
+4. **In Sideloadly:**
+   1. Drag `Forma.ipa` into the window.
+   2. Pick your iPhone and enter your Apple ID. A free Apple ID works. Sideloadly asks Apple for a development certificate; it does not need your Apple ID for anything else, but use an account you're comfortable with.
+   3. Under **Advanced options**, keep **Bundle ID** set to something unique. Sideloadly's default rewrites it to a unique ID, which a free account needs because `com.example.forma.app` belongs to no one.
+   4. Click **Start**. If Apple asks for a two-factor code, enter it in Sideloadly.
+5. **On the iPhone:**
+   1. Settings → Privacy & Security → **Developer Mode** → On, then restart (§4).
+   2. Settings → General → **VPN & Device Management** → your Apple ID → **Trust**.
+   3. Open Forma.
+6. **Every 7 days** (free Apple ID): the app stops opening. Before that happens, export a backup (Settings → Data), then repeat step 4 with the same `.ipa` and the **same bundle ID**. Reinstalling the same bundle ID is an update, so your data is expected to stay; the backup is there in case it doesn't. With a paid developer account the signature lasts much longer.
+
+Limits of a free Apple ID: 3 sideloaded apps at a time, and 10 new bundle IDs per 7 days. Keeping the same bundle ID avoids burning through them.
+
 ## 4. Enable Developer Mode on the iPhone
 
 1. Connect the iPhone to the Mac once (or pair it in Xcode's Device Hub). Developer Mode only appears in Settings after the iPhone has been paired with a Mac.
