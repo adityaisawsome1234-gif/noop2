@@ -12,7 +12,8 @@ A local-first iPhone app that reads **your own WHOOP band** directly over Blueto
 |---|---|
 | FormaKit (protocol, sync, storage, analytics, app model) | Implemented. Compiled and unit-tested on Linux with Swift 6.4.2 (see `docs/TEST_REPORT.md`); not yet built or tested on macOS or iOS |
 | WHOOP 5.0 decoding | Cross-checked against every real WHOOP 5.0 payload published by public research (`Tools/verify-published-captures.sh`). **Not yet run against your band** |
-| iOS app (SwiftUI, Core Bluetooth) | Written and reviewed, **not yet compiled** (no Apple SDK in this build environment). Build in Xcode 27 |
+| iOS app (SwiftUI, Core Bluetooth) | Written and independently reviewed (UI, Bluetooth/platform, compile risk). It type-checks with 0 errors and 0 warnings against stand-in SDK modules (`Tools/linux-app-typecheck`). **Not yet compiled against the Apple SDK** (no Mac in this build environment). Build in Xcode 27 |
+| Band history | Downloaded and saved; **not acknowledged** to the band by default. Acknowledgement is an experimental setting in Diagnostics, to be enabled only after checklist test 5.6 |
 | Hardware validation | Pending. Follow `docs/HARDWARE_VALIDATION_HANDOFF.md` |
 
 ## Repository layout
