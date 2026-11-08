@@ -12,12 +12,13 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 27
+      - name: Select the newest Xcode (26 or later; Forma targets iOS 26)
         run: |
-          XC=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
-          if [ -z "$XC" ]; then echo "::error::Xcode 27 not found on this runner image"; ls /Applications; exit 1; fi
+          echo "::notice::Xcodes on runner: $(ls -d /Applications/Xcode*.app | xargs -n1 basename | tr '\n' ' ')"
+          XC=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then echo "::error::No Xcode 26 or later on this runner image"; exit 1; fi
           sudo xcode-select -s "$XC"
-          xcodebuild -version
+          echo "::notice::Using $(xcodebuild -version | tr '\n' ' ')"
       - name: Build for iPhone (Release, unsigned)
         run: |
           set -o pipefail
