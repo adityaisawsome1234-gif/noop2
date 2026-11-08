@@ -26,19 +26,30 @@ struct DiagnosticsView: View {
             } header: {
                 Text("Compatibility test")
             } footer: {
-                Text("The test only reads data and sends read-only or stream on/off requests. It never resets, updates or reconfigures the band.")
+                Text("The test reads data and sends only read-only or stream on/off requests; it never resets, updates or reconfigures the band. If band history is set to download (Band → History), the test also downloads history once, exactly like Sync now — see the History explanation for what that means for the band.")
             }
 
             Section {
-                Toggle("Use unvalidated motion data for sleep windows", isOn: Binding(get: { model.allowUnvalidatedMotion },
-                                                                                     set: { v in Task { await model.setAllowUnvalidatedMotion(v) } }))
+                Toggle("Use unvalidated motion to propose sleep windows", isOn: Binding(get: { model.allowUnvalidatedMotion },
+                                                                                       set: { v in Task { await model.setAllowUnvalidatedMotion(v) } }))
                     .tint(Theme.accent)
                 Button("Check band-history heart rate against live heart rate") { Task { await model.validateHistoryHeartRate() } }
                     .disabled(model.selectedDevice == nil || model.isDemo)
             } header: {
                 Text("Field validation")
             } footer: {
-                Text("Decoded band fields are only used in metrics once validated. Motion values are raw sensor counts with an unpublished scale; allowing them lets Forma propose sleep windows that you then confirm. History heart rate is validated automatically when it matches live standard heart rate for at least 10 minutes.")
+                Text("Decoded band fields are used in metrics only once validated. Motion values are raw sensor counts with an unpublished scale: allowing them only lets Forma propose sleep windows for you to confirm; time asleep, wake bouts, continuity, trends and readiness never use them. Band-history heart rate is used only after it agrees with live standard heart rate over at least 10 shared minutes. Forma runs this check after a history download when your band and firmware have no result yet; you can also run it here.")
+            }
+
+            Section {
+                Toggle("Confirm saved history to the band", isOn: Binding(get: { model.historyAcknowledgementEnabled },
+                                                                         set: { v in Task { await model.setHistoryAcknowledgement(v) } }))
+                    .tint(Theme.accent)
+                    .disabled(model.isDemo)
+            } header: {
+                Text("History acknowledgement (experimental)")
+            } footer: {
+                Text("Off by default. When on, Forma tells the band a history chunk was received, but only for a chunk it requested, received intact, decoded completely and saved durably on this iPhone. After that the band may delete the chunk, and the official WHOOP app may then never receive that period. The message format comes from public analysis of the official app and has not been confirmed on your band: turn this on only for checklist test 5.6, and turn it off again if the band does not accept it. With it off, the band keeps its copy and sends it again; Forma skips what it already has.")
             }
 
             Section("Band") {
@@ -56,6 +67,27 @@ struct DiagnosticsView: View {
                 LabeledContent("…with beat intervals", value: "\(state.counters.standardHRWithRR)")
                 LabeledContent("History records", value: "\(state.counters.historyRecords)")
                 LabeledContent("Commands sent", value: "\(state.counters.commandsSent)")
+                LabeledContent("Response sequence mismatches", value: "\(state.counters.responseSequenceMismatches)")
+                LabeledContent("Notifications lost by the link", value: "\(state.counters.notificationGaps)")
+            }
+            .font(.subheadline.monospacedDigit())
+
+            Section {
+                LabeledContent("Real-time frames", value: "\(state.counters.realtimeHRPackets)")
+                LabeledContent("Latest real-time value (unvalidated)",
+                               value: state.counters.lastRealtimeCandidateBPM.map { "\($0) bpm" } ?? "—")
+                LabeledContent("Chunks saved", value: "\(state.counters.historyChunksSaved)")
+                LabeledContent("Chunks acknowledged", value: "\(state.counters.historyChunksAcknowledged)")
+                LabeledContent("Acknowledgements accepted", value: "\(state.counters.acknowledgementsAccepted)")
+                LabeledContent("Acknowledgements not accepted", value: "\(state.counters.acknowledgementsRejected)")
+                LabeledContent("Records with an unusable band time", value: "\(state.counters.historyRecordsUnmapped)")
+                LabeledContent("Records Forma does not decode yet", value: "\(state.counters.historyRecordsUndecoded)")
+                LabeledContent("Records sharing one time", value: "\(state.counters.historyTimeCollisions)")
+                LabeledContent("History another app requested", value: "\(state.counters.historyRecordsUnsolicited)")
+            } header: {
+                Text("Vendor stream and history")
+            } footer: {
+                Text("Real-time values come from frames whose meaning is not validated; they are shown here only, never as your heart rate. A chunk is never acknowledged if it contains records Forma cannot decode or place in time, or records that share one time.")
             }
             .font(.subheadline.monospacedDigit())
 
@@ -120,6 +152,7 @@ struct DiagnosticsView: View {
                 }
             }
         }
+        .formaListBackground()
         .navigationTitle("Diagnostics")
         .fileExporter(isPresented: Binding(get: { exportDocument != nil }, set: { if !$0 { exportDocument = nil } }),
                       document: exportDocument,

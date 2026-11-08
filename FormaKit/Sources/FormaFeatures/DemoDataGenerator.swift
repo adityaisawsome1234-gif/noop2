@@ -115,7 +115,11 @@ public struct DemoDataGenerator: Sendable {
                     var rr = meanRR + rsaAmplitude * sin(phase) + rng.gaussian(mean: 0, sd: morningNight.hrv * 0.35)
                     if rng.uniform(0, 1) < 0.002 { rr *= 0.65 }
                     rr = min(1_900, max(320, rr))
-                    bt += Int64(rr.rounded())
+                    // A beat that would close after the block (and possibly after `end`, i.e. in the future)
+                    // is not generated. The random draws above still happen, so the sequence is unchanged.
+                    let next = bt + Int64(rr.rounded())
+                    guard next <= rrEnd else { break }
+                    bt = next
                     beats.append(BeatInterval(deviceID: Self.deviceID, timestamp: bt, intervalMillis: rr, source: .demo,
                                               recordKey: rrStart, indexInRecord: index, receivedAt: bt,
                                               timingBasis: .reconstructedFromRecordTime))

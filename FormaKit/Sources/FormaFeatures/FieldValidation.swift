@@ -1,5 +1,6 @@
 import Foundation
 import FormaCore
+import FormaAnalytics
 
 /// Decides whether a decoded-but-unvalidated field may be used in metrics, using independent evidence
 /// recorded at the same time. A field is never "validated" merely because it decodes.
@@ -18,24 +19,43 @@ public struct FieldValidationResult: Hashable, Sendable, Codable {
 }
 
 public enum FieldValidator {
-    /// Settings key under which a passed validation is recorded, per adapter and firmware: a firmware
-    /// change requires validating again.
+    /// Prefix of every field-validation setting key.
+    public static let keyPrefix = "fieldValidation."
+    /// Prefix of the band-history heart-rate keys.
+    public static let historyHeartRateKeyPrefix = keyPrefix + "historyHR."
+
+    /// Settings key under which a validation verdict is recorded, per adapter and firmware: a firmware
+    /// change requires validating again. Records are matched to a key through their ingest batch's
+    /// provenance, so a verdict only ever applies to values decoded by that adapter on that firmware.
     public static func historyHeartRateKey(adapterID: String, firmware: String?) -> String {
-        "fieldValidation.historyHR.\(adapterID).\(firmware ?? "unknown-firmware")"
+        "\(historyHeartRateKeyPrefix)\(adapterID).\(firmware ?? "unknown-firmware")"
+    }
+
+    /// A reading is evidence only if analytics would use it: plausible, with sensor contact, not marked
+    /// invalid by the device, with a trustworthy time and not next to a clock discontinuity.
+    static func isEvidence(_ sample: HeartRateSample) -> Bool {
+        // The field under test is unvalidated by definition (and analytics exclude that flag), so every other
+        // quality rule is applied exactly as analytics would, with that one flag set aside.
+        var candidate = sample
+        candidate.quality.remove(.unvalidatedField)
+        return HeartRateSeries.isUsable(candidate) && !candidate.quality.contains(.nearClockDiscontinuity)
     }
 
     /// Compares band-history heart rate (unvalidated) with live heart rate from an independent, documented
-    /// source (Bluetooth SIG Heart Rate Service) for the same minutes.
-    /// - Passes when ≥ `minimumMinutes` minutes overlap and the median absolute difference of per-minute
-    ///   means is ≤ `maxMedianAbsoluteDifference` bpm.
+    /// source (Bluetooth SIG Heart Rate Service) for the same minutes, using per-minute means.
+    /// - Passes when ≥ `minimumMinutes` minutes overlap, the median absolute difference is
+    ///   ≤ `maxMedianAbsoluteDifference` bpm, and at least `minimumAgreeingFraction` of the overlapping
+    ///   minutes differ by ≤ `agreementToleranceBPM` (a field that is grossly wrong in a sizeable share of
+    ///   minutes — e.g. one record kind read from the wrong byte — must not pass on the median alone).
     /// - Fails when enough minutes overlap but values disagree (the field is probably not heart rate).
     /// - Otherwise the result is unverified (not enough overlap yet).
     public static func historyHeartRateAgreement(history: [HeartRateSample], live: [HeartRateSample],
-                                                 minimumMinutes: Int = 10, maxMedianAbsoluteDifference: Double = 3) -> FieldValidationResult {
+                                                 minimumMinutes: Int = 10, maxMedianAbsoluteDifference: Double = 3,
+                                                 agreementToleranceBPM: Double = 5,
+                                                 minimumAgreeingFraction: Double = 0.9) -> FieldValidationResult {
         func perMinute(_ samples: [HeartRateSample]) -> [Int64: Double] {
             var sums: [Int64: (Double, Int)] = [:]
-            for s in samples where HeartRateSample.plausibleRange.contains(s.bpm)
-                && !s.quality.contains(.clockUnmapped) && !s.quality.contains(.noSensorContact) {
+            for s in samples where isEvidence(s) {
                 let minute = s.timestamp / 60_000
                 let current = sums[minute] ?? (0, 0)
                 sums[minute] = (current.0 + Double(s.bpm), current.1 + 1)
@@ -45,7 +65,7 @@ public enum FieldValidator {
         let h = perMinute(history.filter { $0.source == .deviceHistory })
         let l = perMinute(live.filter { $0.source == .standardHeartRateService })
         let shared = Set(h.keys).intersection(l.keys)
-        guard shared.count >= minimumMinutes else {
+        guard shared.count >= max(1, minimumMinutes) else {
             return FieldValidationResult(status: .unverified, overlappingMinutes: shared.count, medianAbsoluteDifference: nil,
                                          detail: "Needs at least \(minimumMinutes) minutes where band history and live standard heart rate overlap (have \(shared.count)).")
         }
@@ -54,11 +74,18 @@ public enum FieldValidator {
             return abs(a - b)
         }.sorted()
         let median = diffs.count % 2 == 1 ? diffs[diffs.count / 2] : (diffs[diffs.count / 2 - 1] + diffs[diffs.count / 2]) / 2
-        if median <= maxMedianAbsoluteDifference {
+        let agreeing = Double(diffs.filter { $0 <= agreementToleranceBPM }.count) / Double(diffs.count)
+        let medianText = DisplayFormat.number(median, digits: 1)
+        let agreeingText = DisplayFormat.percent(agreeing)
+        let toleranceText = DisplayFormat.number(agreementToleranceBPM, digits: 0)
+        if median <= maxMedianAbsoluteDifference && agreeing >= minimumAgreeingFraction {
             return FieldValidationResult(status: .passed, overlappingMinutes: shared.count, medianAbsoluteDifference: median,
-                                         detail: "Band history heart rate agrees with live heart rate (median difference \(DisplayFormat.number(median, digits: 1)) bpm over \(shared.count) minutes).")
+                                         detail: "Band history heart rate agrees with live heart rate (median difference \(medianText) bpm over \(shared.count) minutes; \(agreeingText) of minutes within \(toleranceText) bpm).")
         }
+        let reason = median > maxMedianAbsoluteDifference
+            ? "median difference \(medianText) bpm over \(shared.count) minutes"
+            : "only \(agreeingText) of \(shared.count) minutes within \(toleranceText) bpm; median difference \(medianText) bpm"
         return FieldValidationResult(status: .failed, overlappingMinutes: shared.count, medianAbsoluteDifference: median,
-                                     detail: "Band history values do not match live heart rate (median difference \(DisplayFormat.number(median, digits: 1)) bpm over \(shared.count) minutes). Forma keeps them as unvalidated evidence and does not use them.")
+                                     detail: "Band history values do not match live heart rate (\(reason)). Forma keeps them as unvalidated evidence and does not use them.")
     }
 }

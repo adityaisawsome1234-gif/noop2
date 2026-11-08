@@ -163,6 +163,19 @@ public struct DiagnosticsCounters: Hashable, Sendable, Codable {
     public var standardHRWithRR: Int = 0
     public var commandsSent: Int = 0
     public var historyRecords: Int = 0
+    /// Vendor real-time frames and the latest unvalidated heart-rate candidate they carried.
+    public var realtimeHRPackets: Int = 0
+    public var lastRealtimeCandidateBPM: Int?
+    public var historyRecordsUnmapped: Int = 0
+    public var historyRecordsUndecoded: Int = 0
+    public var historyRecordsUnsolicited: Int = 0
+    public var historyTimeCollisions: Int = 0
+    public var historyChunksSaved: Int = 0
+    public var historyChunksAcknowledged: Int = 0
+    public var acknowledgementsAccepted: Int = 0
+    public var acknowledgementsRejected: Int = 0
+    public var responseSequenceMismatches: Int = 0
+    public var notificationGaps: Int = 0
 
     public init() {}
 }

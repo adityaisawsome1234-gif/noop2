@@ -8,6 +8,12 @@ public enum DisplayFormat {
     public static func number(_ value: Double, digits: Int) -> String {
         guard value.isFinite else { return "—" }
         let d = max(0, min(3, digits))
+        // From 1e15 on, the fixed-point arithmetic below would overflow Int64 (and such values carry no
+        // meaningful fractional digits): print the exact decimal expansion instead of trapping.
+        if abs(value) >= 1e15 {
+            let text = String(format: "%.\(d)f", locale: Locale(identifier: "en_US_POSIX"), abs(value))
+            return value < 0 ? "\u{2212}" + text : text
+        }
         let factor = pow(10.0, Double(d))
         let rounded = (abs(value) * factor).rounded() / factor
         let negative = value < 0 && rounded != 0
@@ -37,7 +43,7 @@ public enum DisplayFormat {
     /// "86%" from a 0…1 fraction.
     public static func percent(_ fraction: Double) -> String {
         guard fraction.isFinite else { return "—" }
-        return "\(Int((fraction * 100).rounded()))%"
+        return number(fraction * 100, digits: 0) + "%"
     }
 
     /// "23:05" in the calendar's time zone.

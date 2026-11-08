@@ -24,6 +24,7 @@ struct DeviceHubView: View {
                     NavigationLink("Settings") { SettingsView() }
                 }
             }
+            .formaListBackground()
             .navigationTitle("Band")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -36,6 +37,9 @@ struct DeviceHubView: View {
                 Text("Forma stops connecting to it. Recorded data stays on this iPhone. The Bluetooth bond (if any) is managed by iOS Settings and is not changed.")
             }
         }
+        // Messages raised while this sheet is open (pairing guidance, a band Forma cannot read, a failed
+        // save) are shown here; the root view cannot present over a sheet.
+        .modelAlert(model)
     }
 
     @ViewBuilder
@@ -56,7 +60,7 @@ struct DeviceHubView: View {
                     }
                 }
                 .accessibilityElement(children: .combine)
-                ForEach(Array(model.connection.detailLines(now: model.now).enumerated()), id: \.offset) { _, line in
+                ForEach(Array(model.connection.displayLines(now: model.now, calendar: model.calendar).enumerated()), id: \.offset) { _, line in
                     Text(line).font(.subheadline)
                 }
                 Button("Forget band", role: .destructive) { confirmForget = true }
@@ -78,14 +82,14 @@ struct DeviceHubView: View {
             Toggle("Collect from band", isOn: Binding(get: { model.collectionEnabled },
                                                        set: { v in Task { await model.setCollectionEnabled(v) } }))
                 .tint(Theme.accent)
-            Toggle("Live heart rate while open", isOn: Binding(get: { model.liveHeartRateEnabled },
-                                                                set: { v in Task { await model.setLiveHeartRate(v) } }))
+            Toggle("Request live heart-rate stream", isOn: Binding(get: { model.liveHeartRateEnabled },
+                                                                    set: { v in Task { await model.setLiveHeartRate(v) } }))
                 .tint(Theme.accent)
                 .disabled(!model.collectionEnabled)
         } header: {
             Text("Collection")
         } footer: {
-            Text("While collection is on, iOS reconnects to the band automatically when it is in range, including in the background. If you swipe Forma away in the app switcher, iOS will not relaunch it until you open it again.")
+            Text("While collection is on, iOS usually reconnects to the band when it is back in range, also in the background. It does not after Bluetooth is turned off in Settings, after a restart until the iPhone is unlocked once, or after you swipe Forma away in the app switcher; open Forma again then. Heart rate the band sends through the standard heart-rate service is recorded whenever it is connected. “Request live heart-rate stream” asks bands that support Forma's request to stream heart rate as well, only while Forma is open (a running workout keeps it on until you finish); other bands ignore it. Values from that stream are not validated yet, so they appear only in Diagnostics.")
         }
     }
 
@@ -149,6 +153,7 @@ struct DevicePickerView: View {
                 Text("This build uses AccessorySetupKit: iOS shows its own picker and gives Forma access only to the band you choose.")
             }
         }
+        .formaListBackground()
         .navigationTitle("Choose band")
     }
 
@@ -177,7 +182,7 @@ struct DevicePickerView: View {
                     Text(model.isScanning ? "Nothing yet" : "No devices found")
                         .foregroundStyle(Theme.textSecondary)
                 }
-                ForEach(model.discoveredDevices) { device in
+                ForEach(orderedDevices) { device in
                     Button {
                         Task {
                             await model.selectDevice(device)
@@ -189,13 +194,21 @@ struct DevicePickerView: View {
                             Text(subtitle(device)).font(.caption).foregroundStyle(Theme.textSecondary)
                         }
                     }
-                    .accessibilityHint("Selects this band and starts the compatibility test")
+                    .accessibilityHint("Selects this band and connects to it")
                 }
             }
         }
+        .formaListBackground()
         .navigationTitle("Choose band")
         .onAppear { model.startScan(includeUnfiltered: includeUnfiltered) }
         .onDisappear { model.stopScan() }
+    }
+
+    /// Bands already connected to this iPhone (usually your own, held by another app) come first; the
+    /// model's order (known band types, then signal strength) is kept otherwise.
+    private var orderedDevices: [DiscoveredDevice] {
+        let devices = model.discoveredDevices
+        return devices.filter(\.connectedToThisPhone) + devices.filter { !$0.connectedToThisPhone }
     }
 
     private func subtitle(_ device: DiscoveredDevice) -> String {
@@ -216,7 +229,7 @@ struct ConnectionHistoryView: View {
             }
             ForEach(Array(model.connectionEvents.enumerated()), id: \.offset) { _, event in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(event.kind.rawValue)
+                    Text(Self.title(for: event.kind))
                         .font(.subheadline.weight(.medium))
                     Text(RelativeTimeFormatter(calendar: model.calendar).string(from: event.timestamp, now: model.now)
                          + (event.detail.map { " · \($0)" } ?? ""))
@@ -226,7 +239,26 @@ struct ConnectionHistoryView: View {
                 .accessibilityElement(children: .combine)
             }
         }
+        .formaListBackground()
         .navigationTitle("Connection history")
         .task { await model.loadConnectionEvents() }
+    }
+
+    static func title(for kind: ConnectionEventKind) -> String {
+        switch kind {
+        case .scanStarted: return "Started looking for bands"
+        case .scanStopped: return "Stopped looking for bands"
+        case .connecting: return "Waiting for the band"
+        case .connected: return "Connected"
+        case .servicesDiscovered: return "Ready: band services found"
+        case .disconnected: return "Disconnected"
+        case .connectFailed: return "Connection failed"
+        case .restoredByOS: return "Reconnected by iOS after a relaunch"
+        case .bluetoothOff: return "Bluetooth turned off"
+        case .bluetoothOn: return "Bluetooth on"
+        case .unauthorized: return "Bluetooth unavailable to Forma"
+        case .reconnectScheduled: return "Reconnecting soon"
+        @unknown default: return kind.rawValue
+        }
     }
 }

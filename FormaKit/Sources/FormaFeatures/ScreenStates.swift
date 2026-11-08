@@ -69,7 +69,8 @@ public struct LatestHeartRate: Hashable, Sendable {
     public var bpm: Int
     public var at: EpochMillis
     public var sourceLabel: String
-    /// True when the newest sample is older than the "live" threshold.
+    /// True when the sample is older than the "live" threshold (re-evaluated by `AppModel` on every
+    /// tick, so a value that stops updating is never presented as current).
     public var isStale: Bool
 
     public init(bpm: Int, at: EpochMillis, sourceLabel: String, isStale: Bool) {
@@ -279,7 +280,7 @@ public enum TrendMetric: String, Hashable, Sendable, CaseIterable, Identifiable 
         switch self {
         case .restingHR: return "Resting HR (overnight)"
         case .hrv: return "HRV (RMSSD)"
-        case .sleepDuration: return "Sleep duration"
+        case .sleepDuration: return "Time in sleep window"
         case .load: return "Forma Load"
         }
     }

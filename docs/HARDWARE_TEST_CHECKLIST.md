@@ -68,7 +68,7 @@ Acknowledgements are **off** for 5.1–5.5: Forma downloads and saves, and the b
 | 5.2 | Sync again immediately | The band sends the same data again (it was not acknowledged): 0 new records, duplicates counted. Confirms the band keeps unacknowledged history | |
 | 5.3 | Kill Forma (Xcode stop) **mid-transfer**, reopen, sync again | No duplicates (dedup keys). The previously interrupted chunk is transferred again | |
 | 5.4 | Walk out of range mid-transfer | Sync is marked interrupted. On return it resumes. No data loss and no duplicates | |
-| 5.5 | Field validation: history HR vs live HR for the same minutes | "Field validation" passes only if the values agree (median absolute difference ≤ 3 bpm over ≥ 10 min). Otherwise history HR stays **unvalidated** and is not used in metrics | |
+| 5.5 | Field validation: history HR vs live HR for the same minutes | "Field validation" passes only if the values agree (≥ 10 overlapping minutes, median absolute difference ≤ 3 bpm, ≥ 90 % of minutes within ±5 bpm). Otherwise history HR stays **unvalidated** and is not used in metrics | |
 | 5.6 | **Acknowledgement test** (experimental; only after 5.1–5.2). Diagnostics → turn on "Confirm saved history to the band", Sync now | Only intact, fully saved chunks are acknowledged. Diagnostics shows chunks acknowledged and the band's answers (accepted / not accepted). Then Sync again: acknowledged chunks are **not** sent again. If the band does not accept the acknowledgement, or sends acknowledged data again, turn the setting off and report it with the capture | |
 | 5.7 | Coexistence: let the official app sync after Forma acknowledged a chunk | Record whether the official app still shows that period. This documents the trade-off described in Settings | |
 

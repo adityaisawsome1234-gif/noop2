@@ -15,7 +15,7 @@ struct TrendsView: View {
                 if let state = model.trends {
                     content(state)
                 } else {
-                    ProgressView("Loading").frame(maxWidth: .infinity, minHeight: 200)
+                    LoadingPlaceholder { await model.refreshNow() }
                 }
             }
             .navigationTitle("Trends")
@@ -60,7 +60,7 @@ struct TrendsView: View {
             } else if showTable {
                 TrendTable(values: state.daily, unit: state.metric.unit, calendar: model.calendar)
             } else {
-                DailyChart(values: state.daily, unit: state.metric.unit)
+                DailyChart(values: state.daily, unit: state.metric.unit, title: state.metric.title)
             }
             Toggle("Show as table", isOn: $showTable)
                 .font(Theme.Typeface.label)
@@ -86,10 +86,9 @@ struct TrendsView: View {
             Text("Descriptive statistics only. Changes over time can have many causes.")
                 .font(Theme.Typeface.caption)
                 .foregroundStyle(Theme.textSecondary)
-            Button("How these values are calculated") { explainedMetricID = model.specID(for: state.metric) }
-                .font(Theme.Typeface.caption)
-                .buttonStyle(.borderless)
-                .foregroundStyle(Theme.accent)
+            ExplainButton(title: "How these values are calculated", subject: state.metric.title) {
+                explainedMetricID = model.specID(for: state.metric)
+            }
         }
     }
 }

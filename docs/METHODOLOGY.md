@@ -50,7 +50,12 @@ The per-metric specifications (inputs, quality gates, method, windows, units, ba
 
 Decoded fields whose meaning public evidence hasn't confirmed are stored with `unvalidatedField` and excluded from every metric.
 
-- **Band-history heart rate** is validated per adapter and firmware. It passes when it agrees with **live standard heart rate** for the same minutes: median absolute difference ≤ 3 bpm over at least 10 overlapping minutes. If it disagrees, it stays excluded and the reason is shown.
+- **Band-history heart rate** is validated per adapter and firmware. It passes when it agrees with **live standard heart rate**, compared as per-minute means over the same minutes. Three conditions must hold:
+  - at least 10 minutes overlap;
+  - the median absolute difference is ≤ 3 bpm;
+  - at least 90 % of the overlapping minutes are within ±5 bpm, so a field that is badly wrong in a sizeable share of minutes cannot pass on the median alone.
+
+  Readings flagged as invalid, without sensor contact, with an unusable time or next to a clock change are not evidence. Forma runs the check automatically after a history download when the band and firmware have no verdict yet, and on demand in Diagnostics. A verdict applies only to history saved by the same adapter and firmware. If the data disagrees, history heart rate stays excluded and the reason is shown.
 - **Motion counts** have an unpublished scale. They are used for sleep candidates only if you allow it in Diagnostics.
 
 ## 5. Metrics at a glance

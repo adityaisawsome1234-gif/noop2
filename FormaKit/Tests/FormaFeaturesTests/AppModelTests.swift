@@ -122,20 +122,47 @@ final class TestPlatform: PlatformServices, @unchecked Sendable {
         #expect(model.sleep?.nights.isEmpty == true)
     }
 
-    @Test func backupRoundTripAndDeleteAll() async throws {
-        let (model, _, _, _) = makeModel()
+    /// PRD §7: demo data is never mixed with live records — not through export, not through import.
+    @Test func backupRoundTripNeverCarriesDemoDataAndDeleteAll() async throws {
+        let (model, _, _, clock) = makeModel()
+        let own = (0..<60).map { i in
+            HeartRateSample(deviceID: "P-1", timestamp: clock.now() - 120_000 + Int64(i) * 1_000, bpm: 64, source: .standardHeartRateService,
+                            receivedAt: clock.now() - 120_000 + Int64(i) * 1_000, quality: [.phoneReceiveTime])
+        }
+        _ = try #require(model.liveStore).ingest(IngestBatch(
+            provenance: Provenance(deviceID: "P-1", adapterID: "forma.standard-hr", parserVersion: "t", firmwareVersion: nil,
+                                   source: .standardHeartRateService, syncRunID: nil, createdAt: clock.now()),
+            heartRates: own))
         await model.enterDemo()
+        // Exports always hold the user's own data, also while Demo mode is showing.
         let backup = try await model.exportBackup()
-        #expect(String(decoding: backup.prefix(200), as: UTF8.self).contains("forma-backup"))
+        let text = String(decoding: backup, as: UTF8.self)
+        #expect(text.contains("forma-backup"))
+        #expect(!text.contains(DemoDataGenerator.deviceID), "a demo record was exported as the user's data")
         let csv = try await model.exportCSVArchive()
         #expect(String(decoding: csv, as: UTF8.self).contains("hr_samples.csv"))
         await model.exitDemo()
+
+        // A backup of the demo database (as an earlier build exported in Demo mode) is refused as a whole.
+        let demoURL = FileManager.default.temporaryDirectory.appendingPathComponent("forma-demo-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: demoURL) }
+        try #require(model.demoStore).exportBackup(to: demoURL)
+        let refused = await model.importBackup(from: demoURL)
+        #expect(refused.contains("demo data"), "\(refused)")
+        #expect(try #require(model.liveStore).heartRates(in: TimeRange(start: 0, end: Int64.max / 4)).count == own.count)
+        #expect(try #require(model.liveStore).devices().allSatisfy { $0.id != DemoDataGenerator.deviceID })
+
+        // The user's own backup round-trips.
+        let wiped = await model.deleteAllData()
+        #expect(wiped.contains("deleted"))
+        #expect(model.today?.hasAnyData == false)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("forma-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
         try backup.write(to: url)
         let report = await model.importBackup(from: url)
-        #expect(report.hasPrefix("Imported"))
-        await model.refreshNow()
+        #expect(report.hasPrefix("Imported"), "\(report)")
         #expect(model.today?.hasAnyData == true)
+        #expect(try #require(model.liveStore).heartRates(in: TimeRange(start: 0, end: Int64.max / 4)).count == own.count)
         let again = await model.importBackup(from: url)
         #expect(again.contains("Imported 0 records"), "re-import must not duplicate: \(again)")
         let message = await model.deleteAllData()

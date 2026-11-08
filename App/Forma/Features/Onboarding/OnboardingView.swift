@@ -29,8 +29,11 @@ struct OnboardingView: View {
             .background(Theme.background.ignoresSafeArea())
             .sheet(isPresented: $showPicker) {
                 NavigationStack { DevicePickerView() }
+                    .modelAlert(model)
             }
         }
+        // While the band picker is up, its own alert shows the model's messages.
+        .modelAlert(model, isActive: !showPicker)
     }
 
     @ViewBuilder
@@ -51,25 +54,28 @@ struct OnboardingView: View {
                 Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(Theme.critical)
             }
             Button("Allow Bluetooth") { model.requestBluetooth() }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
+                .buttonStyle(.formaProminent)
         case 3:
             heading("Choose your band", icon: "sensor.tag.radiowaves.forward")
             paragraph("Keep the band close to your iPhone. Forma lists matching bands nearby and bands already connected to this iPhone.")
             if let device = model.selectedDevice {
                 Label("Selected: \(device.name)", systemImage: "checkmark.circle.fill").foregroundStyle(Theme.accent)
-                paragraph("Forma will run a short compatibility test after setup. It only reads data and never changes the band.")
+                paragraph("After setup you can run a short compatibility test from Band → Compatibility test and diagnostics. It shows which data paths your band provides and never resets, updates or reconfigures the band.")
             }
             Button(model.selectedDevice == nil ? "Find band" : "Choose a different band") { showPicker = true }
                 .buttonStyle(.bordered)
                 .tint(Theme.accent)
-            Button("Skip and explore demo data") {
-                Task {
-                    await model.enterDemo()
-                    model.completeOnboarding()
+            if model.isPreparingDemo {
+                ProgressView("Preparing demo data…")
+            } else {
+                Button("Skip and explore demo data") {
+                    Task {
+                        await model.enterDemo()
+                        model.completeOnboarding()
+                    }
                 }
+                .tint(Theme.demo)
             }
-            .tint(Theme.demo)
         case 4:
             heading("Band history", icon: "clock.arrow.circlepath")
             paragraph("Your band stores data while your iPhone is away. Forma can download it and fill the gaps.")
@@ -106,12 +112,10 @@ struct OnboardingView: View {
             Spacer()
             if step < lastStep {
                 Button("Continue") { step += 1 }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Theme.accent)
+                    .buttonStyle(.formaProminent)
             } else {
                 Button("Start using Forma") { model.completeOnboarding() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Theme.accent)
+                    .buttonStyle(.formaProminent)
             }
         }
     }

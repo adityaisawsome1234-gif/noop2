@@ -7,7 +7,7 @@ All data lives in `Application Support/Forma/` inside Forma's app container on t
 | File | Contents |
 |---|---|
 | `forma.sqlite` (+ `-wal`, `-shm`) | Live data from your band, plus your sessions, corrections, settings and cached derived metrics |
-| `forma-demo.sqlite` | Synthetic demo data. It is used only in Demo mode, labelled on every screen, and never mixed with live data |
+| `forma-demo.sqlite` | Synthetic demo data. It is used only in Demo mode, labelled on every screen, and never mixed with live data. Exports and backups always contain live data only (also in Demo mode), and an import refuses any file that contains demo records |
 
 Database tables (schema v1; full definitions in `FormaKit/Sources/FormaStore`):
 
