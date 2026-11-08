@@ -1,0 +1,1 @@
+Fixtures for protocol tests.
