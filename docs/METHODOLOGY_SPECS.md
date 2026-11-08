@@ -36,7 +36,7 @@
 - HeartRateSample from band history, the live vendor stream, the standard Heart Rate Service or a backup import
 
 **Quality gates**
-- Excluded: samples flagged outOfRange, deviceMarkedInvalid, noSensorContact, clockUnmapped or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware); they never enter coverage, zones or any metric
+- Excluded: samples flagged outOfRange, deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity (time uncertain next to a band clock change or restart) or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware); they never enter coverage, zones or any metric
 - Excluded: bpm outside 25–240
 - Excluded: timestamps more than 2^52 ms from the Unix epoch (malformed)
 
@@ -165,7 +165,7 @@
 **Quality gates**
 - Rule A: intervals outside 300–2000 ms (or non-finite, or flagged outOfRange) are rejected
 - Rule B: an interval deviating more than 20% from the median of the last ≤ 5 accepted intervals of its segment is rejected; applied once ≥ 3 accepted references exist
-- Beats flagged deviceMarkedInvalid, noSensorContact, clockUnmapped or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware) are rejected (counted as flagged)
+- Beats flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware) are rejected (counted as flagged)
 - A window is valid when ≥ 80% of its beats are accepted, its accepted intervals sum to ≥ 180 s and it has ≥ 100 successive pairs
 - At least 6 valid windows are required; otherwise insufficient data
 - A period median RMSSD of 0 ms (no beat-to-beat variation, suggesting quantised or synthetic data) is reported as low quality, never as a value
@@ -292,7 +292,7 @@
 **Quality gates**
 - No motion input: not provided by this band: motion (accelerometer)
 - No usable motion epoch in the window: insufficient data
-- Motion epochs flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, outOfRange or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware), with no samples, or with non-finite or negative activity count as missing
+- Motion epochs flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity, outOfRange or unvalidatedField (decoded from a field whose meaning is not yet validated for the firmware), with no samples, or with non-finite or negative activity count as missing
 - The main candidate must last at least 3 h
 - Motion data must cover at least 70% of the candidate's epochs; otherwise low quality
 - The user must confirm a candidate before it counts

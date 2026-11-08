@@ -144,7 +144,7 @@ public enum SleepDetector {
     /// Motion epochs carrying any of these flags are treated as missing data (an off-wrist band lying
     /// still would otherwise look like sleep; an unvalidated field is never used).
     public static let excludedMotionFlags: QualityFlags = [.deviceMarkedInvalid, .noSensorContact, .clockUnmapped, .outOfRange,
-                                                           .unvalidatedField]
+                                                           .unvalidatedField, .nearClockDiscontinuity]
 
     /// The detection window for the night that ends on the morning of `day` (a Gregorian date; only
     /// `calendar`'s time zone is used): `[day−1 at windowStartHour, day at windowStartHour)` local time

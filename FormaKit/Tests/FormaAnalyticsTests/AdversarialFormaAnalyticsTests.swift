@@ -220,8 +220,10 @@ struct AdvHeartRateSeriesTests {
     // The integration review added `.unvalidatedField` to the module spec's four exclusion flags: a value decoded
     // from a field whose meaning is not yet validated must never enter a series or metric.
     @Test func usableExcludesExactlyTheSpecExclusionFlags() {
-        let excluded: [QualityFlags] = [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped, .unvalidatedField]
-        let tolerated: [QualityFlags] = [.phoneReceiveTime, .clockOffsetApplied, .nearClockDiscontinuity]
+        // Integration also added `.nearClockDiscontinuity` (METHODOLOGY §2: records next to a clock change are excluded).
+        let excluded: [QualityFlags] = [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped, .unvalidatedField,
+                                        .nearClockDiscontinuity]
+        let tolerated: [QualityFlags] = [.phoneReceiveTime, .clockOffsetApplied]
         for f in excluded {
             #expect(HeartRateSeries.usable([AX.hr(t0, 60, quality: f)]).isEmpty, "flag \(f.rawValue) must exclude")
             #expect(HeartRateSeries.usable([AX.hr(t0, 60, quality: f.union(.phoneReceiveTime))]).isEmpty)

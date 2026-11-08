@@ -196,7 +196,8 @@ public struct HRVAnalysis: Hashable, Sendable, Codable {
 public enum HRVAnalyzer {
     /// Flags that make a beat unusable regardless of its value (`unvalidatedField`: decoded from a field whose
     /// meaning is not yet validated for the firmware).
-    public static let flaggedQuality: QualityFlags = [.deviceMarkedInvalid, .noSensorContact, .clockUnmapped, .unvalidatedField]
+    public static let flaggedQuality: QualityFlags = [.deviceMarkedInvalid, .noSensorContact, .clockUnmapped, .unvalidatedField,
+                                                      .nearClockDiscontinuity]
     /// Sensor named when the band provides no beat intervals.
     public static let sensorName = "beat-to-beat intervals"
     /// A beat with a plausible interval starts a new segment when the time since the previous beat is less than

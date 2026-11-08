@@ -68,7 +68,7 @@ public enum MetricCatalog {
             id: MetricID.heartRateSeries, name: "Heart rate", version: 2, status: .measured, unit: "bpm",
             requiredInputs: ["HeartRateSample from band history, the live vendor stream, the standard Heart Rate Service or a backup import"],
             qualityGates: [
-                "Excluded: samples flagged outOfRange, deviceMarkedInvalid, noSensorContact, clockUnmapped or \(unvalidatedFieldNote); they never enter coverage, zones or any metric",
+                "Excluded: samples flagged outOfRange, deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity (time uncertain next to a band clock change or restart) or \(unvalidatedFieldNote); they never enter coverage, zones or any metric",
                 "Excluded: bpm outside \(plausible.lowerBound)–\(plausible.upperBound)",
                 "Excluded: timestamps more than 2^52 ms from the Unix epoch (malformed)",
             ],
@@ -174,7 +174,7 @@ public enum MetricCatalog {
             qualityGates: [
                 "Rule A: intervals outside \(num(r.lowerBound, 0))–\(num(r.upperBound, 0)) ms (or non-finite, or flagged outOfRange) are rejected",
                 "Rule B: an interval deviating more than \(pct(p.ruleBMaximumDeviation)) from the median of the last ≤ \(p.ruleBReferenceBeats) accepted intervals of its segment is rejected; applied once ≥ \(p.ruleBMinimumReferences) accepted references exist",
-                "Beats flagged deviceMarkedInvalid, noSensorContact, clockUnmapped or \(unvalidatedFieldNote) are rejected (counted as flagged)",
+                "Beats flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity or \(unvalidatedFieldNote) are rejected (counted as flagged)",
                 "A window is valid when ≥ \(pct(p.windowMinimumAcceptedFraction)) of its beats are accepted, its accepted intervals sum to ≥ \(num(p.windowMinimumAcceptedMillis / 1_000, 0)) s and it has ≥ \(p.windowMinimumPairs) successive pairs",
                 "At least \(p.minimumValidWindows) valid windows are required; otherwise insufficient data",
                 "A period median RMSSD of 0 ms (no beat-to-beat variation, suggesting quantised or synthetic data) is reported as low quality, never as a value",
@@ -276,7 +276,7 @@ public enum MetricCatalog {
             qualityGates: [
                 "No motion input: not provided by this band: \(SleepDetector.motionSensorName)",
                 "No usable motion epoch in the window: insufficient data",
-                "Motion epochs flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, outOfRange or \(unvalidatedFieldNote), with no samples, or with non-finite or negative activity count as missing",
+                "Motion epochs flagged deviceMarkedInvalid, noSensorContact, clockUnmapped, nearClockDiscontinuity, outOfRange or \(unvalidatedFieldNote), with no samples, or with non-finite or negative activity count as missing",
                 "The main candidate must last at least \(dur(p.minimumCandidateMillis))",
                 "Motion data must cover at least \(pct(p.minimumMotionCoverage)) of the candidate's epochs; otherwise low quality",
                 "The user must confirm a candidate before it counts",

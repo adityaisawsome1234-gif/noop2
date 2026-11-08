@@ -53,10 +53,10 @@ struct CatalogTests {
         #expect(HeartRateSeries.historyPrecedenceMillis == 5_000)
         #expect(HeartRateSeries.defaultMaxGapMillis == 10_000)
         #expect(HeartRateSeries.excludedFlags == [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped,
-                                                  .unvalidatedField])
+                                                  .unvalidatedField, .nearClockDiscontinuity])
         expectMentions(MetricCatalog.heartRateSeries, ["±5 s", "for at most 5 s", "more than 10 s apart", "25–240",
                                                        "live vendor stream > backup import > standard Heart Rate Service",
-                                                       "clockUnmapped or unvalidatedField"])
+                                                       "clockUnmapped, nearClockDiscontinuity", "restart) or unvalidatedField"])
     }
 
     @Test func zoneAndMaxHeartRateParameters() {

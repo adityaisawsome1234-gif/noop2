@@ -64,8 +64,10 @@ public struct HeartRateSeries: Hashable, Sendable {
     /// `.unvalidatedField` is included: a value decoded from a field whose meaning is not yet validated
     /// for the firmware never enters a series, coverage, zones or any metric. Once a field is validated,
     /// the ingest or feature layer should stop setting (or remove) the flag.
+    /// `.nearClockDiscontinuity` is included too: next to a band clock change or restart the record's absolute
+    /// time is uncertain (METHODOLOGY §2).
     public static let excludedFlags: QualityFlags = [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped,
-                                                     .unvalidatedField]
+                                                     .unvalidatedField, .nearClockDiscontinuity]
     /// Longest time one sample may stand for, ms.
     public static let maxSpanMillis: Int64 = 5_000
     /// Non-history samples within ± this many ms of a usable band-history sample are dropped.
