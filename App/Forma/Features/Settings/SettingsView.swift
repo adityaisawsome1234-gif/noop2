@@ -5,6 +5,7 @@ import FormaFeatures
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(AppLock.self) private var appLock
 
     var body: some View {
         Form {
@@ -37,8 +38,8 @@ struct SettingsView: View {
                 }
             }
             Section {
-                Toggle("Require Face ID or passcode", isOn: Binding(get: { model.appLock.isEnabled },
-                                                                    set: { model.appLock.setEnabled($0) }))
+                Toggle("Require Face ID or passcode", isOn: Binding(get: { appLock.isEnabled },
+                                                                    set: { appLock.setEnabled($0) }))
                     .tint(Theme.accent)
             } header: {
                 Text("Privacy")

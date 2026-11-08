@@ -61,6 +61,11 @@ final class CoreBluetoothLink: PeripheralLink, @unchecked Sendable {
         let key = UUIDs.normalize(characteristic)
         guard let c = characteristics[key] else { throw LinkError.characteristicNotFound(key) }
         if lock.withLock({ closed }) { throw LinkError.notConnected }
+        // Use the write type the characteristic actually supports (prefer the requested one).
+        let props = c.properties
+        let withResponse = withResponse
+            ? (props.contains(.write) || !props.contains(.writeWithoutResponse))
+            : !(props.contains(.writeWithoutResponse)) && props.contains(.write)
         let maxLength = peripheral.maximumWriteValueLength(for: withResponse ? .withResponse : .withoutResponse)
         guard bytes.count <= maxLength else { throw LinkError.writeFailed("command of \(bytes.count) bytes exceeds the link limit of \(maxLength)") }
         let data = Data(bytes)

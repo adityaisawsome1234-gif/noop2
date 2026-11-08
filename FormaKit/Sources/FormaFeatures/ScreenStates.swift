@@ -1,5 +1,6 @@
 import Foundation
 import FormaCore
+import FormaAnalytics
 
 // Display-ready state for each screen. Views render these and nothing else, so every state
 // (disconnected, syncing, partial, calibrating, insufficient quality, unsupported sensor, empty,
@@ -293,9 +294,7 @@ public enum TrendMetric: String, Hashable, Sendable, CaseIterable, Identifiable 
     }
 }
 
-public enum TrendPeriod: Int, Hashable, Sendable, CaseIterable, Identifiable {
-    case week = 7, month = 30, quarter = 90
-
+extension TrendPeriod: Identifiable {
     public var id: Int { rawValue }
     public var title: String { "\(rawValue) days" }
 }

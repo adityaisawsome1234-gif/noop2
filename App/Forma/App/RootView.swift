@@ -8,6 +8,7 @@ enum AppTab: Hashable {
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(AppLock.self) private var appLock
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -31,7 +32,7 @@ struct RootView: View {
         }
         .preferredColorScheme(model.appearance.colorScheme)
         .overlay {
-            if model.appLock.isLocked {
+            if appLock.isLocked {
                 LockScreen()
             }
         }
@@ -46,7 +47,7 @@ struct RootView: View {
             case .active:
                 Task { await model.sceneBecameActive() }
             case .background:
-                model.appLock.lockIfEnabled()
+                appLock.lockIfEnabled()
                 model.sceneEnteredBackground()
             default:
                 break
@@ -57,7 +58,7 @@ struct RootView: View {
 
 /// Privacy screen shown while App Lock is engaged.
 struct LockScreen: View {
-    @Environment(AppModel.self) private var model
+    @Environment(AppLock.self) private var appLock
 
     var body: some View {
         ZStack {
@@ -68,15 +69,15 @@ struct LockScreen: View {
                     .foregroundStyle(Theme.accent)
                 Text("Forma is locked")
                     .font(.title2.weight(.semibold))
-                if let error = model.appLock.lastError {
+                if let error = appLock.lastError {
                     Text(error).font(.footnote).foregroundStyle(Theme.textSecondary).multilineTextAlignment(.center)
                 }
-                Button("Unlock") { Task { await model.appLock.unlock() } }
+                Button("Unlock") { Task { await appLock.unlock() } }
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.accent)
             }
             .padding(Theme.Space.xl)
         }
-        .task { await model.appLock.unlock() }
+        .task { await appLock.unlock() }
     }
 }

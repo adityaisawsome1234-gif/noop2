@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import FormaFeatures
 
 /// Forma design tokens. Colors are defined in code (not an asset catalog) so light, dark and
 /// increased-contrast variants live side by side and can be reviewed together.
@@ -95,25 +96,13 @@ extension UIColor {
     }
 }
 
-/// App-wide appearance preference (Settings → Appearance).
-enum AppearancePreference: String, CaseIterable, Identifiable {
-    case system, light, dark
-
-    var id: String { rawValue }
-
+extension AppearancePreference {
+    /// SwiftUI color scheme for `.preferredColorScheme` (nil = follow the system).
     var colorScheme: ColorScheme? {
         switch self {
         case .system: return nil
         case .light: return .light
         case .dark: return .dark
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .system: return "Match system"
-        case .light: return "Light"
-        case .dark: return "Dark"
         }
     }
 }

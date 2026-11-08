@@ -5,17 +5,6 @@ import FormaProtocol
 import FormaSync
 import FormaFeatures
 
-/// Events from the central to the app model (delivered on the main actor).
-enum CentralEvent: Sendable {
-    case stateChanged(LinkState)
-    case bluetoothProblem(String?)
-    case discovered(DiscoveredDevice, advertisement: [String: String])
-    case scanStopped
-    case linkReady(CoreBluetoothLink, services: [GATTServiceSummary])
-    case connectionEvent(ConnectionEvent)
-    case pairingProblem(String)
-}
-
 /// Owns the app's single `CBCentralManager`.
 ///
 /// - Created once at process start with a constant restoration identifier (iOS 27 scene-based apps get
@@ -25,13 +14,14 @@ enum CentralEvent: Sendable {
 /// - Scans only when the user is choosing a band: filtered by service UUIDs, time-boxed to 30 s.
 ///   Unfiltered scanning is offered only explicitly, in the foreground.
 /// - All Core Bluetooth calls happen on `queue`, the same serial queue that receives delegate callbacks.
-final class BLECentral: NSObject, @unchecked Sendable {
+final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
     static let restoreIdentifier = "com.forma.central.v1"
     private static let selectedPeripheralKey = "forma.selectedPeripheralID"
 
     let queue = DispatchQueue(label: "com.forma.ble", qos: .userInitiated)
     private var central: CBCentralManager!
-    private let onEvent: @Sendable (CentralEvent) -> Void
+    private let handlerLock = NSLock()
+    private var handler: (@Sendable (CentralEvent) -> Void)?
 
     // State below is only touched on `queue`.
     private var target: CBPeripheral?
@@ -49,9 +39,8 @@ final class BLECentral: NSObject, @unchecked Sendable {
     /// Profiles the app knows how to drive. Used for scan filters and post-discovery adapter selection.
     let knownProfiles: [GATTProfile]
 
-    init(knownProfiles: [GATTProfile], onEvent: @escaping @Sendable (CentralEvent) -> Void) {
+    init(knownProfiles: [GATTProfile]) {
         self.knownProfiles = knownProfiles
-        self.onEvent = onEvent
         super.init()
         central = CBCentralManager(delegate: self, queue: queue, options: [
             CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier,
@@ -59,9 +48,33 @@ final class BLECentral: NSObject, @unchecked Sendable {
         ])
     }
 
+    /// Events raised before the app model installs its handler (e.g. state restoration at launch) are
+    /// buffered and delivered when the handler is set, so nothing is lost.
+    private var pendingEvents: [CentralEvent] = []
+
+    func setEventHandler(_ handler: @escaping @Sendable (CentralEvent) -> Void) {
+        let backlog: [CentralEvent] = handlerLock.withLock {
+            self.handler = handler
+            let b = pendingEvents
+            pendingEvents.removeAll()
+            return b
+        }
+        for e in backlog { handler(e) }
+    }
+
+    private func onEvent(_ event: CentralEvent) {
+        let h: (@Sendable (CentralEvent) -> Void)? = handlerLock.withLock {
+            if handler == nil, pendingEvents.count < 500 { pendingEvents.append(event) }
+            return handler
+        }
+        h?(event)
+    }
+
+    var savedPeripheralID: String? { Self.savedPeripheralUUID?.uuidString }
+
     // MARK: Persistence of the selected band
 
-    static var savedPeripheralID: UUID? {
+    static var savedPeripheralUUID: UUID? {
         guard let s = UserDefaults.standard.string(forKey: selectedPeripheralKey) else { return nil }
         return UUID(uuidString: s)
     }
@@ -91,7 +104,8 @@ final class BLECentral: NSObject, @unchecked Sendable {
         }
     }
 
-    func select(peripheralID: UUID, profile: GATTProfile) {
+    func select(peripheralID: String, profile: GATTProfile) {
+        guard let peripheralID = UUID(uuidString: peripheralID) else { return }
         queue.async {
             Self.savePeripheralID(peripheralID)
             if let current = self.target, current.identifier != peripheralID {
@@ -161,7 +175,7 @@ final class BLECentral: NSObject, @unchecked Sendable {
 
     private func establishConnection() {
         guard wantConnected, central.state == .poweredOn else { return }
-        if target == nil, let id = Self.savedPeripheralID {
+        if target == nil, let id = Self.savedPeripheralUUID {
             target = central.retrievePeripherals(withIdentifiers: [id]).first
         }
         guard let p = target else {
@@ -200,7 +214,8 @@ final class BLECentral: NSObject, @unchecked Sendable {
             if pendingServiceDiscoveries == 0 { subscribe(p) }
             return
         }
-        p.discoverServices(profile.discoverServices.map { CBUUID(string: $0) })
+        // An empty list means "discover everything" (used when the band's family is not known yet).
+        p.discoverServices(profile.discoverServices.isEmpty ? nil : profile.discoverServices.map { CBUUID(string: $0) })
     }
 
     private func register(_ characteristics: [CBCharacteristic], on p: CBPeripheral) {
@@ -349,7 +364,7 @@ extension BLECentral: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
-        let saved = Self.savedPeripheralID
+        let saved = Self.savedPeripheralUUID
         if let p = restored.first(where: { $0.identifier == saved }) ?? restored.first {
             target = p
             p.delegate = self

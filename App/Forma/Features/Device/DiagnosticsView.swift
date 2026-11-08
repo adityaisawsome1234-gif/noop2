@@ -82,7 +82,7 @@ struct DiagnosticsView: View {
                     .tint(Theme.accent)
                 LabeledContent("Captured entries", value: "\(state.capturedEntries)")
                 Button("Export capture…") {
-                    do { exportDocument = try model.makeCaptureDocument() } catch { exportError = error.localizedDescription }
+                    do { exportDocument = CaptureDocument(data: try model.makeCaptureData()) } catch { exportError = error.localizedDescription }
                 }
                 .disabled(state.capturedEntries == 0)
                 Button("Clear capture", role: .destructive) { model.clearCapture() }
