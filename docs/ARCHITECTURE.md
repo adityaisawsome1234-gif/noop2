@@ -35,18 +35,22 @@ Dependency rules, enforced by `Package.swift`:
 
 ```
 BLE notification ──► PeripheralLink.events ──► SyncEngine
-(CoreBluetoothLink                               │  per-characteristic FrameAssembler (adapter codec)
- or ReplayLink)                                  │  adapter decoder → DecodedEvent
-                                                 │  ClockMapper: device time → UTC, flags
-                                                 │  Normalizer → FormaCore records (+ provenance)
+(CoreBluetoothLink                               │  adapter decoder: per-characteristic frame reassembly → DecodedEvent
+ or ReplayLink)                                  │  ClockMapper: device time → UTC, flags
+                                                 │  normalize → FormaCore records (+ provenance)
                                                  ▼
                                           IngestSink.ingest(batch)   ← one SQLite transaction
                                                  │
-                                   (only after success) history acknowledgement command
+                                          IngestSink.ensureDurable() ← WAL checkpoint, full fsync
+                                                 │
+                   (only if enabled, and only for an intact chunk) history acknowledgement command
 ```
 
 - **Same code path.** `CoreBluetoothLink` (app) and `ReplayLink` (FormaSync, fed by a `CaptureFile`) implement the same `PeripheralLink` protocol. Tests, the `forma-replay` CLI and the app all run the identical `SyncEngine` → adapter → normalizer → `IngestSink` pipeline.
-- **Persist before acknowledge.** History acknowledgements that may advance or discard the band's stored history are sent only after `IngestSink.ingest` returns. If persistence throws, no acknowledgement is sent. The band keeps the data and the next sync re-requests it, and the dedup keys absorb any repeat.
+- **Persist before acknowledge.** History acknowledgements that may advance or discard the band's stored history are sent only after `IngestSink.ingest` returned and `IngestSink.ensureDurable()` made the commit survive power loss. If either throws, no acknowledgement is sent. The band keeps the data and the next sync re-requests it, and the dedup keys absorb any repeat.
+- **History transfers are owned.** The engine acts only on a transfer it requested, in this order: read the band clock (wait up to 7 s for the answer), read the history range (cmd 34; wait for an explicit success, 25 s more on each "pending", two retries), then request history (cmd 22). Records and markers that arrive outside such a transfer (for example when another app on the same phone syncs) are saved if history is enabled, but never acknowledged and never move Forma's sync cursor.
+- **When a chunk may be acknowledged.** Acknowledgements are off by default (`SyncOptions.acknowledgeHistory`). When on, a chunk is acknowledged only if its start marker was seen; no frame on a vendor characteristic was malformed, truncated or left partial; every record was of a kind the adapter decodes (`HistoryRecord.contentDecoded`) and had a mappable time; and the save and durability flush succeeded. The first failing chunk blocks acknowledgements for the rest of that transfer. Forma never sends an abort.
+- **Timeouts.** A timer task enforces command, pending and idle deadlines against the engine's clock: the later of the time source and the newest receive time, so a replayed capture reproduces a silent band. A transfer that goes quiet after some chunks ends as *interrupted*, never as *complete*. `lastCompleteSyncAt` is written only when the band's completion marker arrived and every chunk was saved intact.
 - **Dedup keys** (unique indexes, `INSERT OR IGNORE`):
   - HR: `(device, source, ts)`
   - Beat intervals: `(device, source, record_key, index)`
@@ -58,7 +62,7 @@ BLE notification ──► PeripheralLink.events ──► SyncEngine
 
 ## 2. Protocol layer and device adapters
 
-- `FrameAssembler<Codec>` reassembles frames across BLE notifications, one assembler per characteristic. It validates header and payload checksums, resyncs after garbage, bounds its buffer and reports malformed or discarded bytes instead of throwing them away silently.
+- Each adapter's decoder reassembles frames across BLE notifications, one reassembler per characteristic (WHOOP 5.0: `Whoop5Deframer`). It validates the header checksum before trusting a length, then the payload checksum. On a failure it drops only the start byte and rescans, so genuine frames inside a bogus or truncated span are recovered. A frame still arriving is abandoned as soon as a complete valid frame appears inside its span. Each frame keeps the receive time of the notification that carried its first byte. Malformed or discarded bytes are reported, never silently dropped, and the outcome does not depend on how notifications split the stream.
 - A `DeviceAdapter` holds everything family-specific:
   - the GATT profile (service and characteristic UUIDs and roles)
   - the frame codec
@@ -66,13 +70,13 @@ BLE notification ──► PeripheralLink.events ──► SyncEngine
   - the command encoder
 
   Adding WHOOP 4.0 or another band means adding an adapter. Nothing else changes.
-- **Command allowlist.** Commands are an `enum AllowedCommand` that can only express verified read, stream-toggle and acknowledge operations. Reset, reboot, erase, firmware/DFU, haptics, config writes and clock writes are **not representable**. Each adapter also keeps a runtime set of commands verified for its firmware. Every command written is logged to the diagnostics capture.
-- **Unknown or malformed data.** Unknown packet types are surfaced as `DecodedEvent.unknown` and counted, and are kept as raw evidence when capture is enabled. Malformed frames are rejected without crashing. Decoded fields whose meaning is unvalidated are stored with `validated = false` and never shown as health values.
+- **Command allowlist.** Commands are an `enum AllowedCommand` that can only express read, stream-toggle, history request and acknowledge operations. Reset, reboot, erase, firmware/DFU, haptics, config writes and clock writes are **not representable**. Each adapter declares which of them it supports (`supports(_:)`). Its `encode` returns an `EncodedCommand`, which only code inside FormaProtocol can create, and `PeripheralLink.write` accepts nothing else. So no module can push hand-built bytes to a band. Every successful write is logged to the diagnostics capture, and failed writes are logged as failures.
+- **Unknown or malformed data.** Unknown packet types are surfaced as `DecodedEvent.unknownPacket` and counted. With capture enabled, notifications that produced unknown, malformed or discarded bytes are also kept in the bounded raw-frame table. Malformed frames are rejected without crashing. Decoded fields whose meaning is unvalidated carry the `unvalidatedField` quality flag and are never shown as health values.
 
 ## 3. Time
 
 - Every stored record carries **source time** (raw device clock value), **receive time** (phone clock) and the **normalized UTC timestamp**, plus the clock offset applied.
-- `ClockMapper` builds the device→UTC mapping from clock reads and packet timestamps, and flags records:
+- `ClockMapper` builds the device→UTC mapping from clock reads (GET_CLOCK, once per connection and after clock events). Offsets within 2 s are ignored; larger offsets up to 24 h are applied. A band clock before 2020 or off by more than 24 h makes every record unmappable (left on the band), because Forma never sets the clock. It flags records:
   - `.clockOffsetApplied` when an offset was used
   - `.nearClockDiscontinuity` near jumps, resets or reboots
   - `.clockUnmapped` when the mapping is uncertain (such records are excluded from analytics)

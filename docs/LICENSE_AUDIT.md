@@ -1,6 +1,6 @@
 # License and provenance audit of public interoperability projects
 
-**Audited:** 2026-11-08, from local clones at the pinned commits below. Read-only: no code from these projects was built, run or imported. Detailed notes with file:line citations are in `docs/research/`.
+**Audited:** 2026-11-08, from local clones at the pinned commits below. Read-only: no code from these projects was built, run or imported. The facts Forma uses, each with a file:line citation, are restated in Forma's own words in `docs/research/WHOOP5_PROTOCOL.md`.
 
 **Result:** Forma contains **no code** from any of these projects. Forma uses only interoperability **facts** described by the sources: identifiers, frame layouts, checksum parameters, command numbers, byte offsets and observed bytes on the wire. Facts are not copyrightable. All parsing, sync, storage, analytics and UI code in Forma is original. The test vectors in Forma's suite are frames that Forma's own builder derives from the documented algorithm. Published third-party captures are only fetched at run time by `Tools/verify-published-captures.sh`; they are never committed.
 
@@ -29,4 +29,30 @@
 
 ## my-whoop
 
-*Completed from the my-whoop extraction (`docs/research/`).*
+`johnmiddleton12/my-whoop` at `890e0c96beb817ab0cec3aaf7d9a06c530025355` (2026-05-30). The history is a single squashed commit.
+
+- **License: none.**
+  - There is no LICENSE, COPYING or NOTICE file, no SPDX tag and no copyright header.
+  - The Swift packages and the Python `pyproject.toml` declare no license.
+  - The README calls the project "open-source", but the repository grants no license, and the disclaimer limits it to personal and educational use.
+  - So all rights are reserved: Forma may record facts from it and must not reuse its code.
+- **Provenance concerns.**
+  - The README says its HRV and strain modules were "ported" from `bWanShiTong/openwhoop-algos`, while one source file calls its strain code an independent implementation.
+  - Its `.gitignore` excludes a decompiled official-app directory, so some of its facts trace back to the official Android app.
+- **What it covers.** WHOOP **4.0** only (the README says other generations use different protocols): reverse-engineering notes, an iOS collector and a server.
+- **Forma's use.** WHOOP 4.0 facts for the compatibility matrix only. Nothing from it is used in the WHOOP 5.0 adapter. No code, no algorithms. Forma's analytics are its own published methods (`METHODOLOGY.md`).
+
+## whoop4-ble
+
+`andyguzmaneth/whoop4-ble` at `a76ad4576bda9ec76cc6347ff9ad18fbcad1cd88` (2026-05-11).
+
+- **License: MIT**, "Copyright (c) 2026 Andy Guzman". The `LICENSE` file and `pyproject.toml` agree.
+- Its runtime dependencies (bleak, websockets, and Chart.js loaded from a CDN) state no license in the repository. Forma needs none of them.
+- **Forma's use.** WHOOP 4.0 facts only (framing and CRC parameters for the compatibility matrix). No code is included. If a WHOOP 4.0 adapter is ever written from it, the MIT terms allow reuse provided the copyright and permission notice is kept in `THIRD_PARTY_NOTICES.md`.
+
+## How this audit was done
+
+- Each repository was cloned at the commit above.
+- Its license files, package manifests and README were read directly, and the git history was inspected.
+- Every protocol fact Forma uses was traced to a file and line (see `docs/research/`).
+- Forma's implementation was written from those facts, then checked against real published payloads (`Tools/verify-published-captures.sh`) and independently re-derived frames. Nothing was copied.

@@ -28,9 +28,10 @@ The per-metric specifications (inputs, quality gates, method, windows, units, ba
 ## 2. Time
 
 - **Band-history records** use the band's own clock (Unix seconds), never the moment the phone received them.
-  - If a clock reading shows the band is more than 2 s off, the offset is applied and recorded (`clockOffsetApplied`).
+  - Forma reads the band's clock once per connection (and again after a clock event). If the band is more than 2 s off, the offset (whole seconds, up to 24 h) is applied and recorded on each record (`clockOffsetApplied`, with the offset).
+  - A band clock before 2020 or off by more than 24 h is treated as wrong. Forma never sets the band's clock, so history then stays on the band until the clock is fixed.
   - Records with implausible times (before 2020 or more than a day in the future) cannot be placed in time. They are not stored as measurements, and that history chunk is **not** acknowledged, so the band keeps it.
-  - Records next to clock resets or device restarts are flagged and excluded from analytics.
+  - Records next to clock resets or device restarts are flagged and excluded from analytics. Restart detection runs per record kind and starts fresh with every transfer.
 - **Standard heart-rate service** data carries no timestamps. Forma stamps it with the phone's receive time and flags it as such. Beat intervals from it are placed backwards from the receive time.
 - Days, nights and trends use the phone's current time zone. Stored times are always UTC.
 

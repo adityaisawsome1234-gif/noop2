@@ -46,27 +46,31 @@ Conventions:
 | 3.1 | With the band worn, watch Diagnostics → "Standard HR notifications" | The counter increases at about 1 Hz, and the HR values look plausible against a manual pulse check | |
 | 3.2 | "…with beat intervals" counter | Record whether the counter is **> 0**. If it is 0, the standard path carries no beat intervals and HRV from that path stays **unsupported** | |
 | 3.3 | Whether HR broadcast must be enabled in the official app for `180D` to appear | Record yes / no / unknown | |
+| 3.4 | Turn **Live heart rate while open** off, reconnect, wait 2 min; then turn it on (this sends TOGGLE_REALTIME_HR `01`) | Record whether "Standard HR notifications" increases **before** the toggle, only **after** it, or never. This settles whether `2A37` depends on the vendor toggle | |
 
 ## T4. Vendor data path
 
 | # | Step | Expected | Result |
 |---|---|---|---|
 | 4.1 | Compatibility test → "Vendor data path" | Frames arrive, the header CRC-16/MODBUS and payload CRC-32 validate, and the malformed counter stays 0 or close to it | |
-| 4.2 | "Identify band" (read-only hello) | A response arrives. Record the result code and the payload in the capture | |
-| 4.3 | "Live heart rate" (realtime stream on) | Plausible bpm at least every few seconds. Turning it off stops the stream | |
-| 4.4 | "Band clock" (read-only) | Record the offset between band and phone. Forma flags corrections greater than 2 s | |
+| 4.2 | "Identify band" (read-only hello) | A response arrives. Record its result code (public sources disagree whether 0 means success) and whether "Response sequence mismatches" stays 0 (does the band echo Forma's sequence byte?) | |
+| 4.3 | **Live heart rate while open** on (TOGGLE_REALTIME_HR `01`) | Record which packet types now arrive (frame log), whether event `BLE_REALTIME_HR_ON` (33) appears, and the "vendor HR candidate" in Diagnostics against a manual pulse. It stays **unvalidated** either way. Turn it off (`00`): the frames stop and event 34 may appear. Disconnect while it is on, reconnect without touching anything: record whether real-time frames arrive before Forma sends a command (does the band keep streaming after a disconnect?) | |
+| 4.4 | Band clock (GET_CLOCK, read once per connection) | Diagnostics shows the band–phone offset. Forma applies corrections greater than 2 s and records them on each record. Record the offset and the response's result code | |
 | 4.5 | Unknown packet types counter | Record the count. Export the capture for parser follow-up | |
 
 ## T5. History sync (only with history sync enabled)
 
+Acknowledgements are **off** for 5.1–5.5: Forma downloads and saves, and the band keeps its copy.
+
 | # | Step | Expected | Result |
 |---|---|---|---|
-| 5.1 | Band off the phone for 2 h (phone away or Bluetooth off), then Sync now | History records arrive. The coverage gap is filled. Diagnostics shows "history records" > 0 | |
-| 5.2 | Kill Forma (Xcode stop) **mid-transfer**, reopen, sync again | No duplicates (dedup keys). The previously unacknowledged chunk is transferred again | |
-| 5.3 | Walk out of range mid-transfer | Sync is marked interrupted. On return it resumes. No data loss and no duplicates | |
-| 5.4 | Sync twice in a row | The second sync inserts 0 new records (duplicates counted) | |
+| 5.1 | Band off the phone for 2 h (phone away or Bluetooth off), then Sync now | The range request (cmd 34) is answered: record its result codes (any "pending"?) and body length from the frame log. History records arrive and the coverage gap is filled. Record the number of chunks saved, and whether the transfer ends **complete** or **stopped without finishing**. That tells whether the band sends more than one chunk without acknowledgements | |
+| 5.2 | Sync again immediately | The band sends the same data again (it was not acknowledged): 0 new records, duplicates counted. Confirms the band keeps unacknowledged history | |
+| 5.3 | Kill Forma (Xcode stop) **mid-transfer**, reopen, sync again | No duplicates (dedup keys). The previously interrupted chunk is transferred again | |
+| 5.4 | Walk out of range mid-transfer | Sync is marked interrupted. On return it resumes. No data loss and no duplicates | |
 | 5.5 | Field validation: history HR vs live HR for the same minutes | "Field validation" passes only if the values agree (median absolute difference ≤ 3 bpm over ≥ 10 min). Otherwise history HR stays **unvalidated** and is not used in metrics | |
-| 5.6 | Coexistence: let the official app sync after Forma acknowledged a chunk | Record whether the official app still shows that period. This documents the trade-off described in Settings | |
+| 5.6 | **Acknowledgement test** (experimental; only after 5.1–5.2). Diagnostics → turn on "Confirm saved history to the band", Sync now | Only intact, fully saved chunks are acknowledged. Diagnostics shows chunks acknowledged and the band's answers (accepted / not accepted). Then Sync again: acknowledged chunks are **not** sent again. If the band does not accept the acknowledgement, or sends acknowledged data again, turn the setting off and report it with the capture | |
+| 5.7 | Coexistence: let the official app sync after Forma acknowledged a chunk | Record whether the official app still shows that period. This documents the trade-off described in Settings | |
 
 ## T6. Persistence and integrity
 
