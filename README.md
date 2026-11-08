@@ -22,7 +22,7 @@ App/Forma/            iOS app target: SwiftUI views, Core Bluetooth, iOS platfor
 FormaKit/             Swift package, platform-independent and tested on Linux and macOS
   FormaCore           shared value types (measurements, provenance, metric results)
   FormaProtocol       WHOOP 5.0 adapter, standard heart-rate adapter, command allowlist
-  FormaSync           sync engine (persist-before-acknowledge), clock mapping, captures, replay
+  FormaSync           sync engine (owned transfers, durable save before any opt-in acknowledgement), clock mapping, captures, replay
   FormaStore          SQLite storage, migrations, export/import/backup/delete
   FormaAnalytics      metrics with specifications (HR, zones, RHR, RMSSD, trends, sleep, load, readiness)
   FormaFeatures       app model and screen state (used by the SwiftUI views)
@@ -69,6 +69,8 @@ Tools/audit-no-network.sh
 | `docs/HARDWARE_VALIDATION_HANDOFF.md` | What to capture, what to send back, how open questions get resolved |
 | `docs/KNOWN_LIMITATIONS.md` | What doesn't work or isn't verified yet |
 | `docs/LICENSE_AUDIT.md` | Audit of the public interoperability projects. Forma reuses facts only, no code |
+| `docs/research/WHOOP5_PROTOCOL.md` | The WHOOP 5.0 protocol facts Forma relies on, in its own words, with source citations and open questions |
+| `docs/research/IOS_BLE_RULES.md` | Current iOS Core Bluetooth background, restoration and AccessorySetupKit rules |
 | `docs/TEST_REPORT.md` | What was tested, how, and the results |
 
 ## License
