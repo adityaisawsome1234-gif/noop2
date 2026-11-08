@@ -10,6 +10,11 @@ public enum LinkEvent: Sendable, Equatable {
     case ready(services: [String: [String]])
     /// A notification/indication (or read response) from the peripheral.
     case notification(characteristic: String, bytes: [UInt8], receivedAt: EpochMillis)
+    /// The link lost `count` notifications before delivering them (for example its buffer overflowed while
+    /// the engine was busy). Whatever they carried is gone: the sync engine treats an open history chunk as
+    /// damaged and acknowledges nothing more in that transfer. `characteristic` is nil when unknown. Links
+    /// that can drop notifications must report it this way, never silently.
+    case gap(characteristic: String?, count: Int, at: EpochMillis)
     /// The link went down. `reason` is a human-readable description when known.
     case disconnected(reason: String?, at: EpochMillis)
 }

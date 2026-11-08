@@ -349,9 +349,13 @@ func dataPayload(type: UInt8 = 47, k: UInt8, counter: UInt32, seconds: UInt32, l
         #expect(d.decode(characteristic: "2A19", bytes: [87], receivedAt: 5) == [.batteryLevel(percent: 87, receivedAt: 5)])
         guard case .malformed? = d.decode(characteristic: "2A19", bytes: [101], receivedAt: 6).first else { Issue.record("battery > 100"); return }
         #expect(d.decode(characteristic: "2A26", bytes: Array("41.17.3\0".utf8), receivedAt: 7) == [.deviceInformation(field: "firmware", value: "41.17.3")])
-        // Junk after a NUL, bidi controls and non-ASCII are removed; an all-junk value yields nothing.
-        #expect(d.decode(characteristic: "2A26", bytes: Array("4\u{202E}1.2\0garbage".utf8), receivedAt: 8) == [.deviceInformation(field: "firmware", value: "41.2")])
-        #expect(d.decode(characteristic: "2A27", bytes: [0xFF, 0xFE, 0x00, 0x41], receivedAt: 9).isEmpty)
+        // Junk after a NUL is cut; bidi controls and non-ASCII bytes become visible escapes (never deleted, so
+        // distinct values never merge into one firmware key); an all-junk value is reported, never dropped.
+        #expect(d.decode(characteristic: "2A26", bytes: Array("4\u{202E}1.2\0garbage".utf8), receivedAt: 8)
+                == [.deviceInformation(field: "firmware", value: "4\\xE2\\x80\\xAE1.2")])
+        guard case .malformed? = d.decode(characteristic: "2A27", bytes: [0xFF, 0xFE, 0x00, 0x41], receivedAt: 9).first else {
+            Issue.record("an unprintable device-information value must be reported as malformed"); return
+        }
     }
 
     @Test func registryPicksAdapterFromServices() {

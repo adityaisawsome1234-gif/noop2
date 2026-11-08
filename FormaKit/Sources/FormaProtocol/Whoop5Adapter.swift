@@ -71,7 +71,8 @@ public struct Whoop5Adapter: DeviceAdapter {
             commandCharacteristic: Self.commandToStrap,
             commandWriteWithResponse: true,
             scanServiceFilter: [Self.service],
-            nameHints: ["WHOOP"]
+            nameHints: ["WHOOP"],
+            framedCharacteristics: [Self.commandFromStrap, Self.eventsFromStrap, Self.dataFromStrap, Self.memfault]
         )
     }
 
@@ -205,6 +206,63 @@ enum Whoop5Wire {
         return crc ^ 0xFFFF_FFFF
     }
 
+    /// One byte of the CRC-32 register (before the final xor).
+    @inline(__always)
+    static func crc32Step(_ register: UInt32, _ byte: UInt8) -> UInt32 {
+        crc32Table[Int((register ^ UInt32(byte)) & 0xFF)] ^ (register >> 8)
+    }
+
+    // CRC-32 of a segment from two prefix CRCs (the standard "CRC combine" identity, derived from the
+    // polynomial arithmetic, not from any particular implementation):
+    //   crc(A‖B) = (x^(8·|B|) · crc(A) mod P) ⊕ crc(B)   ⇒   crc(B) = crc(A‖B) ⊕ (x^(8·|B|) · crc(A) mod P)
+    // Polynomials use the reflected bit order of the table above (bit 31 is x^0).
+
+    /// a(x)·b(x) mod P(x). `a` must be non-zero (every power of x is).
+    static func multiplyModP(_ a: UInt32, _ b: UInt32) -> UInt32 {
+        var m: UInt32 = 1 << 31
+        var product: UInt32 = 0
+        var b = b
+        while true {
+            if a & m != 0 {
+                product ^= b
+                if a & (m &- 1) == 0 { break }
+            }
+            m >>= 1
+            b = b & 1 != 0 ? (b >> 1) ^ 0xEDB8_8320 : b >> 1
+        }
+        return product
+    }
+
+    /// x^(2^k) mod P for k = 0…31.
+    private static let powersOfX: [UInt32] = {
+        var table: [UInt32] = []
+        var p: UInt32 = 1 << 30   // x^1
+        for _ in 0..<32 {
+            table.append(p)
+            p = multiplyModP(p, p)
+        }
+        return table
+    }()
+
+    /// x^(8·byteCount) mod P.
+    static func shiftOperator(byteCount: Int) -> UInt32 {
+        var p: UInt32 = 1 << 31   // x^0
+        var n = UInt64(max(0, byteCount))
+        var k = 3                 // 8 = 2^3
+        while n != 0 {
+            if n & 1 != 0 { p = multiplyModP(powersOfX[k & 31], p) }
+            n >>= 1
+            k += 1
+        }
+        return p
+    }
+
+    /// CRC-32 of the bytes between two prefixes, given the standard CRC-32 of each prefix (taken from the
+    /// same origin) and the segment length. O(log length) instead of O(length).
+    static func crc32OfSegment(prefixCRC: UInt32, extendedCRC: UInt32, length: Int) -> UInt32 {
+        extendedCRC ^ multiplyModP(shiftOperator(byteCount: length), prefixCRC)
+    }
+
     static func u16(_ b: [UInt8], _ o: Int) -> UInt16? {
         guard o >= 0, o + 2 <= b.count else { return nil }
         return UInt16(b[o]) | UInt16(b[o + 1]) << 8
@@ -246,10 +304,21 @@ enum Whoop5Wire {
 ///   genuine frames inside a bogus or truncated span are recovered (each has its own two CRCs).
 /// - While a long frame is still arriving, the bytes after its start are searched for a complete
 ///   frame that passes both CRCs; finding one proves the pending frame was truncated, and its start byte
-///   is dropped. Frames and reported counts are the same however notifications split the stream.
+///   is dropped. Frames and reported counts are the same however notifications split the stream, with
+///   one documented exception: when a frame that passes both CRCs contains another complete frame that
+///   also passes both CRCs, a split that delivers the inner frame before the outer one completes makes the
+///   outer frame look truncated. It is then reported as malformed (never silently dropped) and the inner
+///   frame is delivered. Waiting for every pending span to complete would remove that exception but
+///   would delay recovery after every genuinely truncated frame by up to 64 KB.
 /// - Each frame carries the receive time of the notification that held its first byte.
-/// - The buffer holds at most one pending frame (≤ 8 + 65 535 bytes) plus the latest chunk; garbage
-///   without a start byte is discarded immediately. Bytes are consumed through a read index (linear time).
+/// - The buffer holds at most one pending frame (≤ 8 + 65 535 bytes) plus the latest chunk (and a
+///   consumed prefix of at most the same size before it is compacted); garbage without a start byte is
+///   discarded immediately.
+/// - Work is linear in the bytes received, whatever the notification sizes: every byte position is
+///   examined once by the look-ahead, payload CRCs come from running prefix CRCs (O(log n) per
+///   candidate, so nested or overlapping candidate frames cost no rescans), each candidate frame is
+///   checked once when its span completes, receive times are found by binary search, and the consumed
+///   prefix is dropped only when it is at least half the buffer.
 struct Whoop5Deframer {
     enum Output: Equatable {
         case frame(payload: [UInt8], receivedAt: EpochMillis)
@@ -258,18 +327,36 @@ struct Whoop5Deframer {
     }
 
     private var buffer: [UInt8] = []
+    /// `crcRegister[i]` is the CRC-32 register after `buffer[0..<i]` (before the final xor). Any common
+    /// origin works for segment CRCs, so compaction just drops the same prefix.
+    private var crcRegister: [UInt32] = [0xFFFF_FFFF]
     private var start = 0
-    /// (buffer index of a chunk's first byte, its receive time), ascending.
+    /// (buffer index of a chunk's first byte, its receive time), ascending. Entries before `chunkHead`
+    /// describe consumed bytes and are dropped on compaction.
     private var chunkTimes: [(index: Int, at: EpochMillis)] = []
-    /// Where the truncation look-ahead resumes for the current pending frame.
-    private var lookaheadFrom: Int?
+    private var chunkHead = 0
+
+    // Truncation look-ahead (indices into `buffer`). Valid for any pending frame starting before them.
+    /// Next index not yet examined as a possible frame start.
+    private var scanFrom = 0
+    /// Candidates with a valid header whose span is not complete yet, as a min-heap on the span end.
+    private var undecided = SpanHeap()
+    /// Start of a complete frame that passes both CRCs, found by the look-ahead.
+    private var knownComplete: Int?
 
     var pendingByteCount: Int { buffer.count - start }
 
     mutating func append(_ chunk: [UInt8], receivedAt: EpochMillis) -> [Output] {
         guard !chunk.isEmpty else { return [] }
-        compact()
+        compactIfWorthwhile()
         chunkTimes.append((buffer.count, receivedAt))
+        buffer.reserveCapacity(buffer.count + chunk.count)
+        crcRegister.reserveCapacity(crcRegister.count + chunk.count)
+        var register = crcRegister[crcRegister.count - 1]
+        for b in chunk {
+            register = Whoop5Wire.crc32Step(register, b)
+            crcRegister.append(register)
+        }
         buffer.append(contentsOf: chunk)
         var out: [Output] = []
         while start < buffer.count {
@@ -300,7 +387,6 @@ struct Whoop5Deframer {
             let total = Whoop5Wire.headerLength + declared
             // 3. Complete frame: check the payload CRC.
             if buffer.count - start >= total {
-                lookaheadFrom = nil
                 if payloadIsValid(at: start, total: total) {
                     let payload = Array(buffer[(start + Whoop5Wire.headerLength)..<(start + total - 4)])
                     out.append(.frame(payload: payload, receivedAt: time(of: start)))
@@ -312,12 +398,10 @@ struct Whoop5Deframer {
                 continue
             }
             // 4. Still arriving: a complete valid frame starting inside the pending span means it was truncated.
-            //    Like a CRC failure, that costs only the start byte; rescanning then reaches the valid frame
-            //    (so the outcome does not depend on how notifications split the stream).
-            if completeFrameStart(after: start) != nil {
+            //    Like a CRC failure, that costs only the start byte; rescanning then reaches the valid frame.
+            if completeFrameExists(after: start) {
                 out.append(.malformed(reason: "frame truncated (declared \(declared) bytes)", byteCount: 1))
                 consume(to: start + 1)
-                lookaheadFrom = nil
                 continue
             }
             break
@@ -328,76 +412,162 @@ struct Whoop5Deframer {
     /// Drops any partial frame (disconnect). Returns the number of bytes discarded.
     mutating func reset() -> Int {
         let n = buffer.count - start
-        buffer.removeAll()
-        start = 0
-        chunkTimes.removeAll()
-        lookaheadFrom = nil
+        clear()
         return n
     }
 
     // MARK: Helpers
+
+    private mutating func clear() {
+        buffer.removeAll(keepingCapacity: true)
+        crcRegister.removeAll(keepingCapacity: true)
+        crcRegister.append(0xFFFF_FFFF)
+        start = 0
+        chunkTimes.removeAll(keepingCapacity: true)
+        chunkHead = 0
+        scanFrom = 0
+        undecided.removeAll()
+        knownComplete = nil
+    }
 
     private func headerIsValid(at i: Int) -> Bool {
         guard let stored = Whoop5Wire.u16(buffer, i + 6) else { return false }
         return Whoop5Wire.crc16Modbus(buffer[i..<(i + 6)]) == stored
     }
 
+    /// Payload CRC of the frame at `i` (complete in the buffer), from the prefix CRCs.
     private func payloadIsValid(at i: Int, total: Int) -> Bool {
         guard let stored = Whoop5Wire.u32(buffer, i + total - 4) else { return false }
-        return Whoop5Wire.crc32(buffer[(i + Whoop5Wire.headerLength)..<(i + total - 4)]) == stored
+        let from = i + Whoop5Wire.headerLength, to = i + total - 4
+        let crc = Whoop5Wire.crc32OfSegment(prefixCRC: crcRegister[from] ^ 0xFFFF_FFFF, extendedCRC: crcRegister[to] ^ 0xFFFF_FFFF,
+                                            length: to - from)
+        return crc == stored
     }
 
-    /// First index after `pending` where a complete frame passing both CRCs starts, if any. Candidates
-    /// that are not complete yet are revisited on the next append (the search resumes at the first one).
-    private mutating func completeFrameStart(after pending: Int) -> Int? {
-        var j = max(pending + 1, lookaheadFrom ?? 0)
-        var firstUndecided: Int?
-        while j + Whoop5Wire.headerLength <= buffer.count, let k = buffer[j...].firstIndex(of: Whoop5Wire.startOfFrame) {
-            j = k
-            guard j + Whoop5Wire.headerLength <= buffer.count else { break }
-            if headerIsValid(at: j) {
-                let declared = Int(Whoop5Wire.u16(buffer, j + 2) ?? 0)
-                let total = Whoop5Wire.headerLength + declared
-                if declared >= 4 {
-                    if j + total <= buffer.count {
-                        if payloadIsValid(at: j, total: total) { return j }
-                    } else if firstUndecided == nil {
-                        firstUndecided = j
-                    }
-                }
+    /// Whether a complete frame passing both CRCs starts after `pending`. Each byte position is examined
+    /// once; a candidate whose span is still incomplete is checked once, when its span completes.
+    private mutating func completeFrameExists(after pending: Int) -> Bool {
+        if let k = knownComplete {
+            if k > pending { return true }
+            knownComplete = nil
+        }
+        var j = max(scanFrom, pending + 1)
+        let lastStart = buffer.count - Whoop5Wire.headerLength   // last index with a full header
+        while j <= lastStart {
+            guard let k = buffer[j...lastStart].firstIndex(of: Whoop5Wire.startOfFrame) else {
+                j = lastStart + 1
+                break
             }
-            j += 1
+            j = k + 1
+            guard headerIsValid(at: k) else { continue }
+            let declared = Int(Whoop5Wire.u16(buffer, k + 2) ?? 0)
+            guard declared >= 4 else { continue }
+            let total = Whoop5Wire.headerLength + declared
+            if k + total <= buffer.count {
+                if payloadIsValid(at: k, total: total) {
+                    scanFrom = j
+                    knownComplete = k
+                    return true
+                }
+            } else {
+                undecided.push(start: k, end: k + total)
+            }
         }
-        lookaheadFrom = firstUndecided ?? max(pending + 1, buffer.count - Whoop5Wire.headerLength + 1)
-        return nil
+        scanFrom = j
+        while let top = undecided.min, top.end <= buffer.count {
+            undecided.popMin()
+            guard top.start > pending else { continue }
+            if payloadIsValid(at: top.start, total: top.end - top.start) {
+                knownComplete = top.start
+                return true
+            }
+        }
+        return false
     }
 
+    /// Receive time of the chunk that held `index` (binary search over the chunk starts).
     private func time(of index: Int) -> EpochMillis {
-        var at = chunkTimes.first?.at ?? 0
-        for entry in chunkTimes {
-            if entry.index <= index { at = entry.at } else { break }
+        var lo = chunkHead, hi = chunkTimes.count - 1
+        guard lo <= hi else { return 0 }
+        var best = chunkTimes[lo].at
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if chunkTimes[mid].index <= index {
+                best = chunkTimes[mid].at
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
         }
-        return at
+        return best
     }
 
     private mutating func consume(to index: Int) {
         start = min(index, buffer.count)
-        // Keep only the chunk entry that covers `start` and later ones.
-        while chunkTimes.count > 1, chunkTimes[1].index <= start { chunkTimes.removeFirst() }
         if start == buffer.count {
-            buffer.removeAll(keepingCapacity: true)
-            start = 0
-            chunkTimes.removeAll()
-            lookaheadFrom = nil
+            clear()
+            return
+        }
+        // Advance the chunk head to the entry that covers `start`.
+        while chunkHead + 1 < chunkTimes.count, chunkTimes[chunkHead + 1].index <= start { chunkHead += 1 }
+    }
+
+    /// Drops the consumed prefix once it is at least half the buffer (amortized O(1) per byte).
+    private mutating func compactIfWorthwhile() {
+        guard start > 0, start * 2 >= buffer.count else { return }
+        let shift = start
+        buffer.removeFirst(shift)
+        crcRegister.removeFirst(shift)
+        chunkTimes = chunkTimes[chunkHead...].map { (max(0, $0.index - shift), $0.at) }
+        chunkHead = 0
+        scanFrom = max(0, scanFrom - shift)
+        if let k = knownComplete { knownComplete = k >= shift ? k - shift : nil }
+        undecided.shift(by: shift)
+        start = 0
+    }
+}
+
+/// Min-heap of candidate frame spans keyed by their end index.
+struct SpanHeap {
+    private var items: [(start: Int, end: Int)] = []
+
+    var min: (start: Int, end: Int)? { items.first }
+
+    mutating func removeAll() { items.removeAll(keepingCapacity: true) }
+
+    mutating func push(start: Int, end: Int) {
+        items.append((start, end))
+        var i = items.count - 1
+        while i > 0 {
+            let parent = (i - 1) / 2
+            guard items[i].end < items[parent].end else { break }
+            items.swapAt(i, parent)
+            i = parent
         }
     }
 
-    private mutating func compact() {
-        guard start > 0 else { return }
-        buffer.removeFirst(start)
-        chunkTimes = chunkTimes.map { (max(0, $0.index - start), $0.at) }
-        if let l = lookaheadFrom { lookaheadFrom = max(0, l - start) }
-        start = 0
+    mutating func popMin() {
+        guard !items.isEmpty else { return }
+        items.swapAt(0, items.count - 1)
+        items.removeLast()
+        var i = 0
+        while true {
+            let l = 2 * i + 1, r = l + 1
+            var smallest = i
+            if l < items.count, items[l].end < items[smallest].end { smallest = l }
+            if r < items.count, items[r].end < items[smallest].end { smallest = r }
+            guard smallest != i else { break }
+            items.swapAt(i, smallest)
+            i = smallest
+        }
+    }
+
+    /// Re-bases indices after the buffer dropped `shift` bytes; candidates that started in them are gone.
+    mutating func shift(by shift: Int) {
+        // Subtracting the same amount keeps the heap order; removing entries requires a rebuild.
+        let kept = items.filter { $0.start >= shift }.map { (start: $0.start - shift, end: $0.end - shift) }
+        items.removeAll(keepingCapacity: true)
+        for e in kept { push(start: e.start, end: e.end) }
     }
 }
 
@@ -434,11 +604,11 @@ public final class Whoop5Decoder: DeviceDecoder {
         case UUIDs.batteryLevel:
             return StandardServiceParsing.battery(bytes, characteristic: c, receivedAt: receivedAt)
         case UUIDs.firmwareRevision, UUIDs.hardwareRevision, UUIDs.modelNumber, UUIDs.manufacturerName, UUIDs.softwareRevision:
-            return StandardServiceParsing.deviceInformation(bytes, characteristic: c)
+            return StandardServiceParsing.deviceInformation(bytes, characteristic: c, receivedAt: receivedAt)
         case Whoop5Adapter.commandFromStrap, Whoop5Adapter.eventsFromStrap, Whoop5Adapter.dataFromStrap, Whoop5Adapter.memfault:
-            var deframer = deframers[c] ?? Whoop5Deframer()
-            let outputs = deframer.append(bytes, receivedAt: receivedAt)
-            deframers[c] = deframer
+            // Mutated in place: copying the deframer out of the dictionary would copy its whole buffer
+            // (copy-on-write) on every notification.
+            let outputs = deframers[c, default: Whoop5Deframer()].append(bytes, receivedAt: receivedAt)
             var events: [DecodedEvent] = []
             for o in outputs {
                 switch o {
@@ -519,63 +689,100 @@ public final class Whoop5Decoder: DeviceDecoder {
         }
     }
 
-    /// Heart-rate candidate byte by record kind (public research; meaning unvalidated). 0 means "no reading".
-    static func heartRateCandidate(_ p: [UInt8]) -> Int? {
-        guard p.count >= 2 else { return nil }
-        let offset: Int
-        switch p[1] {
-        case 9, 10, 12, 24: offset = 17
-        case 18: offset = 14
-        case 7: offset = 27
+    /// Offset of the heart-rate candidate byte by record kind (public research; meaning unvalidated).
+    static func heartRateOffset(kind: UInt8) -> Int? {
+        switch kind {
+        case 9, 10, 12, 24: return 17
+        case 18: return 14
+        case 7: return 27
         default: return nil
         }
+    }
+
+    /// Heart-rate candidate byte by record kind (public research; meaning unvalidated). 0 means "no reading".
+    static func heartRateCandidate(_ p: [UInt8]) -> Int? {
+        guard p.count >= 2, let offset = heartRateOffset(kind: p[1]) else { return nil }
         guard offset < p.count, p[offset] != 0 else { return nil }
         return Int(p[offset])
     }
 
-    /// Common 13-byte data header, then per-kind body fields.
+    /// Common 13-byte data header, then per-kind body fields. A record of a decoded kind counts as decoded
+    /// only when every field Forma reads from it is present and understood; otherwise whatever was decoded
+    /// is still reported, but `contentDecoded` is false so its chunk is never acknowledged.
     func decodeHistoryRecord(_ p: [UInt8], characteristic: String, receivedAt: EpochMillis) -> DecodedEvent {
         guard p.count >= 13, let counter = Whoop5Wire.u32(p, 3), let seconds = Whoop5Wire.u32(p, 7), let sub = Whoop5Wire.u16(p, 11) else {
             return .malformed(reason: "data record shorter than its 13-byte header", byteCount: p.count, characteristic: characteristic, receivedAt: receivedAt)
         }
         let kind = p[1]
-        let decoded = Self.decodedKinds.contains(kind)
+        var decoded = Self.decodedKinds.contains(kind)
+        var heartRate: Int?
+        if decoded {
+            if let offset = Self.heartRateOffset(kind: kind), offset >= p.count {
+                decoded = false   // the heart-rate field is missing: the record is shorter than its kind's layout
+            } else {
+                heartRate = Self.heartRateCandidate(p)
+            }
+        }
+        var motion: MotionSummary?
+        if kind == 10 {
+            switch Self.k10Motion(p) {
+            case .summary(let m): motion = m
+            case .noSamples: break                // zero-filled block: nothing was measured, nothing to keep
+            case .notUnderstood: decoded = false  // layout not understood: the band keeps the record
+            }
+        }
         return .historyRecord(HistoryRecord(kind: kind, counter: counter, deviceSeconds: seconds, subseconds: sub, receivedAt: receivedAt,
-                                            heartRate: decoded ? Self.heartRateCandidate(p) : nil, heartRateStatus: .unvalidated,
-                                            beatIntervalsMillis: [], motion: kind == 10 ? Self.motionSummaryK10(p) : nil,
+                                            heartRate: heartRate, heartRateStatus: .unvalidated, beatIntervalsMillis: [], motion: motion,
                                             payloadLength: p.count, contentDecoded: decoded))
     }
 
-    /// Samples per axis in a K10 record (payload byte 18 holds this count in every public capture).
+    /// Samples per axis in a K10 record (payload byte 18 held this count in both public captures; inferred).
     static let k10SamplesPerAxis = 100
+    /// Fewer real (non-zero) samples than this and the block is not summarized: the record stays undecoded.
+    static let k10MinimumRealSamples = 50
     /// ASSUMPTION (unverified): 50 Hz sampling, so 100 samples span 2 s. No public source states the
     /// rate; it only matters when the user lets unvalidated motion feed sleep candidates.
     static let k10AssumedSpanMillis: Int64 = 2_000
 
+    enum K10Motion: Equatable {
+        /// Summary of the real samples.
+        case summary(MotionSummary)
+        /// Every sample is a zero vector: nothing was measured.
+        case noSamples
+        /// Too short, a sample-count byte other than 100, or too few real samples to summarize.
+        case notUnderstood
+    }
+
     /// K10: 100 × i16 accelerometer samples per axis at payload offsets 85 (x), 285 (y), 485 (z).
-    /// Returns nil (no measurement) when the record is too short, its sample-count byte is not 100,
-    /// or the block is zero-filled: a working accelerometer always measures gravity, so zero vectors
-    /// are absent samples, not stillness.
-    static func motionSummaryK10(_ p: [UInt8]) -> MotionSummary? {
+    /// A working accelerometer always measures gravity, so a (0, 0, 0) vector is an absent sample, never
+    /// stillness: such samples are left out of every statistic (and of `sampleCount`).
+    static func k10Motion(_ p: [UInt8]) -> K10Motion {
         let count = k10SamplesPerAxis
         let offsets = [85, 285, 485]
-        guard p.count > 18, Int(p[18]) == count, offsets.allSatisfy({ $0 + count * 2 <= p.count }) else { return nil }
+        guard p.count > 18, Int(p[18]) == count, offsets.allSatisfy({ $0 + count * 2 <= p.count }) else { return .notUnderstood }
         var magnitudes: [Double] = []
         magnitudes.reserveCapacity(count)
-        var zeroVectors = 0
         for i in 0..<count {
             guard let x = Whoop5Wire.i16(p, offsets[0] + 2 * i), let y = Whoop5Wire.i16(p, offsets[1] + 2 * i),
-                  let z = Whoop5Wire.i16(p, offsets[2] + 2 * i) else { return nil }
-            if x == 0, y == 0, z == 0 { zeroVectors += 1 }
+                  let z = Whoop5Wire.i16(p, offsets[2] + 2 * i) else { return .notUnderstood }
+            if x == 0, y == 0, z == 0 { continue }
             let dx = Double(x), dy = Double(y), dz = Double(z)
             magnitudes.append((dx * dx + dy * dy + dz * dz).squareRoot())
         }
-        guard zeroVectors <= 2 else { return nil }
+        if magnitudes.isEmpty { return .noSamples }
+        guard magnitudes.count >= k10MinimumRealSamples else { return .notUnderstood }
+        let n = magnitudes.count
         let sorted = magnitudes.sorted()
-        let median = (sorted[count / 2 - 1] + sorted[count / 2]) / 2
-        let mean = magnitudes.reduce(0, +) / Double(count)
-        let activity = magnitudes.reduce(0) { $0 + abs($1 - median) } / Double(count)
-        return MotionSummary(sampleCount: count, meanMagnitude: mean, activity: activity, spanMillis: k10AssumedSpanMillis)
+        let median = n % 2 == 0 ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2 : sorted[n / 2]
+        let mean = magnitudes.reduce(0, +) / Double(n)
+        let activity = magnitudes.reduce(0) { $0 + abs($1 - median) } / Double(n)
+        return .summary(MotionSummary(sampleCount: n, meanMagnitude: mean, activity: activity, spanMillis: k10AssumedSpanMillis))
+    }
+
+    /// The K10 motion summary, or nil when there is none (see `k10Motion`).
+    static func motionSummaryK10(_ p: [UInt8]) -> MotionSummary? {
+        if case .summary(let m) = k10Motion(p) { return m }
+        return nil
     }
 }
 
@@ -621,7 +828,7 @@ enum StandardServiceParsing {
         return [.batteryLevel(percent: Int(b[0]), receivedAt: receivedAt)]
     }
 
-    static func deviceInformation(_ b: [UInt8], characteristic: String) -> [DecodedEvent] {
+    static func deviceInformation(_ b: [UInt8], characteristic: String, receivedAt: EpochMillis = 0) -> [DecodedEvent] {
         let field: String
         switch characteristic {
         case UUIDs.firmwareRevision: field = "firmware"
@@ -630,19 +837,49 @@ enum StandardServiceParsing {
         case UUIDs.manufacturerName: field = "manufacturer"
         default: field = "software"
         }
-        guard let text = sanitizedText(b) else { return [] }
+        guard let text = sanitizedText(b) else {
+            // Reported, never silently dropped: an empty or entirely unprintable value is not information.
+            return [.malformed(reason: "device information (\(field)) empty or not printable", byteCount: b.count,
+                               characteristic: characteristic, receivedAt: receivedAt)]
+        }
         return [.deviceInformation(field: field, value: text)]
     }
 
-    /// Device-information strings become keys and provenance, so they are reduced to printable ASCII:
-    /// cut at the first NUL, every other character outside U+0020…U+007E removed (control, format,
-    /// bidi and replacement characters included), whitespace trimmed, at most 64 characters.
+    /// Longest sanitized device-information value.
+    static let maxDeviceInformationLength = 64
+
+    /// Device-information strings become keys and provenance, so they are reduced to printable ASCII
+    /// without merging distinct values: cut at the first NUL; every byte outside U+0021…U+007E other than
+    /// a plain space (control, format, bidi, non-ASCII) becomes a visible `\xNN` escape and a backslash
+    /// becomes `\\`; surrounding spaces are trimmed; at most 64 characters (never cutting an escape),
+    /// trimmed again. Nil when nothing printable is left.
     static func sanitizedText(_ b: [UInt8]) -> String? {
-        let prefix = b.prefix { $0 != 0 }
-        let printable = prefix.filter { (0x20...0x7E).contains($0) }
-        let text = String(decoding: printable, as: UTF8.self).trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else { return nil }
-        return String(text.prefix(64))
+        let value = b.prefix { $0 != 0 }
+        guard value.contains(where: { (0x21...0x7E).contains($0) }) else { return nil }
+        let hex: [Character] = Array("0123456789ABCDEF")
+        var tokens: [String] = value.map { byte in
+            switch byte {
+            case 0x5C: return "\\\\"
+            case 0x20...0x7E: return String(UnicodeScalar(byte))
+            default: return "\\x" + String(hex[Int(byte >> 4)]) + String(hex[Int(byte & 0x0F)])
+            }
+        }
+        func trimSpaces() {
+            while tokens.first == " " { tokens.removeFirst() }
+            while tokens.last == " " { tokens.removeLast() }
+        }
+        trimSpaces()
+        var length = 0
+        var kept = 0
+        for t in tokens {
+            guard length + t.count <= maxDeviceInformationLength else { break }
+            length += t.count
+            kept += 1
+        }
+        tokens.removeLast(tokens.count - kept)
+        trimSpaces()
+        let text = tokens.joined()
+        return text.isEmpty ? nil : text
     }
 }
 
@@ -689,7 +926,7 @@ public final class StandardHeartRateDecoder: DeviceDecoder {
         case UUIDs.heartRateMeasurement: return [StandardServiceParsing.heartRate(bytes, characteristic: c, receivedAt: receivedAt)]
         case UUIDs.batteryLevel: return StandardServiceParsing.battery(bytes, characteristic: c, receivedAt: receivedAt)
         case UUIDs.firmwareRevision, UUIDs.hardwareRevision, UUIDs.modelNumber, UUIDs.manufacturerName, UUIDs.softwareRevision:
-            return StandardServiceParsing.deviceInformation(bytes, characteristic: c)
+            return StandardServiceParsing.deviceInformation(bytes, characteristic: c, receivedAt: receivedAt)
         default: return [.unknownPacket(packetType: 0, length: bytes.count, characteristic: c, receivedAt: receivedAt)]
         }
     }

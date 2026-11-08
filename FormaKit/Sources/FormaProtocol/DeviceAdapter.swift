@@ -19,9 +19,15 @@ public struct GATTProfile: Hashable, Sendable {
     public var scanServiceFilter: [String]
     /// Case-insensitive advertised-name hints used only to label scan results.
     public var nameHints: [String]
+    /// Characteristics that carry the vendor's framed protocol (responses, events, history). Damaged,
+    /// discarded or unrecognised data on any of them while a history chunk is open makes that chunk
+    /// ineligible for acknowledgement. Empty means "every characteristic that is not a Bluetooth SIG
+    /// UUID"; adapters whose vendor characteristics use 16-bit UUIDs on the SIG base must list them.
+    public var framedCharacteristics: [String]
 
     public init(vendorService: String?, discoverServices: [String], subscribeCharacteristics: [String],
-                commandCharacteristic: String?, commandWriteWithResponse: Bool, scanServiceFilter: [String], nameHints: [String]) {
+                commandCharacteristic: String?, commandWriteWithResponse: Bool, scanServiceFilter: [String], nameHints: [String],
+                framedCharacteristics: [String] = []) {
         self.vendorService = vendorService.map(UUIDs.normalize)
         self.discoverServices = discoverServices.map(UUIDs.normalize)
         self.subscribeCharacteristics = subscribeCharacteristics.map(UUIDs.normalize)
@@ -29,6 +35,14 @@ public struct GATTProfile: Hashable, Sendable {
         self.commandWriteWithResponse = commandWriteWithResponse
         self.scanServiceFilter = scanServiceFilter.map(UUIDs.normalize)
         self.nameHints = nameHints
+        self.framedCharacteristics = framedCharacteristics.map(UUIDs.normalize)
+    }
+
+    /// Whether `characteristic` carries the vendor's framed protocol (see `framedCharacteristics`).
+    public func carriesVendorFrames(_ characteristic: String) -> Bool {
+        let c = UUIDs.normalize(characteristic)
+        if framedCharacteristics.isEmpty { return !c.hasSuffix(UUIDs.sigBaseSuffix) }
+        return framedCharacteristics.contains(c)
     }
 }
 
@@ -218,9 +232,12 @@ public struct HistoryRecord: Hashable, Sendable {
     public var beatIntervalsMillis: [Double]
     public var motion: MotionSummary?
     public var payloadLength: Int
-    /// False when the adapter recognises the frame as stored history but does not decode its content
-    /// (an unknown record kind or a history stream Forma does not store). The sync engine never
-    /// acknowledges a chunk containing such records, so the band keeps that data.
+    /// False when the adapter recognises the frame as stored history but does not decode everything in
+    /// it that Forma would keep: an unknown record kind, a history stream Forma does not store, or a
+    /// record of a decoded kind whose expected fields are missing or not understood (too short, an
+    /// unexpected layout byte, too few real samples). Fields that were decoded are still reported and
+    /// stored, but the sync engine never acknowledges a chunk containing such records, so the band keeps
+    /// that data.
     public var contentDecoded: Bool
 
     public init(kind: UInt8, counter: UInt32, deviceSeconds: UInt32, subseconds: UInt16, receivedAt: EpochMillis,

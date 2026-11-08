@@ -6,7 +6,8 @@ import FormaSync
 // forma-replay — decode a Forma diagnostics capture (or raw payload hex) through the same adapter and
 // sync pipeline the app uses, and print what was understood. Runs offline on macOS or Linux.
 //
-//   swift run forma-replay capture.jsonl                 # replay an exported capture (history acks are NOT replayed)
+//   swift run forma-replay capture.jsonl                 # replay an exported capture (history acks are NOT replayed;
+//                                                        # records re-sent in later connections are counted once)
 //   swift run forma-replay --payload-hex K24.hex         # decode one bare WHOOP 5.0 payload (wrapped in a frame)
 //   swift run forma-replay --json capture.jsonl          # machine-readable summary
 
@@ -33,22 +34,38 @@ func parseArguments() -> Options? {
     return (o.payloadHex.isEmpty && o.captures.isEmpty) ? nil : o
 }
 
-/// Sink that keeps everything in memory for the report (no database needed).
+/// Sink that keeps everything in memory for the report (no database needed). It skips duplicates with the
+/// same natural keys as the app's store (HR: device, source, time · beat intervals: device, source, record,
+/// index · motion: device, source, time, epoch · aux: device, source, kind, time), so a capture whose
+/// connections each re-send the same history reports what the app would hold, not a multiple of it.
 final class SummarySink: IngestSink, @unchecked Sendable {
     private let lock = NSLock()
+    private var keys = Set<String>()
     var hr: [HeartRateSample] = []
     var beats: [BeatInterval] = []
     var motion: [MotionEpoch] = []
     var aux: [AuxMeasurement] = []
     var cursor: SyncCursor?
     var batches = 0
+    var duplicates = 0
 
     func ingest(_ batch: IngestBatch) throws -> IngestResult {
         lock.withLock {
-            hr += batch.heartRates; beats += batch.beatIntervals; motion += batch.motion; aux += batch.aux
+            var inserted = 0
+            var skipped = 0
+            func keep(_ key: String) -> Bool {
+                if keys.insert(key).inserted { inserted += 1; return true }
+                skipped += 1
+                return false
+            }
+            for s in batch.heartRates where keep("hr|\(s.deviceID)|\(s.source.rawValue)|\(s.timestamp)") { hr.append(s) }
+            for b in batch.beatIntervals where keep("rr|\(b.deviceID)|\(b.source.rawValue)|\(b.recordKey)|\(b.indexInRecord)") { beats.append(b) }
+            for m in batch.motion where keep("m|\(m.deviceID)|\(m.source.rawValue)|\(m.timestamp)|\(m.epochMillis)") { motion.append(m) }
+            for a in batch.aux where keep("a|\(a.deviceID)|\(a.source.rawValue)|\(a.kind.rawValue)|\(a.timestamp)") { aux.append(a) }
             if let c = batch.cursor { cursor = c }
             batches += 1
-            return IngestResult(batchID: Int64(batches), inserted: batch.heartRates.count + batch.beatIntervals.count + batch.motion.count + batch.aux.count, duplicates: 0)
+            duplicates += skipped
+            return IngestResult(batchID: Int64(batches), inserted: inserted, duplicates: skipped)
         }
     }
     func syncCursor(deviceID: String) throws -> SyncCursor? { lock.withLock { cursor } }
@@ -161,7 +178,11 @@ func replayCapture(_ path: String, json: Bool) async -> Bool {
         counters.historyRecords += c.historyRecords
         counters.historyRecordsUnmapped += c.historyRecordsUnmapped
         counters.historyRecordsUndecoded += c.historyRecordsUndecoded
+        counters.historyRecordsUnsolicited += c.historyRecordsUnsolicited
+        counters.historyTimeCollisions += c.historyTimeCollisions
+        counters.notificationGaps += c.notificationGaps
         counters.realtimeHRPackets += c.realtimeHRPackets
+        counters.deviceEvents += c.deviceEvents
     }
     let hrValues = sink.hr.map(\.bpm)
     let summary: [String: Any] = [
@@ -173,7 +194,9 @@ func replayCapture(_ path: String, json: Bool) async -> Bool {
                      "unknownPackets": counters.unknownPackets, "standardHR": counters.standardHRNotifications,
                      "standardHRWithRR": counters.standardHRWithRR, "historyRecords": counters.historyRecords,
                      "historyRecordsUnmapped": counters.historyRecordsUnmapped, "historyRecordsUndecoded": counters.historyRecordsUndecoded,
-                     "realtimeHRPackets": counters.realtimeHRPackets],
+                     "historyTimeCollisions": counters.historyTimeCollisions, "notificationGaps": counters.notificationGaps,
+                     "deviceEvents": counters.deviceEvents, "realtimeHRPackets": counters.realtimeHRPackets,
+                     "duplicateRecordsSkipped": sink.duplicates],
         // No samples → null, never a fabricated 0.
         "heartRate": ["samples": hrValues.count, "min": hrValues.min().map { $0 as Any } ?? NSNull(),
                       "max": hrValues.max().map { $0 as Any } ?? NSNull(),
@@ -192,7 +215,9 @@ func replayCapture(_ path: String, json: Bool) async -> Bool {
         print("  entries \(decoded.file.entries.count) in \(segments.count) connection(s) (skipped lines: \(decoded.skippedLines.count))")
         print("  frames valid \(counters.framesValid), malformed \(counters.framesMalformed), discarded bytes \(counters.bytesDiscarded), unknown packets \(counters.unknownPackets)")
         print("  standard HR notifications \(counters.standardHRNotifications) (with RR: \(counters.standardHRWithRR))")
-        print("  history records \(counters.historyRecords) (unmapped clock: \(counters.historyRecordsUnmapped); content not decoded: \(counters.historyRecordsUndecoded))")
+        print("  history records \(counters.historyRecords) (unmapped clock: \(counters.historyRecordsUnmapped); content not decoded: \(counters.historyRecordsUndecoded); same-time collisions: \(counters.historyTimeCollisions))")
+        if counters.notificationGaps > 0 { print("  notifications lost by the link: \(counters.notificationGaps)") }
+        print("  records already seen in an earlier connection (skipped, as the app's store would): \(sink.duplicates)")
         print("  heart-rate samples \(hrValues.count)" + (hrValues.isEmpty ? "" : " range \(hrValues.min()!)–\(hrValues.max()!) bpm; unvalidated \(sink.hr.filter { $0.quality.contains(.unvalidatedField) }.count)"))
         print("  beat intervals \(sink.beats.count), motion epochs \(sink.motion.count)")
         print("  decoded events:")

@@ -15,9 +15,10 @@ public struct DeviceClockReading: Hashable, Sendable {
         self.phoneTime = phoneTime
     }
 
-    /// Device time in whole seconds, as ms. History records carry whole seconds too, so truncating both
-    /// keeps the correction unbiased (the sub-second part is kept for diagnostics only).
-    public var deviceMillis: Int64 { Int64(deviceSeconds) * 1_000 }
+    /// Device time in ms: whole seconds plus the sub-second part when the adapter knows its unit. Without
+    /// it, every read would carry up to a second of truncation phase, so two reads of the same steady clock
+    /// could give corrections a second apart — and map a re-sent record to a different stored time.
+    public var deviceMillis: Int64 { Int64(deviceSeconds) * 1_000 + Int64(subsecondMillis ?? 0) }
 
     /// phone − device, in milliseconds.
     public var offsetMillis: Int64 { phoneTime - deviceMillis }
@@ -30,9 +31,13 @@ public struct DeviceClockReading: Hashable, Sendable {
 ///   A band whose clock was lost/reset reports such values; Forma never substitutes arrival time.
 /// - With no clock reading, or when the measured offset is within `toleranceMillis`, the device clock is
 ///   trusted as-is (no correction, no flag).
-/// - When a clock reading shows a larger offset (up to `maxCorrectableOffsetMillis`), the offset is
-///   applied and records carry `.clockOffsetApplied` plus the applied offset, so the correction is
-///   auditable and reversible.
+/// - When a clock reading shows a larger offset (up to `maxCorrectableOffsetMillis`), the offset — rounded
+///   to `resolutionMillis` — is applied and records carry `.clockOffsetApplied` plus the applied offset, so
+///   the correction is auditable and reversible. The sync engine rounds to whole seconds: band records carry
+///   whole seconds anyway, and a rounded correction stays the same from one connection to the next while
+///   the band clock is steady, so a re-sent record maps to the same stored time (the dedup key) instead of a
+///   slightly different one per connection. (The correction still changes when the band clock drifts across
+///   a half second or is set; keying band history on its raw device time is the store's part of the fix.)
 /// - A reading that is implausible (before 2020, or off by more than `maxCorrectableOffsetMillis`) means
 ///   the band's clock is wrong by days. Forma never sets the band's clock, and a single offset cannot place
 ///   records written before and after such a reset, so every record is then unmapped (not stored, not
@@ -46,6 +51,8 @@ public struct ClockMapper: Sendable {
 
     public var toleranceMillis: Int64
     public var maxCorrectableOffsetMillis: Int64
+    /// Applied corrections are rounded to a multiple of this (1 = exact).
+    public var resolutionMillis: Int64
     public private(set) var offsetMillis: Int64?
     public private(set) var unstable: Bool = false
     /// The latest reading was implausible: nothing can be mapped until a plausible one arrives.
@@ -53,9 +60,28 @@ public struct ClockMapper: Sendable {
     public private(set) var readings: [DeviceClockReading] = []
     private var awaitingFreshBaseline = false
 
-    public init(toleranceMillis: Int64 = 2_000, maxCorrectableOffsetMillis: Int64 = EpochMillis.millisPerDay) {
+    public init(toleranceMillis: Int64 = 2_000, maxCorrectableOffsetMillis: Int64 = EpochMillis.millisPerDay,
+                resolutionMillis: Int64 = 1) {
         self.toleranceMillis = max(0, toleranceMillis)
         self.maxCorrectableOffsetMillis = max(self.toleranceMillis, maxCorrectableOffsetMillis)
+        self.resolutionMillis = min(max(1, resolutionMillis), 60_000)
+    }
+
+    /// The correction `map` applies (0 when none): the latest offset rounded to `resolutionMillis`, when the
+    /// rounded value exceeds the tolerance.
+    public var correctionMillis: Int64 {
+        guard let offset = offsetMillis else { return 0 }
+        let rounded = Self.round(offset, to: resolutionMillis)
+        return abs(rounded) > toleranceMillis ? rounded : 0
+    }
+
+    /// Rounds to the nearest multiple of `step`, halves away from zero.
+    static func round(_ value: Int64, to step: Int64) -> Int64 {
+        guard step > 1 else { return value }
+        let half = step / 2
+        let magnitude = value.magnitude
+        let rounded = Int64(clamping: (magnitude / UInt64(step) + (magnitude % UInt64(step) >= UInt64(half) ? 1 : 0)) * UInt64(step))
+        return value < 0 ? -rounded : rounded
     }
 
     public enum ReadingOutcome: Equatable, Sendable {
@@ -110,9 +136,10 @@ public struct ClockMapper: Sendable {
         let (latest, overflow) = now.addingReportingOverflow(EpochMillis.millisPerDay)
         var timestamp = raw
         var applied: Int64?
-        if let offset = offsetMillis, abs(offset) > toleranceMillis {
-            timestamp = raw + offset
-            applied = offset
+        let correction = correctionMillis
+        if correction != 0 {
+            timestamp = raw + correction
+            applied = correction
             flags.insert(.clockOffsetApplied)
         }
         guard timestamp >= Self.earliestPlausible, overflow || timestamp <= latest else {
