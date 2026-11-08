@@ -2,7 +2,7 @@
 
 How Forma turns raw measurements into what you see, and what each number can and can't tell you.
 
-The per-metric specifications (inputs, quality gates, method, windows, units, baselines, limitations, references) are compiled into the app and rendered in **Settings → Methodology**. The same text is generated into `METHODOLOGY_SPECS.md` with `cd FormaKit && swift run forma-docs`, so the documentation cannot drift from the code.
+The per-metric specifications (inputs, quality gates, method, windows, units, baselines, limitations, references) are compiled into the app and rendered in **Settings → Methodology**. The same text is generated into `METHODOLOGY_SPECS.md` with `cd FormaKit && swift run forma-docs > ../docs/METHODOLOGY_SPECS.md`, and a unit test fails while that file differs from the catalog, so the specifications cannot drift from the code.
 
 ## 1. Principles
 
@@ -40,9 +40,10 @@ The per-metric specifications (inputs, quality gates, method, windows, units, ba
 - Samples flagged out of range (outside 25–240 bpm), no sensor contact, device-invalid, unmapped clock or unvalidated are excluded.
 - When sources overlap, band history wins, then the vendor live stream, then the standard service. One sample per second is kept.
 - Each sample counts as coverage for up to 5 s. *Coverage* is the covered fraction of a window.
-- Charts break the line at gaps longer than 10 s (60 s for overview charts). Gaps are never interpolated.
-- Coverage views separate three cases:
+- Charts break the line at gaps longer than 60 s (15 s in the live workout chart). Gaps are never interpolated. Coverage still counts every second without a sample (beyond its 5 s span) as missing, so a shorter gap is missing data even where a chart line continues.
+- Coverage views separate four cases:
   - **recorded**
+  - **saved, not validated**: band-history heart rate is stored on the iPhone, but its field has not passed validation (§4) for the band's adapter and firmware, so it is not used yet
   - **pending sync**: missing now, but the band may still hold it
   - **not recorded**: no backfill is possible, or a sync has already passed this period
 
@@ -55,7 +56,7 @@ Decoded fields whose meaning public evidence hasn't confirmed are stored with `u
   - the median absolute difference is ≤ 3 bpm;
   - at least 90 % of the overlapping minutes are within ±5 bpm, so a field that is badly wrong in a sizeable share of minutes cannot pass on the median alone.
 
-  Readings flagged as invalid, without sensor contact, with an unusable time or next to a clock change are not evidence. Forma runs the check automatically after a history download when the band and firmware have no verdict yet, and on demand in Diagnostics. A verdict applies only to history saved by the same adapter and firmware. If the data disagrees, history heart rate stays excluded and the reason is shown.
+  Readings flagged as invalid, without sensor contact, with an unusable time or next to a clock change are not evidence. Forma runs the check automatically after every history download — complete or stopped early — while the band and firmware have no verdict (once a UI scene is active, never on a background wake), and on demand in Diagnostics. Without live standard heart rate (no `180D`), it cannot pass. A verdict applies only to history saved by the same adapter and firmware. If the data disagrees, history heart rate stays excluded and the reason is shown.
 - **Motion counts** have an unpublished scale. They are used for sleep candidates only if you allow it in Diagnostics.
 
 ## 5. Metrics at a glance
@@ -66,7 +67,7 @@ Decoded fields whose meaning public evidence hasn't confirmed are stored with `u
 | Max HR | estimate | Your entry; otherwise the Tanaka formula (208 − 0.7 × age), labeled as estimated | Profile |
 | Zones | estimate | % of max HR (50/60/70/80/90) or % of HR reserve (Karvonen) | Max HR (and resting HR for Karvonen) |
 | Workout summary | measured + estimate | Duration, time-weighted mean HR, max HR, time in zones | ≥ 50 % HR coverage |
-| Resting HR (overnight) | estimate | Lowest 5-min mean in a confirmed sleep window (windows ≥ 80 % covered) | ≥ 3 h covered |
+| Resting HR (overnight) | estimate | Lowest 5-min mean in a confirmed sleep window (windows ≥ 80 % covered) | ≥ 3 h covered (≥ 60 % covered for windows under 5 h) |
 | HRV (RMSSD) | estimate | Artifact-filtered, gap-segmented RMSSD per 5-min window; median of valid windows | Real beat intervals; ≥ 6 valid windows |
 | Trends | descriptive | 7/30/90-day statistics; last 7 days vs prior 28 | ≥ 4/7, 14/30, 45/90 days with data |
 | Sleep candidate | estimate | Motion-based quiet periods with an adaptive threshold; you confirm | Motion data |
@@ -76,7 +77,8 @@ Decoded fields whose meaning public evidence hasn't confirmed are stored with `u
 
 ## 6. Limitations
 
-- Optical wrist sensors are less accurate during movement, poor fit, cold skin and arrhythmias. Pulse-to-pulse intervals from PPG aren't ECG RR intervals.
+- Optical wrist sensors are less accurate during movement, poor fit, cold skin and arrhythmias. Pulse-to-pulse intervals from PPG, if a band provides any, aren't ECG RR intervals.
+- Banister TRIMP is specified and implemented but not shown in this version (workouts show Edwards TRIMP only), so Forma does not ask for the sex it needs.
 - Overnight resting HR is a personal estimate, not a clinical resting heart rate.
 - Sleep candidates are heuristics that need your confirmation. They aren't polysomnography.
 - The readiness index is not validated against any outcome. Its weights are fixed defaults and are shown with every value.

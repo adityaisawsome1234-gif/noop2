@@ -81,6 +81,11 @@ extension DiagnosticsCounters {
         out.acknowledgementsRejected += c.acknowledgementsRejected
         out.responseSequenceMismatches += c.responseSequenceMismatches
         out.notificationGaps += c.notificationGaps
+        out.historyRecordsSaved += c.historyRecordsSaved
+        out.historyRecordsAlreadyStored += c.historyRecordsAlreadyStored
+        out.historyChunksReceived += c.historyChunksReceived
+        out.historyTransfersFinishedByBand += c.historyTransfersFinishedByBand
+        out.historyAmbiguousDuplicates += c.historyAmbiguousDuplicates
         return out
     }
 }
@@ -192,13 +197,13 @@ extension AppModel {
     public func setLiveHeartRate(_ on: Bool) async {
         liveHeartRateEnabled = on
         platform.setPreference(on ? "1" : "0", forKey: "liveHeartRate")
-        await engine?.setOptions(syncOptions())
+        await applyEngineOptions()
     }
 
     public func setHistorySyncMode(_ mode: HistorySyncMode) async {
         historySyncMode = mode
         setStoreSetting(mode.rawValue, SettingKey.historySyncMode)
-        await engine?.setOptions(syncOptions())
+        await applyEngineOptions()
     }
 
     /// Experimental: confirm intact, durably saved history chunks to the band. Off by default because
@@ -206,7 +211,7 @@ extension AppModel {
     public func setHistoryAcknowledgement(_ on: Bool) async {
         historyAcknowledgementEnabled = on
         setStoreSetting(on ? "1" : "0", SettingKey.historyAcknowledgement)
-        await engine?.setOptions(syncOptions())
+        await applyEngineOptions()
     }
 
     public func syncNow() async {
@@ -223,20 +228,31 @@ extension AppModel {
         case .manual: policy = .manual
         case .automatic: policy = .automatic
         }
-        return SyncOptions(history: policy, acknowledgeHistory: historyAcknowledgementEnabled, liveHeartRate: wantsRealtimeStream,
-                           rawCapture: diagnostics.captureEnabled)
+        // The compatibility test never acknowledges: it promises read-only and stream on/off requests only.
+        return SyncOptions(history: policy, acknowledgeHistory: historyAcknowledgementEnabled && !isRunningCompatibilityTest,
+                           liveHeartRate: wantsRealtimeStream, rawCapture: diagnostics.captureEnabled)
     }
 
-    /// The band's real-time stream is requested only while someone can see it — Forma in the foreground with
-    /// the setting on — or while a workout is recording (which needs it, whatever the setting). It is switched
-    /// off when Forma goes to the background, so the band is never left streaming for nobody.
+    /// The band's real-time stream is requested only while the setting "Request live heart-rate stream" is on
+    /// and someone can see it — Forma in the foreground — or a workout is recording (it keeps the request
+    /// while Forma is in the background). Otherwise it is switched off, so the band is never left streaming
+    /// for nobody.
     var wantsRealtimeStream: Bool {
-        (liveHeartRateEnabled && sceneActivity == .active) || liveWorkoutStart != nil
+        liveHeartRateEnabled && (sceneActivity == .active || liveWorkoutStart != nil)
     }
 
     /// Re-applies the current options to a running engine (scene changes, workouts, settings).
     func applyEngineOptions() async {
-        await engine?.setOptions(syncOptions())
+        guard let engine else { return }
+        let options = syncOptions()
+        noteRealtimeRequest(options)
+        await engine.setOptions(options)
+    }
+
+    /// Remembers (across launches) that Forma asked for the real-time stream, before the request goes out;
+    /// cleared once the engine reports that it switched the stream off.
+    func noteRealtimeRequest(_ options: SyncOptions) {
+        if options.liveHeartRate { platform.setPreference("1", forKey: Self.realtimeStreamPreferenceKey) }
     }
 
     func startEngine(on link: any PeripheralLink, services: [GATTServiceSummary]) {
@@ -273,8 +289,11 @@ extension AppModel {
         connection.family = adapter.family
         diagnostics.adapterID = adapter.adapterID
         diagnostics.parserVersion = adapter.parserVersion
+        let options = syncOptions()
+        noteRealtimeRequest(options)
         let engine = SyncEngine(adapter: adapter, sink: ProtectedSink(store: store, platform: platform, cacheGate: liveCacheGate),
-                                device: device, timeSource: timeSource, options: syncOptions(), recorder: recorder)
+                                device: device, timeSource: timeSource, options: options, recorder: recorder,
+                                realtimeStreamMayBeOn: platform.preference(Self.realtimeStreamPreferenceKey) == "1")
         self.engine = engine
         engineGeneration &+= 1
         let generation = engineGeneration
@@ -319,6 +338,7 @@ extension AppModel {
         switch update {
         case .linkReady:
             connection.link = .connected
+            lastClockCheck = nil
             recordLinkChecks()
         case .liveHeartRate(let bpm, let at, let source):
             // Never present an implausible value as live (e.g. the 0 a strap sends without contact).
@@ -352,7 +372,7 @@ extension AppModel {
             if chunks == 0 {
                 updateCheck("history", .unverified, "The band reported no stored history to transfer, so saving could not be checked.")
             } else if acknowledged == 0 {
-                updateCheck("history", .passed, "History transferred and saved (\(chunks) chunk\(chunks == 1 ? "" : "s")). Not acknowledged, so the band keeps its copy.")
+                updateCheck("history", .passed, "History transferred and saved (\(chunks) chunk\(chunks == 1 ? "" : "s")). Not acknowledged, so the band is expected to keep its copy (checklist 5.2 verifies it).")
             } else {
                 updateCheck("history", .passed, "History transferred and saved; \(acknowledged) of \(chunks) chunk\(chunks == 1 ? "" : "s") acknowledged after saving.")
             }
@@ -363,6 +383,8 @@ extension AppModel {
             connection.sync = .failed(message: reason, at: at)
             updateCheck("history", .failed, reason)
             invalidateHistoryRange()
+            // What arrived before the stop was saved: it can be validated too.
+            autoValidationPending = true
             scheduleRefresh()
         case .deviceInformation(let field, let value):
             if field == "firmware" {
@@ -371,19 +393,22 @@ extension AppModel {
                 selectedDevice?.firmwareVersion = value
                 diagnostics.firmware = value
             }
-        case .battery:
-            break
+        case .battery(let percent):
+            diagnostics.batteryPercent = percent
         case .clockOffset(let millis):
-            updateCheck("clock", abs(millis) <= 2_000 ? .passed : .unverified,
-                        "Band clock differs from this iPhone by \(DisplayFormat.number(Double(millis) / 1_000, digits: 1)) s.")
+            recordClockCheck(abs(millis) <= 2_000 ? .passed : .unverified,
+                             "Band clock differs from this iPhone by \(DisplayFormat.number(Double(millis) / 1_000, digits: 1)) s.")
         case .clockImplausible(let offset):
             let days = DisplayFormat.number(Double(abs(offset)) / 86_400_000, digits: 1)
-            updateCheck("clock", .failed,
-                        "The band's clock is off by about \(days) days. Forma never sets the band's clock, so band history can't be placed in time and is left on the band. Opening the official app once usually corrects the band's clock.")
+            recordClockCheck(.failed,
+                             "The band's clock is off by about \(days) days. Forma never sets the band's clock, so band history can't be placed in time and is left on the band. Opening the official app once usually corrects the band's clock.")
         case .pairingRequired:
             alertMessage = "The band asked for a paired connection. Accept the iOS pairing prompt; Forma never bypasses pairing."
         case .commandSent(let name):
             if isRunningCompatibilityTest { testCommandNames.append(name) }
+            if name == AllowedCommand.setRealtimeHeartRate(enabled: false).name {
+                platform.setPreference(nil, forKey: Self.realtimeStreamPreferenceKey)
+            }
         case .counters(let c):
             diagnostics.counters = countersBase.adding(c)
             diagnostics.capturedEntries = recorder.count
@@ -400,6 +425,7 @@ extension AppModel {
             }
         case .disconnected(_, let at):
             connection.liveStreaming = false
+            lastClockCheck = nil
             if selectedDevice != nil, !isDemo {
                 connection.link = collectionEnabled ? .searching : .disconnected(since: at)
             }
@@ -417,6 +443,12 @@ extension AppModel {
         updateCheck("gatt", hasVendor || hasHR ? .passed : .failed,
                     "Vendor service \(hasVendor ? "present" : "absent"); standard heart-rate service \(hasHR ? "present" : "absent").")
         if !hasHR { updateCheck("standardHR", .notApplicable, "The band does not expose the standard heart-rate service on this connection.") }
+    }
+
+    /// The clock check of this connection, kept for a compatibility test started while connected.
+    func recordClockCheck(_ status: CheckStatus, _ detail: String) {
+        lastClockCheck = (status, detail)
+        updateCheck("clock", status, detail)
     }
 
     func updateCheck(_ id: String, _ status: CheckStatus, _ detail: String) {

@@ -1,16 +1,20 @@
 import Foundation
 import FormaCore
 
-/// Classifies every part of an analysis window as recorded, pending sync, or not recorded.
+/// Classifies every part of an analysis window as recorded, awaiting validation, pending sync, or not
+/// recorded.
 ///
 /// - recorded: a usable sample exists within `sampleSpanMillis` before the instant.
+/// - awaitingValidation: no usable sample, but band-history heart rate stored on this iPhone covers the
+///   instant; it is kept out of metrics only until its field passes validation for the band's adapter and
+///   firmware (METHODOLOGY §3), so it is neither missing nor waiting on the band.
 /// - pendingSync: no sample here yet, but the band keeps its own history, and this instant is newer
 ///   than the newest band-history record Forma has persisted — the data may still be on the band.
 /// - notRecorded: no sample, and either the band has no history path or Forma already synced past
 ///   this instant — the data is permanently unavailable to Forma.
 public struct CoverageTimeline: Hashable, Sendable {
     public enum State: String, Hashable, Sendable, Codable {
-        case recorded, pendingSync, notRecorded
+        case recorded, awaitingValidation, pendingSync, notRecorded
     }
 
     public struct Span: Hashable, Sendable {
@@ -37,24 +41,34 @@ public struct CoverageTimeline: Hashable, Sendable {
     ///   - sampleSpanMillis: how long one sample counts as coverage (default 5 s, matching analytics).
     ///   - bandKeepsHistory: whether the connected band's adapter supports history backfill.
     ///   - newestPersistedHistory: newest band-history record time already persisted (from the sync cursor).
+    ///   - awaitingValidationTimes: timestamps of stored band-history heart rate that would be usable but is
+    ///     not validated yet (each covers `sampleSpanMillis` like a sample; never overrides "recorded").
     public static func build(window: TimeRange, sampleTimes: [EpochMillis], sampleSpanMillis: Int64 = 5_000,
-                             bandKeepsHistory: Bool, newestPersistedHistory: EpochMillis?) -> CoverageTimeline {
+                             bandKeepsHistory: Bool, newestPersistedHistory: EpochMillis?,
+                             awaitingValidationTimes: [EpochMillis] = []) -> CoverageTimeline {
         guard !window.isEmpty else { return CoverageTimeline(window: window, spans: []) }
         let span = max(1, sampleSpanMillis)
-        // Merge sample coverage intervals.
-        var covered: [TimeRange] = []
-        for t in sampleTimes.sorted() {
-            let r = TimeRange(start: t, end: t + span)
-            guard let clipped = r.intersection(window) else { continue }
-            if let last = covered.last, clipped.start <= last.end {
-                covered[covered.count - 1] = TimeRange(start: last.start, end: max(last.end, clipped.end))
-            } else {
-                covered.append(clipped)
+        /// Merged `[t, t + span)` intervals, clipped to `window`.
+        func coverage(_ times: [EpochMillis]) -> [TimeRange] {
+            var covered: [TimeRange] = []
+            for t in times.sorted() {
+                let (end, overflow) = t.addingReportingOverflow(span)
+                let r = TimeRange(start: t, end: overflow ? Int64.max : end)
+                guard let clipped = r.intersection(window) else { continue }
+                if let last = covered.last, clipped.start <= last.end {
+                    covered[covered.count - 1] = TimeRange(start: last.start, end: max(last.end, clipped.end))
+                } else {
+                    covered.append(clipped)
+                }
             }
+            return covered
         }
+        let covered = coverage(sampleTimes)
+        let awaiting = coverage(awaitingValidationTimes)
         var spans: [Span] = []
         var cursor = window.start
-        func appendGap(_ gap: TimeRange) {
+        /// A gap with no stored data: pending sync or not recorded.
+        func appendMissing(_ gap: TimeRange) {
             guard !gap.isEmpty else { return }
             guard bandKeepsHistory else {
                 spans.append(Span(range: gap, state: .notRecorded))
@@ -70,6 +84,18 @@ public struct CoverageTimeline: Hashable, Sendable {
                 spans.append(Span(range: TimeRange(start: gap.start, end: boundary), state: .notRecorded))
                 spans.append(Span(range: TimeRange(start: boundary, end: gap.end), state: .pendingSync))
             }
+        }
+        /// A gap without usable samples: stored-but-unvalidated history first, the rest is missing.
+        func appendGap(_ gap: TimeRange) {
+            guard !gap.isEmpty else { return }
+            var position = gap.start
+            for a in awaiting where a.end > gap.start && a.start < gap.end {
+                guard let part = a.intersection(gap) else { continue }
+                if part.start > position { appendMissing(TimeRange(start: position, end: part.start)) }
+                spans.append(Span(range: part, state: .awaitingValidation))
+                position = max(position, part.end)
+            }
+            if position < gap.end { appendMissing(TimeRange(start: position, end: gap.end)) }
         }
         for c in covered {
             if c.start > cursor { appendGap(TimeRange(start: cursor, end: c.start)) }
@@ -109,6 +135,7 @@ public struct CoverageTimeline: Hashable, Sendable {
             return whole < 1 ? "<1%" : "\(Int(whole))%"
         }
         var parts = ["\(share(.recorded) ?? "0%") recorded"]
+        if let saved = share(.awaitingValidation) { parts.append("\(saved) saved from the band, awaiting validation") }
         if let pend = share(.pendingSync) { parts.append("\(pend) waiting to sync from the band") }
         if let none = share(.notRecorded) { parts.append("\(none) not recorded") }
         return parts.joined(separator: ", ")

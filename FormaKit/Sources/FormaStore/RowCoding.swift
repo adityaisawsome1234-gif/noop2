@@ -188,6 +188,9 @@ enum MeasurementTable: CaseIterable {
         }
     }
 
+    /// Number of columns in `columns`.
+    var columnCount: Int { columns.split(separator: ",").count }
+
     /// Deduplicating INSERT for the table (see `StoreSQL`).
     var insertSQL: String {
         switch self {
@@ -290,6 +293,7 @@ final class MeasurementWriter {
     private let db: SQLiteConnection
     private var statements: [MeasurementTable: SQLiteStatement] = [:]
     private var lookups: [MeasurementTable: SQLiteStatement] = [:]
+    private var matches: [MeasurementTable: SQLiteStatement] = [:]
 
     init(db: SQLiteConnection) {
         self.db = db
@@ -310,6 +314,50 @@ final class MeasurementWriter {
 
     func exists(_ a: AuxMeasurement) throws -> Bool {
         try lookup(.aux, [a.deviceID, a.source.rawValue, a.kind.rawValue, a.timestamp])
+    }
+
+    /// For a band record that was just skipped as a duplicate: true when no stored row it matched (by raw band
+    /// time or by stored time) is clearly the same record — same raw band time, stored time within
+    /// `FormaStore.ambiguousDuplicateToleranceMillis`. Records without a raw band time are never ambiguous.
+    func isAmbiguousDuplicate(_ s: HeartRateSample) throws -> Bool {
+        guard let raw = s.deviceTimeRaw else { return false }
+        return try ambiguous(.heartRate, raw: raw, timestamp: s.timestamp, [s.deviceID, s.source.rawValue, raw, s.timestamp])
+    }
+
+    func isAmbiguousDuplicate(_ m: MotionEpoch) throws -> Bool {
+        guard let raw = m.deviceTimeRaw else { return false }
+        return try ambiguous(.motion, raw: raw, timestamp: m.timestamp,
+                             [m.deviceID, m.source.rawValue, raw, m.timestamp, m.epochMillis])
+    }
+
+    private func ambiguous(_ table: MeasurementTable, raw: Int64, timestamp: EpochMillis,
+                           _ key: [any SQLiteValueConvertible]) throws -> Bool {
+        let statement: SQLiteStatement
+        if let cached = matches[table] {
+            statement = cached
+            statement.reset()
+        } else {
+            let sql: String
+            switch table {
+            case .heartRate:
+                sql = "SELECT ts_ms, device_time_raw FROM hr_sample WHERE device_id = ?1 AND source = ?2 AND (device_time_raw = ?3 OR ts_ms = ?4)"
+            case .motion:
+                sql = "SELECT ts_ms, device_time_raw FROM motion_epoch WHERE device_id = ?1 AND source = ?2 AND (device_time_raw = ?3 OR (ts_ms = ?4 AND epoch_ms = ?5))"
+            case .beatInterval, .aux:
+                return false
+            }
+            statement = try db.prepare(sql)
+            matches[table] = statement
+        }
+        try statement.bind(values: key)
+        defer { statement.reset() }
+        var sameRecord = false
+        while try statement.step() == .row {
+            guard let storedTime = statement.int64(0), statement.int64(1) == raw else { continue }
+            let (difference, overflow) = storedTime.subtractingReportingOverflow(timestamp)
+            if !overflow, difference.magnitude <= UInt64(FormaStore.ambiguousDuplicateToleranceMillis) { sameRecord = true }
+        }
+        return !sameRecord
     }
 
     private func lookup(_ table: MeasurementTable, _ key: [any SQLiteValueConvertible]) throws -> Bool {

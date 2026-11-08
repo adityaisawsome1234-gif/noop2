@@ -95,8 +95,17 @@ public struct SyncCounters: Hashable, Sendable, Codable {
     /// Records of a Forma transfer that mapped to the same stored time as a different record of that
     /// transfer (only one of them can be kept; their chunks are never acknowledged).
     public var historyTimeCollisions = 0
+    /// End-of-chunk markers of Forma's transfers (whatever happened to the chunk's records).
+    public var historyChunksReceived = 0
+    /// Chunks saved intact: eligible for acknowledgement (sent only when that experimental setting is on).
     public var historyChunksSaved = 0
     public var historyChunksAcknowledged = 0
+    /// Completion markers the band sent for Forma's transfers (whether or not the transfer was complete
+    /// for Forma: a chunk with records Forma does not decode, for example, keeps it incomplete).
+    public var historyTransfersFinishedByBand = 0
+    /// Band records skipped as duplicates whose stored match was not clearly the same record (see
+    /// `IngestResult.ambiguousDuplicates`); their chunks are not acknowledged.
+    public var historyAmbiguousDuplicates = 0
     public var acknowledgementsAccepted = 0
     public var acknowledgementsRejected = 0
     public var commandsSent = 0
@@ -110,6 +119,10 @@ public struct SyncCounters: Hashable, Sendable, Codable {
     public var deviceEvents = 0
     public var persistedRecords = 0
     public var duplicateRecords = 0
+    /// Band-history records newly saved, and those already stored (skipped as duplicates); live data is
+    /// not included (it is in `persistedRecords` and `duplicateRecords`).
+    public var historyRecordsSaved = 0
+    public var historyRecordsAlreadyStored = 0
     public var logLinesSuppressed = 0
 
     public init() {}
@@ -162,8 +175,9 @@ public enum SyncUpdate: Sendable, Equatable {
 /// - An acknowledgement is sent only when acknowledgements are enabled AND the chunk's start marker was
 ///   seen, every frame on the vendor characteristics arrived intact while it was open (no checksum
 ///   failure, truncation, partial frame, lost notification, or frame Forma does not decode), every record
-///   was fully decoded, could be placed in time and kept (no two records on one stored time),
-///   everything was saved, and the save was made durable. Once a chunk of a transfer fails any of these
+///   was fully decoded, could be placed in time and kept (no two records on one stored time, and no
+///   record skipped as a duplicate of a stored band record it matched only by band time or only by stored
+///   time), everything was saved, and the save was made durable. Once a chunk of a transfer fails any of these
 ///   — or the band's clock changes, a history answer does not match Forma's request, or the band refuses
 ///   an acknowledgement — no later chunk of that transfer is acknowledged.
 /// - Forma never sends an abort; it simply stops acknowledging, so the band keeps the data.
@@ -210,9 +224,13 @@ public actor SyncEngine {
     private var liveBeats: [BeatInterval] = []
     private var liveAux: [AuxMeasurement] = []
     private var lastLiveFlush: EpochMillis?
-    /// The real-time stream state last confirmed by a successful write.
-    private var realtimeStreamOn = false
+    /// The real-time stream state last confirmed by a successful write; nil while unknown (Forma may have
+    /// left it on during an earlier connection, see `init(…realtimeStreamMayBeOn:)`).
+    private var realtimeStreamOn: Bool? = false
     private var realtimeToggleRunning = false
+    /// Whether Forma may have left the band's real-time stream on before this engine (the next connection
+    /// then switches it off when it is not wanted).
+    private var realtimeStreamMayBeOn: Bool
 
     // Clock reads
     /// A GET_CLOCK was written and not answered yet (set before the write, so nothing sends a second one).
@@ -274,6 +292,8 @@ public actor SyncEngine {
         var persistenceFailed = false
         var inserted = 0
         var duplicates = 0
+        /// Saved records whose stored match was not clearly the same record (never acknowledged).
+        var ambiguousDuplicates = 0
         var newestPersisted: EpochMillis?
         var isOpen: Bool { startSeen || records > 0 }
     }
@@ -324,14 +344,19 @@ public actor SyncEngine {
     private static let maxRetainedUnsolicited = 20_000
     private static let maxRememberedSequences = 16
 
+    /// - Parameter realtimeStreamMayBeOn: Forma requested the band's real-time stream earlier and has not
+    ///   seen it switched off (for example the app was ended during a workout, or a new engine took over a
+    ///   connection). The first connection then sends "off" when the stream is not wanted, instead of
+    ///   assuming it is already off. Forma never switches off a stream it did not request.
     public init(adapter: any DeviceAdapter, sink: any IngestSink, device: DeviceRecord, timeSource: any TimeSource,
-                options: SyncOptions, recorder: CaptureRecorder? = nil) {
+                options: SyncOptions, recorder: CaptureRecorder? = nil, realtimeStreamMayBeOn: Bool = false) {
         self.adapter = adapter
         self.sink = sink
         self.device = device
         self.timeSource = timeSource
         self.options = options
         self.recorder = recorder
+        self.realtimeStreamMayBeOn = realtimeStreamMayBeOn
         var cont: AsyncStream<SyncUpdate>.Continuation!
         // Unbounded so state changes are never dropped; high-rate telemetry is throttled at the source.
         self.updates = AsyncStream(bufferingPolicy: .unbounded) { cont = $0 }
@@ -355,7 +380,9 @@ public actor SyncEngine {
         if newOptions.history == .off, old.history != .off {
             // Stop owning any transfer: what already arrived is saved first; from now on history is only counted.
             persistAllHistory()
-            if isOwnedTransferActive { finishTransfer(problem: "History sync was turned off during the transfer", at: timeSource.now()) }
+            if isOwnedTransferActive {
+                finishTransfer(problem: "History sync was turned off during the transfer", at: timeSource.now(), bandFinished: false)
+            }
             transferGeneration += 1
             phase = .idle
         }
@@ -471,7 +498,8 @@ public actor SyncEngine {
         receiveShift = 0
         receiveClock = .min
         lastLiveFlush = nil
-        realtimeStreamOn = false
+        realtimeStreamOn = realtimeStreamMayBeOn ? nil : false
+        realtimeStreamMayBeOn = false
         realtimeToggleRunning = false
         clockReadOutstanding = false
         clockReadingReceived = false
@@ -819,11 +847,12 @@ public actor SyncEngine {
 
     /// Brings the band's real-time stream in line with the current setting. One loop runs at a time and
     /// re-reads the setting after every write, so a change made while a toggle is in flight is applied too.
+    /// An unknown state (see `realtimeStreamMayBeOn`) is settled with one write either way.
     private func syncRealtimeStream() async {
         guard !realtimeToggleRunning else { return }
         realtimeToggleRunning = true
         defer { realtimeToggleRunning = false }
-        while link != nil, options.liveHeartRate != realtimeStreamOn {
+        while link != nil, realtimeStreamOn != options.liveHeartRate {
             let want = options.liveHeartRate
             guard adapter.supports(.setRealtimeHeartRate(enabled: want)), await send(.setRealtimeHeartRate(enabled: want)) else { break }
             realtimeStreamOn = want
@@ -1143,12 +1172,13 @@ public actor SyncEngine {
             default: break
             }
         case .complete:
+            counters.historyTransfersFinishedByBand += 1
             persistAllHistory()
             if chunk.isOpen { blockAcks("The transfer ended inside a chunk (no end marker)") }
             if (decoder?.pendingPartialBytes(excluding: characteristic) ?? 0) > 0 {
                 blockAcks("A frame was still incomplete when the transfer ended")
             }
-            finishTransfer(problem: nil, at: marker.receivedAt)
+            finishTransfer(problem: nil, at: marker.receivedAt, bandFinished: true)
         }
     }
 
@@ -1156,6 +1186,7 @@ public actor SyncEngine {
     /// is closed before the acknowledgement write, so nothing that runs during that write sees it.
     private func finishChunk(_ marker: HistoryMarker, characteristic: String) async {
         transfer?.chunks += 1
+        counters.historyChunksReceived += 1
         var problem: String?
         if !chunk.startSeen { problem = "A history chunk arrived without its start marker" }
         else if chunk.integrityLost || (decoder?.pendingPartialBytes(excluding: characteristic) ?? 0) > 0 {
@@ -1192,6 +1223,7 @@ public actor SyncEngine {
         if problem == nil, !saved { problem = "Saving a history chunk failed" }
         let inserted = chunk.inserted
         let duplicates = chunk.duplicates
+        let ambiguous = chunk.ambiguousDuplicates
         chunk = Chunk()
 
         var acknowledged = false
@@ -1199,6 +1231,11 @@ public actor SyncEngine {
             blockAcks(problem)
         } else {
             counters.historyChunksSaved += 1
+            if ambiguous > 0 {
+                // Saved, but a skipped record may be a distinct one that reuses a band second after the band's
+                // clock was set back: the band keeps the chunk.
+                holdAcks("\(ambiguous) record(s) matched a stored band record only by band time or only by stored time (the band's clock may have been set back)")
+            }
             if options.acknowledgeHistory, transfer?.ackBlocked == false, let token = marker.ackToken,
                adapter.supports(.acknowledgeHistory(token: token)) {
                 acknowledged = await acknowledge(token: token)
@@ -1253,7 +1290,8 @@ public actor SyncEngine {
     }
 
     /// Ends the current Forma-requested transfer: complete when nothing went wrong, stopped otherwise.
-    private func finishTransfer(problem: String?, at time: EpochMillis) {
+    /// `bandFinished`: the band sent its completion marker (reported apart from Forma's verdict).
+    private func finishTransfer(problem: String?, at time: EpochMillis, bandFinished: Bool) {
         if let problem { blockAcks(problem) }
         transferGeneration += 1
         pendingProgress = nil
@@ -1275,7 +1313,9 @@ public actor SyncEngine {
             historyOutcome = .failed
             historyOutcomeNote = t.problems.first
             let detail = t.problems.joined(separator: "; ")
-            emit(.historyStopped(reason: "\(detail). Nothing unsaved was acknowledged; the band keeps that data.", at: time))
+            // The band's own outcome is reported apart from Forma's verdict on the data.
+            let outcome = bandFinished ? "The band finished the transfer (\(Self.chunkCount(t.chunks))), but it is not complete for Forma: " : ""
+            emit(.historyStopped(reason: "\(outcome)\(detail). Nothing unsaved was acknowledged; the band keeps that data.", at: time))
         }
         transfer = nil
         chunk = Chunk()
@@ -1292,7 +1332,8 @@ public actor SyncEngine {
             return
         }
         if !t.problems.isEmpty {
-            failTransfer(t.problems.joined(separator: "; "), at: time)
+            failTransfer("The band stopped sending without finishing (after \(Self.chunkCount(t.chunks))); "
+                         + t.problems.joined(separator: "; "), at: time)
             return
         }
         transferGeneration += 1
@@ -1306,6 +1347,9 @@ public actor SyncEngine {
         chunk = Chunk()
         phase = .idle
     }
+
+    /// "1 chunk", "3 chunks".
+    static func chunkCount(_ n: Int) -> String { "\(n) chunk\(n == 1 ? "" : "s")" }
 
     private func failTransfer(_ reason: String, at time: EpochMillis) {
         blockAcks(reason)
@@ -1341,8 +1385,12 @@ public actor SyncEngine {
             batchesThisRun += 1
             counters.persistedRecords += result.inserted
             counters.duplicateRecords += result.duplicates
+            counters.historyRecordsSaved += result.inserted
+            counters.historyRecordsAlreadyStored += result.duplicates
+            counters.historyAmbiguousDuplicates += result.ambiguousDuplicates
             chunk.inserted += result.inserted
             chunk.duplicates += result.duplicates
+            chunk.ambiguousDuplicates += result.ambiguousDuplicates
             if let newest { chunk.newestPersisted = max(chunk.newestPersisted ?? newest, newest) }
             return true
         } catch {
@@ -1365,6 +1413,9 @@ public actor SyncEngine {
             batchesThisRun += 1
             counters.persistedRecords += result.inserted
             counters.duplicateRecords += result.duplicates
+            counters.historyRecordsSaved += result.inserted
+            counters.historyRecordsAlreadyStored += result.duplicates
+            counters.historyAmbiguousDuplicates += result.ambiguousDuplicates
             return true
         } catch {
             emit(.persistenceFailed(message: "Saving band history failed: \(error)"))

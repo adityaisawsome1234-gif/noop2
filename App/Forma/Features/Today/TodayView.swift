@@ -64,7 +64,7 @@ struct TodayView: View {
                 }
             }
         } else {
-            latestHeartRateCard(state.latestHeartRate)
+            latestHeartRateCard(state.latestHeartRate, historyAwaitingValidation: state.historyAwaitingValidation)
             if let pending = state.pendingSleepReview {
                 sleepReviewCard(pending)
             }
@@ -106,7 +106,7 @@ struct TodayView: View {
     }
 
     @ViewBuilder
-    private func latestHeartRateCard(_ latest: LatestHeartRate?) -> some View {
+    private func latestHeartRateCard(_ latest: LatestHeartRate?, historyAwaitingValidation: Bool) -> some View {
         Card("Heart rate", accessory: AnyView(StatusTag(status: .measured))) {
             if let latest {
                 // "Live"/"Current" only while samples are arriving and this one is recent; the model
@@ -136,6 +136,8 @@ struct TodayView: View {
                     .font(Theme.Typeface.caption)
                     .foregroundStyle(Theme.textSecondary)
                     .accessibilityHidden(true)
+            } else if historyAwaitingValidation {
+                AvailabilityNote(availability: .disabled(reason: TodayState.historyAwaitingValidationNote))
             } else {
                 AvailabilityNote(availability: .insufficientData(detail: "No heart-rate samples yet"))
             }
@@ -243,15 +245,15 @@ struct CoverageLegend: View {
     @ViewBuilder
     private var items: some View {
         legend(.recorded, "Recorded")
+        legend(.awaitingValidation, "Saved, not validated")
         legend(.pendingSync, "Pending sync")
         legend(.notRecorded, "Not recorded")
     }
 
-    /// Same mark as in the bar: full height, half height or a thin line.
+    /// Same mark as in the bar: full bar, outlined bar, half height or a thin line.
     private func legend(_ kind: CoverageBar.Segment.Kind, _ text: String) -> some View {
         HStack(spacing: 4) {
-            Rectangle()
-                .fill(CoverageBar.color(kind))
+            CoverageBar.mark(kind)
                 .frame(width: 12, height: CoverageBar.markHeight(kind))
                 .frame(width: 12, height: CoverageBar.height)
             Text(text)
@@ -266,6 +268,7 @@ enum CoverageSegments {
             let kind: CoverageBar.Segment.Kind
             switch span.state {
             case .recorded: kind = .recorded
+            case .awaitingValidation: kind = .awaitingValidation
             case .pendingSync: kind = .pendingSync
             case .notRecorded: kind = .notRecorded
             }

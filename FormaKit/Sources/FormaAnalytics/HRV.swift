@@ -359,7 +359,7 @@ public enum HRVAnalyzer {
             "artifactsRuleB": "\(artifacts.ruleB)",
             "artifactsFlagged": "\(artifacts.flagged)",
             "segments": "\(segment + 1)",
-            "signal": "device-provided beat intervals (optical pulse intervals on WHOOP); never derived from heart rate",
+            "signal": "device-provided beat intervals (optical pulse intervals on a wrist band); never derived from heart rate",
         ]
         if !sourceNames.isEmpty { inputs["sources"] = sourceNames }
         if prepared.exactDuplicates > 0 {

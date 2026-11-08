@@ -167,20 +167,32 @@ extension FormaStore {
     /// The keyset-pagination query `forEachPage` runs: rows after `(ts_ms, rowid)` = (?2, ?3) with
     /// `ts_ms >= ?1` (and `ts_ms < ?4` with a range), in `(ts_ms, rowid)` order, `LIMIT` last. The
     /// `(ts_ms)` index delivers exactly that order, so no page ever needs a sort.
-    static func pageSQL(_ table: MeasurementTable, hasRange: Bool) -> String {
-        var sql = "SELECT rowid, ts_ms, \(table.columns) FROM \(table.name) WHERE ts_ms >= ? AND (ts_ms > ? OR rowid > ?)"
-        if hasRange { sql += " AND ts_ms < ?" }
-        return sql + " ORDER BY ts_ms, rowid LIMIT ?"
+    ///
+    /// With `withOrigin`, every row is followed by the `adapter_id` and `firmware` of the `ingest_batch`
+    /// that stored it (NULL when the batch is unknown), looked up by its primary key.
+    static func pageSQL(_ table: MeasurementTable, hasRange: Bool, withOrigin: Bool = false) -> String {
+        guard withOrigin else {
+            var sql = "SELECT rowid, ts_ms, \(table.columns) FROM \(table.name) WHERE ts_ms >= ? AND (ts_ms > ? OR rowid > ?)"
+            if hasRange { sql += " AND ts_ms < ?" }
+            return sql + " ORDER BY ts_ms, rowid LIMIT ?"
+        }
+        let columns = table.columns.split(separator: ",")
+            .map { "m." + $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
+        var sql = "SELECT m.rowid, m.ts_ms, \(columns), b.adapter_id, b.firmware FROM \(table.name) AS m "
+            + "LEFT JOIN ingest_batch AS b ON b.id = m.batch_id WHERE m.ts_ms >= ? AND (m.ts_ms > ? OR m.rowid > ?)"
+        if hasRange { sql += " AND m.ts_ms < ?" }
+        return sql + " ORDER BY m.ts_ms, m.rowid LIMIT ?"
     }
 
     /// Streams a measurement table in `(ts_ms, rowid)` order, `pageSize` rows per lock acquisition,
     /// and hands each decoded page to `body` with the lock released (keyset pagination, so ingest
     /// can interleave with a long export). Rows written concurrently behind the read position are
-    /// not included: the result is not a point-in-time snapshot.
+    /// not included: the result is not a point-in-time snapshot. With `withOrigin`, `decode` also finds
+    /// the row's batch `adapter_id` and `firmware` after the table's columns (see `pageSQL`).
     /// - Throws: `CancellationError` (checked before every page) when the calling task is cancelled.
-    func forEachPage<Row>(_ table: MeasurementTable, range: TimeRange?, pageSize: Int = 4_096,
+    func forEachPage<Row>(_ table: MeasurementTable, range: TimeRange?, pageSize: Int = 4_096, withOrigin: Bool = false,
                           decode: (SQLiteStatement, Int) -> Row?, body: ([Row]) throws -> Void) throws {
-        let sql = Self.pageSQL(table, hasRange: range != nil)
+        let sql = Self.pageSQL(table, hasRange: range != nil, withOrigin: withOrigin)
         let limit = max(1, pageSize)
         var afterTimestamp = range?.start ?? Int64.min
         var afterRowID = Int64.min

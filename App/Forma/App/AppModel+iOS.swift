@@ -26,8 +26,9 @@ extension AppModel {
             central = BLECentral(knownProfiles: profiles, defaultProfile: defaultProfile)
         }
         let model = AppModel(central: central, platform: IOSPlatformServices())
-        // A Bluetooth relaunch starts the process in the background, possibly with no UI scene at all.
-        // Tell the model before its first refresh runs, so a background wake computes no screens.
+        // A Bluetooth relaunch starts the process in the background, possibly with no UI scene at all. The
+        // model computes nothing until the first active scene phase arrives (RootView reports it), so this
+        // does not depend on the application state, which may not be known yet while the App is created.
         if UIApplication.shared.applicationState == .background {
             model.sceneEnteredBackground()
         }

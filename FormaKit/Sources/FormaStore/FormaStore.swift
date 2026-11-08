@@ -26,6 +26,11 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
     /// Connection-history rows kept before the oldest are trimmed (10 % at a time).
     public static let defaultConnectionEventLimit = 20_000
 
+    /// A band record skipped as a duplicate is clearly the same record only when a stored row has its raw
+    /// band time and a stored time at most this far from its own (the clock correction is applied in whole
+    /// seconds and drifts between downloads). Anything else is an `IngestResult.ambiguousDuplicates`.
+    public static let ambiguousDuplicateToleranceMillis: Int64 = 2_000
+
     /// Database file path, or nil for an in-memory store.
     public let path: String?
     /// Bounds applied to diagnostics raw-frame capture.
@@ -144,8 +149,10 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
 
     /// Persists a batch atomically, in ONE transaction: an `ingest_batch` provenance row, every record
     /// (stamped with that batch id; records whose dedup key already exists are skipped and counted as
-    /// duplicates), and the cursor if one is given. If anything fails, everything is rolled back and
-    /// the error rethrown, so a history acknowledgement can safely depend on this returning.
+    /// duplicates — band records whose match is not clearly the same record also as
+    /// `ambiguousDuplicates`, see `ambiguousDuplicateToleranceMillis`), and the cursor if one is given.
+    /// If anything fails, everything is rolled back and the error rethrown, so a history acknowledgement
+    /// can safely depend on this returning.
     ///
     /// Durability: batches that carry a cursor or band history are committed with
     /// `synchronous=FULL` (the write-ahead log is synced before this returns), because the band may
@@ -169,17 +176,26 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
                 let writer = MeasurementWriter(db: db)
                 var inserted = 0
                 var duplicates = 0
+                var ambiguous = 0
                 func tally(_ stored: Bool) {
                     if stored { inserted += 1 } else { duplicates += 1 }
                 }
-                for sample in batch.heartRates { tally(try writer.insert(sample, batchID: batchID)) }
+                for sample in batch.heartRates {
+                    let stored = try writer.insert(sample, batchID: batchID)
+                    tally(stored)
+                    if !stored, try writer.isAmbiguousDuplicate(sample) { ambiguous += 1 }
+                }
                 for interval in batch.beatIntervals { tally(try writer.insert(interval, batchID: batchID)) }
-                for epoch in batch.motion { tally(try writer.insert(epoch, batchID: batchID)) }
+                for epoch in batch.motion {
+                    let stored = try writer.insert(epoch, batchID: batchID)
+                    tally(stored)
+                    if !stored, try writer.isAmbiguousDuplicate(epoch) { ambiguous += 1 }
+                }
                 for measurement in batch.aux { tally(try writer.insert(measurement, batchID: batchID)) }
                 if let cursor = batch.cursor {
                     try Self.upsertCursor(cursor, db: db)
                 }
-                return IngestResult(batchID: batchID, inserted: inserted, duplicates: duplicates)
+                return IngestResult(batchID: batchID, inserted: inserted, duplicates: duplicates, ambiguousDuplicates: ambiguous)
             }
         }
     }

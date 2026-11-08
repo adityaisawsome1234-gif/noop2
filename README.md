@@ -10,7 +10,7 @@ A local-first iPhone app that reads **your own WHOOP band** directly over Blueto
 
 | Part | State |
 |---|---|
-| FormaKit (protocol, sync, storage, analytics, app model) | Implemented. Compiled and unit-tested with Swift 6.4.2 (see `docs/TEST_REPORT.md`) |
+| FormaKit (protocol, sync, storage, analytics, app model) | Implemented. Compiled and unit-tested on Linux with Swift 6.4.2 (see `docs/TEST_REPORT.md`); not yet built or tested on macOS or iOS |
 | WHOOP 5.0 decoding | Cross-checked against every real WHOOP 5.0 payload published by public research (`Tools/verify-published-captures.sh`). **Not yet run against your band** |
 | iOS app (SwiftUI, Core Bluetooth) | Written and reviewed, **not yet compiled** (no Apple SDK in this build environment). Build in Xcode 27 |
 | Hardware validation | Pending. Follow `docs/HARDWARE_VALIDATION_HANDOFF.md` |
@@ -19,7 +19,7 @@ A local-first iPhone app that reads **your own WHOOP band** directly over Blueto
 
 ```
 App/Forma/            iOS app target: SwiftUI views, Core Bluetooth, iOS platform services
-FormaKit/             Swift package, platform-independent and tested on Linux and macOS
+FormaKit/             Swift package, platform-independent; tested on Linux (Swift 6.4.2), Apple platforms untested
   FormaCore           shared value types (measurements, provenance, metric results)
   FormaProtocol       WHOOP 5.0 adapter, standard heart-rate adapter, command allowlist
   FormaSync           sync engine (owned transfers, durable save before any opt-in acknowledgement), clock mapping, captures, replay
@@ -41,9 +41,9 @@ On a Mac with Xcode 27:
 open Forma.xcodeproj
 ```
 
-Set your Team and a unique bundle identifier, then run on your iPhone. See `docs/BUILD_AND_INSTALL.md` for signing (a free team re-signs every 7 days; the paid program lasts a year).
+Set your Team and a unique bundle identifier, then run on your iPhone. See `docs/BUILD_AND_INSTALL.md` for signing (a free team re-signs every 7 days; a paid-program profile commonly lasts about a year, which Apple does not state).
 
-Core tests (macOS or Linux, Swift 6.4):
+Core tests (Swift 6.4; run on Linux so far, macOS untested):
 
 ```bash
 cd FormaKit && swift test

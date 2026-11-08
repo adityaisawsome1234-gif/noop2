@@ -57,7 +57,7 @@ The first build compiles the Swift package and the app. FormaKit (all parsing, s
 | First launch | iOS may ask you to trust the developer under **Settings → General → VPN & Device Management** (reported by users; not an Apple document) | For memberships created after June 6, 2021, development-signed apps **check in with Apple's PPQ service on first launch**, which needs internet. Offline profiles are valid for 7 days. This is iOS, not Forma. |
 | TestFlight | Not available | Possible (builds expire after 90 days and need an App Store Connect upload). Not needed for a personal build |
 
-**Recommendation.** Use a **paid membership** if you want uninterrupted background collection. A Personal Team build stops working every 7 days until you reinstall it. Reinstalling the same bundle ID is an update, so local data is expected to survive. This is unconfirmed, so **export a backup first** (Settings → Your data).
+**Recommendation.** Use a **paid membership** if you want uninterrupted background collection. A Personal Team build stops working every 7 days until you reinstall it. Reinstalling the same bundle ID is an update, so local data is expected to survive. This is unconfirmed, so **export a backup first** (Settings → Data → Export, import and delete → Export full backup).
 
 Neither route is an app subscription. Forma has no in-app purchases, accounts or recurring charges.
 
@@ -88,6 +88,7 @@ On iOS 26 and later, only apps that set up the accessory through **AccessorySetu
    - `NSAccessorySetupBluetoothNames` = a name substring
    - `NSAccessorySetupBluetoothCompanyIdentifiers` = the company ID, if one is advertised
 3. Rebuild. Forma detects the keys at launch and uses the system accessory picker instead of its own scan list. In this mode **only accessories chosen in that picker are visible** to the app.
+   - **Migration is not implemented.** Apple's rule for an install that already used plain Core Bluetooth: activate the `ASAccessorySession` and migrate the band (`ASMigrationDisplayItem`) *before* creating the `CBCentralManager`; a central created first makes the picker fail (`docs/research/IOS_BLE_RULES.md` 3.8). This build has no migration step and creates its central at launch once Bluetooth permission was decided, so on an existing install the switch may fail. Until a migration step is added, enable ASK only on a fresh install (export a backup, delete Forma, install the ASK build, import the backup), and verify the picker on device.
 4. Never use "remove accessory" for a band you share with the official app. ASK removal unpairs the band system-wide. Forma's "Forget band" doesn't call it.
 
 ## 7. Troubleshooting

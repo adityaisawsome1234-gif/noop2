@@ -94,8 +94,11 @@ public final class AppModel {
     /// Span of band-history record times reported by the current transfer, not yet invalidated in the cache.
     @ObservationIgnored var historyRunRange: TimeRange?
     @ObservationIgnored var historyChunksAcknowledged = 0
-    /// A history transfer completed: validate history heart rate automatically when next in the foreground.
+    /// A history transfer ended: validate history heart rate automatically when next in the foreground.
     @ObservationIgnored var autoValidationPending = false
+    /// The clock check of the current connection (the band clock is read once per connection), so a
+    /// compatibility test started while connected still reports it.
+    @ObservationIgnored var lastClockCheck: (status: CheckStatus, detail: String)?
     // Compatibility test observations
     @ObservationIgnored var testLiveReadingTimes: [EpochMillis] = []
     @ObservationIgnored var testCommandNames: [String] = []
@@ -146,6 +149,10 @@ public final class AppModel {
 
     /// Live heart rate is "streaming" while updates arrive at least this often (phone time).
     static let liveStreamTimeoutMillis: Int64 = 15_000
+    /// Preference set while Forma may have left the band's real-time stream on (it requested the stream
+    /// and has not seen it switched off since), also across launches: the next engine then switches the
+    /// stream off when nobody wants it.
+    static let realtimeStreamPreferenceKey = "realtimeStreamRequested"
 
     // MARK: Init
 
@@ -311,11 +318,12 @@ public final class AppModel {
         }
     }
 
-    /// Recomputes all screens off the main actor. Coalesces overlapping requests. While the scene is in
-    /// the background (a Bluetooth wake) nothing is computed; the refresh runs when it becomes active.
+    /// Recomputes all screens off the main actor. Coalesces overlapping requests. Until a UI scene is
+    /// active — in the background, and after a launch before the first scene phase arrives (a Bluetooth
+    /// relaunch has no scene at all) — nothing is computed; the refresh runs when the scene becomes active.
     public func scheduleRefresh() {
         refreshTask?.cancel()
-        guard sceneActivity != .background else {
+        guard sceneActivity == .active else {
             refreshDeferredUntilActive = true
             return
         }

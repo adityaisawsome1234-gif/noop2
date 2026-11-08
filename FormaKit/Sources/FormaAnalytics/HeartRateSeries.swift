@@ -72,8 +72,14 @@ public struct HeartRateSeries: Hashable, Sendable {
     public static let maxSpanMillis: Int64 = 5_000
     /// Non-history samples within ± this many ms of a usable band-history sample are dropped.
     public static let historyPrecedenceMillis: Int64 = 5_000
-    /// Default chart gap: consecutive samples further apart than this start a new segment, ms.
+    /// Default gap of `segments(in:maxGapMillis:)`: consecutive samples further apart than this start a new
+    /// segment, ms.
     public static let defaultMaxGapMillis: Int64 = 10_000
+    /// Gap that breaks the line in the app's heart-rate charts of a night or a saved workout (each point there
+    /// summarises up to a minute of samples), ms.
+    public static let chartMaxGapMillis: Int64 = 60_000
+    /// Gap that breaks the line in the live workout chart, ms.
+    public static let liveChartMaxGapMillis: Int64 = 15_000
 
     /// Canonical samples: usable, merged, ascending, one per timestamp.
     public let samples: [HeartRateSample]

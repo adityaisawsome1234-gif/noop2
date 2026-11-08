@@ -26,7 +26,7 @@ struct DiagnosticsView: View {
             } header: {
                 Text("Compatibility test")
             } footer: {
-                Text("The test reads data and sends only read-only or stream on/off requests; it never resets, updates or reconfigures the band. If band history is set to download (Band → History), the test also downloads history once, exactly like Sync now — see the History explanation for what that means for the band.")
+                Text("The test reads data and sends only read-only or stream on/off requests; it never resets, updates or reconfigures the band, and never confirms history to the band, even when the experimental acknowledgement below is on. If band history is set to download (Band → History), the test also downloads history once, like Sync now.")
             }
 
             Section {
@@ -38,7 +38,7 @@ struct DiagnosticsView: View {
             } header: {
                 Text("Field validation")
             } footer: {
-                Text("Decoded band fields are used in metrics only once validated. Motion values are raw sensor counts with an unpublished scale: allowing them only lets Forma propose sleep windows for you to confirm; time asleep, wake bouts, continuity, trends and readiness never use them. Band-history heart rate is used only after it agrees with live standard heart rate over at least 10 shared minutes. Forma runs this check after a history download when your band and firmware have no result yet; you can also run it here.")
+                Text("Decoded band fields are used in metrics only once validated. Motion values are raw sensor counts with an unpublished scale: allowing them only lets Forma propose sleep windows for you to confirm; time asleep, wake bouts, continuity, trends and readiness never use them. Band-history heart rate is used only after it agrees with live standard heart rate over at least 10 shared minutes, so a band without the standard heart-rate service cannot pass yet. Forma runs this check after every history download, complete or not, while your band and firmware have no result; you can also run it here.")
             }
 
             Section {
@@ -49,13 +49,14 @@ struct DiagnosticsView: View {
             } header: {
                 Text("History acknowledgement (experimental)")
             } footer: {
-                Text("Off by default. When on, Forma tells the band a history chunk was received, but only for a chunk it requested, received intact, decoded completely and saved durably on this iPhone. After that the band may delete the chunk, and the official WHOOP app may then never receive that period. The message format comes from public analysis of the official app and has not been confirmed on your band: turn this on only for checklist test 5.6, and turn it off again if the band does not accept it. With it off, the band keeps its copy and sends it again; Forma skips what it already has.")
+                Text("Off by default. When on, Forma tells the band a history chunk was received, but only for a chunk it requested, received intact, decoded completely and saved durably on this iPhone. After that the band may delete the chunk, and the official WHOOP app may then never receive that period. The message format comes from public analysis of the official app and has not been confirmed on your band: turn this on only for checklist test 5.6, and turn it off again if the band does not accept it. The compatibility test never sends it. With it off, the band is expected to keep its copy and send it again (not yet verified); Forma skips what it already has.")
             }
 
             Section("Band") {
                 LabeledContent("Adapter", value: state.adapterID ?? "—")
                 LabeledContent("Parser version", value: state.parserVersion ?? "—")
                 LabeledContent("Firmware", value: state.firmware ?? "not read")
+                LabeledContent("Battery (reported by the band)", value: state.batteryPercent.map { "\($0) %" } ?? "not read")
             }
 
             Section("Counters") {
@@ -66,6 +67,8 @@ struct DiagnosticsView: View {
                 LabeledContent("Standard HR notifications", value: "\(state.counters.standardHRNotifications)")
                 LabeledContent("…with beat intervals", value: "\(state.counters.standardHRWithRR)")
                 LabeledContent("History records", value: "\(state.counters.historyRecords)")
+                LabeledContent("History records saved (new)", value: "\(state.counters.historyRecordsSaved)")
+                LabeledContent("History records already stored", value: "\(state.counters.historyRecordsAlreadyStored)")
                 LabeledContent("Commands sent", value: "\(state.counters.commandsSent)")
                 LabeledContent("Response sequence mismatches", value: "\(state.counters.responseSequenceMismatches)")
                 LabeledContent("Notifications lost by the link", value: "\(state.counters.notificationGaps)")
@@ -76,18 +79,21 @@ struct DiagnosticsView: View {
                 LabeledContent("Real-time frames", value: "\(state.counters.realtimeHRPackets)")
                 LabeledContent("Latest real-time value (unvalidated)",
                                value: state.counters.lastRealtimeCandidateBPM.map { "\($0) bpm" } ?? "—")
-                LabeledContent("Chunks saved", value: "\(state.counters.historyChunksSaved)")
+                LabeledContent("Chunks received", value: "\(state.counters.historyChunksReceived)")
+                LabeledContent("Chunks saved intact", value: "\(state.counters.historyChunksSaved)")
                 LabeledContent("Chunks acknowledged", value: "\(state.counters.historyChunksAcknowledged)")
+                LabeledContent("Transfers the band finished", value: "\(state.counters.historyTransfersFinishedByBand)")
                 LabeledContent("Acknowledgements accepted", value: "\(state.counters.acknowledgementsAccepted)")
                 LabeledContent("Acknowledgements not accepted", value: "\(state.counters.acknowledgementsRejected)")
                 LabeledContent("Records with an unusable band time", value: "\(state.counters.historyRecordsUnmapped)")
                 LabeledContent("Records Forma does not decode yet", value: "\(state.counters.historyRecordsUndecoded)")
                 LabeledContent("Records sharing one time", value: "\(state.counters.historyTimeCollisions)")
+                LabeledContent("Records matching a stored one only partly", value: "\(state.counters.historyAmbiguousDuplicates)")
                 LabeledContent("History another app requested", value: "\(state.counters.historyRecordsUnsolicited)")
             } header: {
                 Text("Vendor stream and history")
             } footer: {
-                Text("Real-time values come from frames whose meaning is not validated; they are shown here only, never as your heart rate. A chunk is never acknowledged if it contains records Forma cannot decode or place in time, or records that share one time.")
+                Text("Real-time values come from frames whose meaning is not validated; they are shown here only, never as your heart rate. “Chunks received” and “Transfers the band finished” count what the band sent, whatever Forma could do with it. A chunk is saved intact only if it holds no record Forma cannot decode or place in time and no records that share one time; only such a chunk can be acknowledged, and not when one of its records matched a stored record only partly (the band's clock may have been set back).")
             }
             .font(.subheadline.monospacedDigit())
 

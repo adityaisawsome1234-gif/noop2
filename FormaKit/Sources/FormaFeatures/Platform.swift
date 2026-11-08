@@ -41,7 +41,8 @@ public protocol PlatformServices: Sendable {
     func isIncludedInBackups() -> Bool
     /// An empty directory for staging exports.
     func makeStagingDirectory() throws -> URL
-    /// Archive a directory into a single file's bytes (zip on iOS).
+    /// Archive a directory into a single file's bytes (zip on iOS), memory-mapped rather than read into
+    /// memory where the platform allows it.
     func archiveDirectory(_ url: URL) throws -> Data
     /// Run short work that must finish even if the app is suspended mid-way (background task on iOS).
     func runProtected<T: Sendable>(_ name: String, _ body: () throws -> T) rethrows -> T

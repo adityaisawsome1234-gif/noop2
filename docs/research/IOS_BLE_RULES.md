@@ -12,7 +12,7 @@ How the sources were checked:
 - The Accessory Design Guidelines PDF is R32 Update 1. Its page footer is dated 2026-10-30 and the file's Last-Modified header is 2026-11-01.
 - Tags: **UNCONFIRMED** means no Apple primary source was found, or Apple sources conflict.
   **INFERRED** means the point follows from Apple statements but Apple doesn't say it directly.
-- Raw copies: `research/raw/` (earlier run) and `research/raw2/` (this run: `ask/`, `rn/`, `adg/adg.txt`, forum fetches not saved).
+- Raw copies of the fetched pages were kept in the research workspace (`research/raw/` from the earlier run, `research/raw2/` from this one; forum fetches not saved). They are not part of this repository; the quotes and URLs above are the record.
 
 ---------------------------------------------------------------------------------------------------
 

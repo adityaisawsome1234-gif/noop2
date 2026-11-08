@@ -11,13 +11,15 @@ extension AppModel {
     static let compatibilityMaxLiveGapMillis: Int64 = 5_000
 
     /// Runs the read-only compatibility test: connects, observes data paths for up to `seconds`, optionally
-    /// performs one history sync (only if the user enabled history), and validates decoded fields against
-    /// independent evidence. Records a raw capture while running. With "Collect from band" off, the band is
-    /// connected for the test only and released afterwards.
+    /// performs one history sync (only if the user enabled history; never acknowledged, whatever the
+    /// experimental setting), and validates decoded fields against independent evidence. Records a raw
+    /// capture while running. With "Collect from band" off, the band is connected for the test only and
+    /// released afterwards.
     public func runCompatibilityTest(seconds: Int = 60) async {
         guard !isDemo, selectedDevice != nil, !isRunningCompatibilityTest else { return }
         isRunningCompatibilityTest = true
-        defer { isRunningCompatibilityTest = false }
+        // Acknowledgements are off while the test runs (see `syncOptions()`).
+        await applyEngineOptions()
         let collectionWasOff = !collectionEnabled
         diagnostics.checks = CompatibilityCheck.plan.map {
             var c = $0
@@ -29,8 +31,10 @@ extension AppModel {
         let wasCapturing = diagnostics.captureEnabled
         setCaptureEnabled(true)
         if connection.link == .connected {
-            // Already connected: the link was set up before the test started, so report what it showed.
+            // Already connected: the link was set up before the test started, so report what it showed
+            // (the band clock is read once per connection).
             recordLinkChecks()
+            if let clock = lastClockCheck { updateCheck("clock", clock.status, clock.detail) }
         } else {
             central.connectSelected(profile: Self.connectionProfile)
         }
@@ -56,6 +60,8 @@ extension AppModel {
         }
         finishChecks(startCounters: startCounters, requestedHistory: requestedHistory)
         await validateHistoryHeartRate()
+        isRunningCompatibilityTest = false
+        await applyEngineOptions()
         if !wasCapturing { setCaptureEnabled(false) }
         if collectionWasOff && !collectionEnabled {
             // The test connected only for itself: restore "Collect from band: off".
@@ -117,7 +123,12 @@ extension AppModel {
             updateCheck("history", .unverified, "History was requested but did not complete within the test window.")
         }
         if checkStatus("clock") == .running {
-            updateCheck("clock", .notApplicable, "Reading the band clock is not supported yet for this band; band timestamps are checked for plausibility instead.")
+            let adapter = currentAdapter ?? selectedDevice.flatMap { AdapterRegistry.adapter(for: $0.family) }
+            if adapter?.supports(.readClock) == true {
+                updateCheck("clock", .unverified, "No band clock reading arrived during the test. Forma reads the clock once after connecting; reconnect the band and run the test again.")
+            } else {
+                updateCheck("clock", .notApplicable, "Reading the band clock is not supported yet for this band; band timestamps are checked for plausibility instead.")
+            }
         }
     }
 
@@ -171,10 +182,10 @@ extension AppModel {
         recordHistoryValidation(outcome)
     }
 
-    /// After a history transfer, history heart rate is validated automatically (in the foreground, off the
-    /// main actor) as long as this adapter and firmware have no verdict yet.
+    /// After a history transfer ends (complete or stopped), history heart rate is validated automatically —
+    /// once a UI scene is active, off the main actor — as long as this adapter and firmware have no verdict yet.
     func runAutoValidationIfNeeded() async {
-        guard autoValidationPending, sceneActivity != .background else { return }
+        guard autoValidationPending, sceneActivity == .active else { return }
         autoValidationPending = false
         guard let store = liveStore, let key = currentHistoryValidationKey(),
               ((try? store.setting(forKey: key)) ?? nil) == nil,
@@ -188,7 +199,7 @@ extension AppModel {
     public func setCaptureEnabled(_ on: Bool) {
         diagnostics.captureEnabled = on
         try? liveStore?.setRawCaptureEnabled(on)
-        Task { await engine?.setOptions(syncOptions()) }
+        Task { await applyEngineOptions() }
     }
 
     public func clearCapture() {

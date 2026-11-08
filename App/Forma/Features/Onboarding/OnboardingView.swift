@@ -78,7 +78,7 @@ struct OnboardingView: View {
             }
         case 4:
             heading("Band history", icon: "clock.arrow.circlepath")
-            paragraph("Your band stores data while your iPhone is away. Forma can download it and fill the gaps.")
+            paragraph("Your band is expected to store data while your iPhone is away, and Forma can try to download it to fill the gaps. This is not yet verified on your band, nor whether it works without an active WHOOP membership.")
             ForEach(HistorySyncMode.allCases) { mode in
                 Button {
                     Task { await model.setHistorySyncMode(mode) }
@@ -88,7 +88,7 @@ struct OnboardingView: View {
                             .foregroundStyle(Theme.accent)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(mode.title).foregroundStyle(Theme.textPrimary)
-                            Text(mode.explanation).font(.footnote).foregroundStyle(Theme.textSecondary)
+                            Text(mode.explanation(acknowledging: model.historyAcknowledgementEnabled)).font(.footnote).foregroundStyle(Theme.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }

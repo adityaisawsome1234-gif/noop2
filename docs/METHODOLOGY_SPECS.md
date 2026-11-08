@@ -30,7 +30,7 @@
 
 **Method.** Usable samples from all sources are merged into one series. Band history wins wherever it exists: any other sample within ±5 s (inclusive) of a usable history sample is dropped. Among the remaining samples each whole UTC second keeps only its best source: live vendor stream > backup import > standard Heart Rate Service > demo. The result is sorted with one sample per timestamp (exact ties: history > live > backup > standard > demo, then earliest receive time, then device ID, then the lower bpm). Each sample is assumed to represent the heart rate from its timestamp until the next sample, for at most 5 s; coverage = covered ms / window ms, and window means are time-weighted over these spans.
 
-**Window.** Charts split the series into segments wherever consecutive samples are more than 10 s apart; gaps are drawn as gaps and never interpolated.
+**Window.** Charts break the line wherever consecutive samples are more than 60 s apart (15 s in the live workout chart); gaps are drawn as gaps and never interpolated. Coverage counts every second not covered by a sample (see the 5 s span) as missing, so a shorter gap is missing data even where a chart line continues.
 
 **Required inputs**
 - HeartRateSample from band history, the live vendor stream, the standard Heart Rate Service or a backup import
@@ -172,7 +172,7 @@
 - Analysis period up to 24 h
 
 **Limitations**
-- WHOOP provides optical pulse-to-pulse intervals (PPG), not ECG R-R intervals. Pulse arrival time varies with blood pressure and vascular tone, and motion or poor contact add error, so values can differ from ECG-based RMSSD, especially when HRV is high.
+- If a wrist band provides beat intervals at all, they are optical pulse-to-pulse intervals (PPG), not ECG R-R intervals (for WHOOP 5.0, Forma decodes none from the band's own data, and whether its standard heart-rate service sends any is untested). Pulse arrival time varies with blood pressure and vascular tone, and motion or poor contact add error, so values can differ from ECG-based RMSSD, especially when HRV is high.
 - Interval timestamps may be reconstructed from record or phone receive times.
 - The first 3 accepted beats of each segment are not checked by rule B.
 - A single missed beat that leaves no gap above interval + 2 s is not detected by timing.
@@ -425,6 +425,7 @@
 - Withheld below 50% heart-rate coverage of the workout
 
 **Limitations**
+- Not shown in this version of the app: workouts show Forma Load (Edwards TRIMP) only, and the app does not ask for the sex this method needs. The specification documents the implemented calculation for a later version.
 - The sex-specific weighting comes from small historical samples.
 - Clamping at HRmax limits the effect of an underestimated HRmax.
 
