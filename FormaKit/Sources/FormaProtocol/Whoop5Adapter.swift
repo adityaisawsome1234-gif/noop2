@@ -116,6 +116,10 @@ public struct Whoop5Adapter: DeviceAdapter {
     }
 
     public func makeDecoder() -> any DeviceDecoder { Whoop5Decoder() }
+
+    /// Wraps a bare payload in a WHOOP 5.0 frame. Used by tools and tests to feed payload-only
+    /// captures through the normal decoder.
+    public static func frame(payload: [UInt8]) -> [UInt8] { Whoop5Wire.frame(payload: payload) }
 }
 
 // MARK: - Wire helpers (CRCs, little-endian reads, frame building)
