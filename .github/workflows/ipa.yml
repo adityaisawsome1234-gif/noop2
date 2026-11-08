@@ -1,0 +1,54 @@
+# Builds an UNSIGNED Forma.ipa on a GitHub macOS runner, for signing and installing with Sideloadly or
+# AltStore (docs/BUILD_AND_INSTALL.md §Sideloadly). No secrets, no Apple account, nothing is uploaded
+# anywhere except this run's artifact.
+name: Build IPA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 27
+        run: |
+          XC=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then echo "::error::Xcode 27 not found on this runner image"; ls /Applications; exit 1; fi
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+      - name: Build for iPhone (Release, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project Forma.xcodeproj -scheme Forma -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | tail -n 100 || {
+              # Surface every compiler error as an annotation so it is visible on the run page.
+              grep -E "^/.*: error: " build.log | sort -u | head -n 50 | while IFS= read -r line; do
+                file=$(echo "$line" | cut -d: -f1 | sed "s|$GITHUB_WORKSPACE/||"); ln=$(echo "$line" | cut -d: -f2)
+                msg=$(echo "$line" | cut -d: -f4- | sed 's/^ error: //')
+                echo "::error file=$file,line=$ln::$msg"
+              done
+              grep -E "error:" build.log | grep -vE "^/" | sort -u | head -n 20 | sed 's/^/::error::/'
+              exit 1
+            }
+      - name: Package Forma.ipa
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "::error::No .app produced"; exit 1; }
+          mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qry Forma.ipa Payload
+          ls -la Forma.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Forma-ipa
+          path: Forma.ipa
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
