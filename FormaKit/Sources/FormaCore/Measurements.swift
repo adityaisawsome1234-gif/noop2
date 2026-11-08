@@ -51,6 +51,9 @@ public struct QualityFlags: OptionSet, Hashable, Sendable, Codable {
     /// The device indicated the reading is not valid/settled (e.g. HR value 0 or a "no signal" marker).
     public static let deviceMarkedInvalid = QualityFlags(rawValue: 1 << 5)
     /// The record was decoded from a field whose meaning is not yet validated for this firmware.
+    /// Analytics exclude flagged records everywhere. The flag stays in storage as evidence; once the user
+    /// validates the field (e.g. history heart rate agreeing with live standard heart rate), the feature
+    /// layer clears it on the copies it hands to analytics.
     public static let unvalidatedField = QualityFlags(rawValue: 1 << 6)
     /// Device time could not be mapped to wall time with confidence.
     public static let clockUnmapped = QualityFlags(rawValue: 1 << 7)
@@ -152,9 +155,13 @@ public struct MotionEpoch: Hashable, Sendable, Codable {
     public var source: MeasurementSource
     public var quality: QualityFlags
     public var batchID: Int64?
+    /// The band's own clock value for the record (seconds), when the epoch came from a device record. It
+    /// identifies the record across downloads whatever clock offset was applied to `timestamp`.
+    public var deviceTimeRaw: Int64?
 
     public init(deviceID: String, timestamp: EpochMillis, epochMillis: Int64, activity: Double,
-                sampleCount: Int, source: MeasurementSource, quality: QualityFlags = [], batchID: Int64? = nil) {
+                sampleCount: Int, source: MeasurementSource, quality: QualityFlags = [], batchID: Int64? = nil,
+                deviceTimeRaw: Int64? = nil) {
         self.deviceID = deviceID
         self.timestamp = timestamp
         self.epochMillis = epochMillis
@@ -163,6 +170,7 @@ public struct MotionEpoch: Hashable, Sendable, Codable {
         self.source = source
         self.quality = quality
         self.batchID = batchID
+        self.deviceTimeRaw = deviceTimeRaw
     }
 }
 

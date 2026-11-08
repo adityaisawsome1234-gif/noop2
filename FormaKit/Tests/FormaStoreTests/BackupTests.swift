@@ -150,9 +150,9 @@ struct BackupTests {
         #expect(second.totalInserted == 0)
         #expect(second.duplicates == first.inserted)
         #expect(second.importedRange == nil)
-        var expected = countsAfterFirst
-        expected["ingest_batch"] = (expected["ingest_batch"] ?? 0) + second.batchIDs.count
-        #expect(try target.tableCounts() == expected)
+        // Not even a provenance row: batches whose records were all duplicates are removed again.
+        #expect(second.batchIDs.isEmpty)
+        #expect(try target.tableCounts() == countsAfterFirst)
     }
 
     @Test func restoringIntoTheOriginalStoreAddsNothing() throws {
@@ -167,9 +167,8 @@ struct BackupTests {
         #expect(report.duplicates[.session] == 3)
         #expect(report.duplicates[.correction] == 3)
         #expect(report.notApplied == [.cursor: 1])
-        var after = try store.tableCounts()
-        after["ingest_batch"] = (after["ingest_batch"] ?? 0) - report.batchIDs.count
-        #expect(after == before)
+        #expect(report.batchIDs.isEmpty)
+        #expect(try store.tableCounts() == before)
     }
 
     @Test func malformedLinesAreSkippedCountedAndExplained() throws {
@@ -270,7 +269,7 @@ struct BackupTests {
         let url = directory.file("shape.ndjson")
         try store.exportBackup(to: url)
         let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n").map(String.init)
-        #expect(lines[0] == #"{"format":"forma-backup","formatVersion":1,"schemaVersion":1,"exportedAt":\#(t0 + 7),"app":"Forma"}"#)
+        #expect(lines[0] == #"{"format":"forma-backup","formatVersion":1,"schemaVersion":2,"exportedAt":\#(t0 + 7),"app":"Forma"}"#)
         #expect(lines.contains(#"{"type":"cursor","data":{"device_id":"band-A","adapter_id":"whoop5","opaque":"AQID","newest_record_ms":null,"last_complete_ms":null,"updated_at":\#(t0)}}"#))
         #expect(lines.contains(#"{"type":"hr","data":{"device_id":"band-A","ts_ms":\#(t0),"bpm":61,"source":2,"device_time_raw":null,"received_at":\#(t0 + 5_000),"clock_offset_ms":null,"quality":0}}"#))
         for line in lines {
@@ -364,17 +363,19 @@ struct BackupTests {
         #expect(FileManager.default.fileExists(atPath: nested.path(percentEncoded: false)))
     }
 
-    @Test func extremeValuesSurviveExportAndImportWithoutTrapping() throws {
+    @Test func extremeValuesNeverTrapAndImportAdmitsOnlyTheTimeWindow() throws {
         let store = try makeStore()
         let extremes = [
             HeartRateSample(deviceID: deviceA, timestamp: .min, bpm: 0, source: .deviceHistory, deviceTimeRaw: .max,
-                            receivedAt: .max, clockOffsetMillis: .min, quality: QualityFlags(rawValue: .min)),
-            HeartRateSample(deviceID: deviceA, timestamp: .max, bpm: 65_535, source: .deviceHistory, receivedAt: .min),
+                            receivedAt: .max, clockOffsetMillis: .min, quality: [.outOfRange, QualityFlags(rawValue: .min)]),
+            HeartRateSample(deviceID: deviceA, timestamp: .max, bpm: 65_535, source: .deviceHistory, receivedAt: .min,
+                            quality: [.outOfRange]),
         ]
-        _ = try store.ingest(IngestBatch(provenance: provenance(), heartRates: extremes,
-                                         beatIntervals: [rr(0, -.greatestFiniteMagnitude, recordKey: .min, index: .max)]))
+        let edge = rr(0, -.greatestFiniteMagnitude, recordKey: .min, index: .max)
+        _ = try store.ingest(IngestBatch(provenance: provenance(), heartRates: extremes, beatIntervals: [edge]))
         try store.insertSession(Session(kind: .sleep, range: TimeRange(start: .min, end: .max), origin: .manual,
                                         createdAt: .min, updatedAt: .max))
+        // Ingest stores what the sync engine delivers, extreme times included.
         #expect(try store.dataBounds() == TimeRange(start: .min, end: .max))
         #expect(try store.newestSampleTime() == .max)
 
@@ -384,16 +385,22 @@ struct BackupTests {
         #expect(try sessions.value(0, "duration_s") == "")
         #expect(try CSVTable(readCSV(urls[0])).rows.count == 2)
 
+        // A backup is untrusted input: timeline values outside the window are reported, not restored,
+        // so nothing derived from an import can overflow (the old behaviour handed out [min, max)).
         let url = directory.file("extreme.ndjson")
         try store.exportBackup(to: url)
         let restored = try makeStore()
         let report = try restored.importBackup(from: url)
-        #expect(report.invalidLines == 0)
-        #expect(report.importedRange == TimeRange(start: .min, end: .max))
-        var restoredHR: [HeartRateSample] = []
-        try restored.forEachPage(.heartRate, range: nil, decode: RowDecoder.heartRate) { restoredHR += $0 }
-        #expect(withoutBatch(restoredHR) == extremes)
-        #expect(withoutBatch(try restored.beatIntervals(in: everything)) == withoutBatch(try store.beatIntervals(in: everything)))
+        #expect(report.invalidLines == 3, "the session and both heart rates: \(report.errors)")
+        #expect(report.errors.count == 3)
+        #expect(report.errors.allSatisfy { $0.contains("outside the importable time range") })
+        #expect(report.inserted == [.rr: 1])
+        let range = try #require(report.importedRange)
+        #expect(range == TimeRange(start: 0, end: 1))
+        #expect(range.durationMillis == 1)
+        #expect(try restored.dataBounds() == TimeRange(start: 0, end: 1))
+        #expect(withoutBatch(try restored.beatIntervals(in: everything)) == [edge])
+        #expect(try restored.sessions(includeDeleted: true).isEmpty)
     }
 
     @Test func importToleratesCRLFAndAByteOrderMark() throws {

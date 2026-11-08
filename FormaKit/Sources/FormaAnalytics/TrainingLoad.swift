@@ -8,6 +8,9 @@ import FormaCore
 /// below 50 % HRmax scores 0. Minutes come from the coverage spans of usable heart rate (see
 /// ``HeartRateSeries``); minutes without usable heart rate contribute nothing and nothing is
 /// extrapolated. Edwards bands always use %HRmax, whatever zone model the user displays.
+///
+/// Reasons are reported in the order a person can act on them: an invalid range first, then a missing
+/// setting (HRmax; for Banister also resting heart rate and sex), then too little heart-rate data.
 public enum TrainingLoad {
     /// Lower bounds of the Edwards bands as fractions of HRmax.
     public static let edwardsBandLowerBounds: [Double] = [0.5, 0.6, 0.7, 0.8, 0.9]
@@ -26,8 +29,9 @@ public enum TrainingLoad {
     public static let missingSexDetail = "Banister TRIMP needs your sex to choose its published weighting; Forma never assumes it"
     public static let missingRestingDetail = "Banister TRIMP needs your resting heart rate"
 
-    /// Load for one local day (`[00:00, next 00:00)` in `calendar`'s time zone), in arbitrary units.
-    /// Unavailable without HRmax; value nil when heart-rate coverage of the day is below 30 %.
+    /// Load for one local day (`[start of day, start of the next day)` in `calendar`'s time zone; `day` is a
+    /// Gregorian date), in arbitrary units. Unavailable without HRmax; value nil when heart-rate coverage of
+    /// the day is below 30 %.
     public static func dailyLoad(day: LocalDay, calendar: Calendar, samples: [HeartRateSample],
                                  hrMax: MaxHeartRate?) -> MetricValue<Double> {
         dailyLoad(day: day, calendar: calendar, series: HeartRateSeries(samples), hrMax: hrMax)
@@ -57,15 +61,17 @@ public enum TrainingLoad {
     /// sex is never assumed. Withheld below 50 % coverage.
     public static func banisterTRIMP(range: TimeRange, samples: [HeartRateSample], hrMax: MaxHeartRate?,
                                      restingHeartRate: Double?, sex: UserProfile.Sex) -> MetricValue<Double> {
+        banisterTRIMP(range: range, series: HeartRateSeries(samples), hrMax: hrMax, restingHeartRate: restingHeartRate, sex: sex)
+    }
+
+    /// As ``banisterTRIMP(range:samples:hrMax:restingHeartRate:sex:)`` for an already canonical series.
+    public static func banisterTRIMP(range: TimeRange, series: HeartRateSeries, hrMax: MaxHeartRate?,
+                                     restingHeartRate: Double?, sex: UserProfile.Sex) -> MetricValue<Double> {
         let spec = MetricCatalog.banisterTRIMP
-        let series = HeartRateSeries(samples)
         guard let gate = coverageGate(range: range, series: series, minimumCoverage: workoutMinimumCoverage, scope: "workout") else {
             return spec.unavailable(.insufficientData(detail: "The workout time range is empty or invalid"), window: nil)
         }
         var inputs = gate.inputs
-        if let failure = gate.failure {
-            return spec.unavailable(failure, coverage: gate.coverage, window: range, inputs: inputs)
-        }
         guard let hrMax, hrMax.bpm.isFinite, hrMax.bpm > 0 else {
             return spec.unavailable(.insufficientData(detail: MaxHeartRateResolver.missingInputDetail),
                                     coverage: gate.coverage, window: range, inputs: inputs)
@@ -85,6 +91,9 @@ public enum TrainingLoad {
             b = banisterMaleExponent
         case .unspecified:
             return spec.unavailable(.insufficientData(detail: missingSexDetail), coverage: gate.coverage, window: range, inputs: inputs)
+        }
+        if let failure = gate.failure {
+            return spec.unavailable(failure, coverage: gate.coverage, window: range, inputs: inputs)
         }
         inputs["weighting"] = "\(sex.rawValue): \(Fmt.number(a, decimals: 2))·e^(\(Fmt.number(b, decimals: 2))·x)"
         let reserve = hrMax.bpm - rest
@@ -149,14 +158,14 @@ public enum TrainingLoad {
             return spec.unavailable(.insufficientData(detail: "The \(scope) time range is empty or invalid"), window: nil)
         }
         var inputs = gate.inputs
-        if let failure = gate.failure {
-            return spec.unavailable(failure, coverage: gate.coverage, window: range, inputs: inputs)
-        }
         guard let hrMax, hrMax.bpm.isFinite, hrMax.bpm > 0 else {
             return spec.unavailable(.insufficientData(detail: MaxHeartRateResolver.missingInputDetail),
                                     coverage: gate.coverage, window: range, inputs: inputs)
         }
         inputs["maxHeartRate"] = Fmt.bpm(hrMax.bpm) + " (\(hrMax.label))"
+        if let failure = gate.failure {
+            return spec.unavailable(failure, coverage: gate.coverage, window: range, inputs: inputs)
+        }
         let breakdown = edwardsBreakdown(series: series, range: range, hrMax: hrMax.bpm)
         let names = ["50–60%", "60–70%", "70–80%", "80–90%", "≥90%"]
         inputs["minutesByBand"] = zip(names, breakdown.millisByBand.dropFirst())

@@ -4,8 +4,10 @@ import FormaCore
 /// Column lists and row decoders shared by queries, CSV export and the backup writer.
 ///
 /// Decoders return nil (the row is skipped) instead of inventing a value when a stored NOT NULL
-/// field is missing or holds a code this build does not know. `base` is the index of the first
-/// listed column in the result row, so the same decoder works behind extra leading columns.
+/// field is missing or holds a code this build does not know. That includes quality flags,
+/// `validated`, `deleted` and sync-run counters: a default such as "no flags" or "not deleted" would
+/// make a damaged row look cleaner than it is. `base` is the index of the first listed column in the
+/// result row, so the same decoder works behind extra leading columns.
 enum RowDecoder {
     static let heartRateColumns =
         "device_id, ts_ms, bpm, source, device_time_raw, received_at, clock_offset_ms, quality, batch_id"
@@ -13,11 +15,11 @@ enum RowDecoder {
     static func heartRate(_ s: SQLiteStatement, _ base: Int = 0) -> HeartRateSample? {
         guard let deviceID = s.string(base), let timestamp = s.int64(base + 1), let bpm = s.int(base + 2),
               let source = s.int(base + 3).flatMap(MeasurementSource.init(rawValue:)),
-              let receivedAt = s.int64(base + 5) else { return nil }
+              let receivedAt = s.int64(base + 5), let quality = s.int64(base + 7) else { return nil }
         return HeartRateSample(deviceID: deviceID, timestamp: timestamp, bpm: bpm, source: source,
                                deviceTimeRaw: s.int64(base + 4), receivedAt: receivedAt,
                                clockOffsetMillis: s.int64(base + 6),
-                               quality: QualityFlags(rawValue: s.int64(base + 7) ?? 0), batchID: s.int64(base + 8))
+                               quality: QualityFlags(rawValue: quality), batchID: s.int64(base + 8))
     }
 
     static let beatIntervalColumns =
@@ -27,21 +29,24 @@ enum RowDecoder {
         guard let deviceID = s.string(base), let timestamp = s.int64(base + 1), let interval = s.double(base + 2),
               let source = s.int(base + 3).flatMap(MeasurementSource.init(rawValue:)),
               let recordKey = s.int64(base + 4), let index = s.int(base + 5), let receivedAt = s.int64(base + 6),
-              let basis = s.int(base + 7).flatMap(BeatTimingBasis.init(rawValue:)) else { return nil }
+              let basis = s.int(base + 7).flatMap(BeatTimingBasis.init(rawValue:)),
+              let quality = s.int64(base + 8) else { return nil }
         return BeatInterval(deviceID: deviceID, timestamp: timestamp, intervalMillis: interval, source: source,
                             recordKey: recordKey, indexInRecord: index, receivedAt: receivedAt, timingBasis: basis,
-                            quality: QualityFlags(rawValue: s.int64(base + 8) ?? 0), batchID: s.int64(base + 9))
+                            quality: QualityFlags(rawValue: quality), batchID: s.int64(base + 9))
     }
 
-    static let motionColumns = "device_id, ts_ms, epoch_ms, activity, sample_count, source, quality, batch_id"
+    static let motionColumns = "device_id, ts_ms, epoch_ms, activity, sample_count, source, quality, batch_id, device_time_raw"
 
     static func motion(_ s: SQLiteStatement, _ base: Int = 0) -> MotionEpoch? {
         guard let deviceID = s.string(base), let timestamp = s.int64(base + 1), let epoch = s.int64(base + 2),
               let activity = s.double(base + 3), let count = s.int(base + 4),
-              let source = s.int(base + 5).flatMap(MeasurementSource.init(rawValue:)) else { return nil }
+              let source = s.int(base + 5).flatMap(MeasurementSource.init(rawValue:)),
+              let quality = s.int64(base + 6) else { return nil }
         return MotionEpoch(deviceID: deviceID, timestamp: timestamp, epochMillis: epoch, activity: activity,
                            sampleCount: count, source: source,
-                           quality: QualityFlags(rawValue: s.int64(base + 6) ?? 0), batchID: s.int64(base + 7))
+                           quality: QualityFlags(rawValue: quality), batchID: s.int64(base + 7),
+                           deviceTimeRaw: s.int64(base + 8))
     }
 
     static let auxColumns = "device_id, ts_ms, kind, value, source, validated, quality, batch_id"
@@ -49,10 +54,11 @@ enum RowDecoder {
     static func aux(_ s: SQLiteStatement, _ base: Int = 0) -> AuxMeasurement? {
         guard let deviceID = s.string(base), let timestamp = s.int64(base + 1),
               let kind = s.string(base + 2).flatMap(AuxKind.init(rawValue:)), let value = s.double(base + 3),
-              let source = s.int(base + 4).flatMap(MeasurementSource.init(rawValue:)) else { return nil }
+              let source = s.int(base + 4).flatMap(MeasurementSource.init(rawValue:)),
+              let validated = s.bool(base + 5), let quality = s.int64(base + 6) else { return nil }
         return AuxMeasurement(deviceID: deviceID, timestamp: timestamp, kind: kind, value: value, source: source,
-                              validated: s.bool(base + 5) ?? false,
-                              quality: QualityFlags(rawValue: s.int64(base + 6) ?? 0), batchID: s.int64(base + 7))
+                              validated: validated, quality: QualityFlags(rawValue: quality),
+                              batchID: s.int64(base + 7))
     }
 
     static let deviceColumns = "id, family, name, firmware, hardware, first_seen, last_connected"
@@ -95,11 +101,12 @@ enum RowDecoder {
 
     static func syncRun(_ s: SQLiteStatement, _ base: Int = 0) -> SyncRunRecord? {
         guard let id = s.int64(base), let deviceID = s.string(base + 1), let startedAt = s.int64(base + 2),
-              let status = s.string(base + 4).flatMap(SyncRunRecord.Status.init(rawValue:)) else { return nil }
+              let status = s.string(base + 4).flatMap(SyncRunRecord.Status.init(rawValue:)),
+              let batches = s.int(base + 5), let recordsInserted = s.int(base + 6), let duplicates = s.int(base + 7),
+              let malformedFrames = s.int(base + 8) else { return nil }
         return SyncRunRecord(id: id, deviceID: deviceID, startedAt: startedAt, endedAt: s.int64(base + 3),
-                             status: status, batches: s.int(base + 5) ?? 0, recordsInserted: s.int(base + 6) ?? 0,
-                             duplicates: s.int(base + 7) ?? 0, malformedFrames: s.int(base + 8) ?? 0,
-                             note: s.string(base + 9))
+                             status: status, batches: batches, recordsInserted: recordsInserted,
+                             duplicates: duplicates, malformedFrames: malformedFrames, note: s.string(base + 9))
     }
 
     static let rawFrameColumns = "device_id, received_at, characteristic, bytes, parse_status"
@@ -126,11 +133,12 @@ enum RowDecoder {
         guard let id = s.int64(base), let kind = s.string(base + 1).flatMap(SessionKind.init(rawValue:)),
               let start = s.int64(base + 2), let end = s.int64(base + 3),
               let origin = s.string(base + 4).flatMap(SessionOrigin.init(rawValue:)),
-              let createdAt = s.int64(base + 9), let updatedAt = s.int64(base + 10) else { return nil }
+              let createdAt = s.int64(base + 9), let updatedAt = s.int64(base + 10),
+              let deleted = s.bool(base + 11) else { return nil }
         return Session(id: id, kind: kind, range: TimeRange(start: start, end: end), origin: origin,
                        label: s.string(base + 5), deviceID: s.string(base + 6), detector: s.string(base + 7),
                        confidence: s.double(base + 8), createdAt: createdAt, updatedAt: updatedAt,
-                       deleted: s.bool(base + 11) ?? false)
+                       deleted: deleted)
     }
 
     static let correctionColumns = "id, session_id, field, old_value, new_value, created_at"
@@ -189,6 +197,20 @@ enum MeasurementTable: CaseIterable {
         case .aux: return StoreSQL.insertAux
         }
     }
+
+    /// Whether a row with the given dedup key exists (answered by the UNIQUE index).
+    var existsSQL: String {
+        switch self {
+        // A band record also matches by its raw device time (schema v2), whatever offset was applied.
+        case .heartRate:
+            return "SELECT 1 FROM hr_sample WHERE device_id = ?1 AND source = ?2 AND (ts_ms = ?3 OR device_time_raw = ?4)"
+        case .beatInterval:
+            return "SELECT 1 FROM beat_interval WHERE device_id = ? AND source = ? AND record_key = ? AND idx = ?"
+        case .motion:
+            return "SELECT 1 FROM motion_epoch WHERE device_id = ?1 AND source = ?2 AND ((ts_ms = ?3 AND epoch_ms = ?4) OR device_time_raw = ?5)"
+        case .aux: return "SELECT 1 FROM aux_measurement WHERE device_id = ? AND source = ? AND kind = ? AND ts_ms = ?"
+        }
+    }
 }
 
 /// SQL shared by ingest and backup import. Inserts use `ON CONFLICT(<dedup key>) DO NOTHING`:
@@ -199,6 +221,7 @@ enum StoreSQL {
         INSERT INTO hr_sample (\(RowDecoder.heartRateColumns))
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (device_id, source, ts_ms) DO NOTHING
+        ON CONFLICT (device_id, source, device_time_raw) WHERE device_time_raw IS NOT NULL DO NOTHING
         """
 
     static let insertBeatInterval = """
@@ -209,8 +232,9 @@ enum StoreSQL {
 
     static let insertMotion = """
         INSERT INTO motion_epoch (\(RowDecoder.motionColumns))
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (device_id, source, ts_ms, epoch_ms) DO NOTHING
+        ON CONFLICT (device_id, source, device_time_raw) WHERE device_time_raw IS NOT NULL DO NOTHING
         """
 
     static let insertAux = """
@@ -261,13 +285,46 @@ enum StoreSQL {
     }
 }
 
-/// Prepared measurement INSERTs, reused for every record of one transaction.
+/// Prepared measurement INSERTs (and dedup-key lookups), reused for every record of one transaction.
 final class MeasurementWriter {
     private let db: SQLiteConnection
     private var statements: [MeasurementTable: SQLiteStatement] = [:]
+    private var lookups: [MeasurementTable: SQLiteStatement] = [:]
 
     init(db: SQLiteConnection) {
         self.db = db
+    }
+
+    /// Each `exists` returns true when a row with the record's dedup key is already stored.
+    func exists(_ s: HeartRateSample) throws -> Bool {
+        try lookup(.heartRate, [s.deviceID, s.source.rawValue, s.timestamp, s.deviceTimeRaw])
+    }
+
+    func exists(_ b: BeatInterval) throws -> Bool {
+        try lookup(.beatInterval, [b.deviceID, b.source.rawValue, b.recordKey, b.indexInRecord])
+    }
+
+    func exists(_ m: MotionEpoch) throws -> Bool {
+        try lookup(.motion, [m.deviceID, m.source.rawValue, m.timestamp, m.epochMillis, m.deviceTimeRaw])
+    }
+
+    func exists(_ a: AuxMeasurement) throws -> Bool {
+        try lookup(.aux, [a.deviceID, a.source.rawValue, a.kind.rawValue, a.timestamp])
+    }
+
+    private func lookup(_ table: MeasurementTable, _ key: [any SQLiteValueConvertible]) throws -> Bool {
+        let statement: SQLiteStatement
+        if let cached = lookups[table] {
+            statement = cached
+            statement.reset()
+        } else {
+            statement = try db.prepare(table.existsSQL)
+            lookups[table] = statement
+        }
+        try statement.bind(values: key)
+        let found = try statement.step() == .row
+        statement.reset()
+        return found
     }
 
     /// Each `insert` returns true when the row was stored, false when its dedup key already existed.
@@ -283,7 +340,7 @@ final class MeasurementWriter {
 
     func insert(_ m: MotionEpoch, batchID: Int64) throws -> Bool {
         try run(.motion, [m.deviceID, m.timestamp, m.epochMillis, m.activity, m.sampleCount, m.source.rawValue,
-                          m.quality.rawValue, batchID])
+                          m.quality.rawValue, batchID, m.deviceTimeRaw])
     }
 
     func insert(_ a: AuxMeasurement, batchID: Int64) throws -> Bool {

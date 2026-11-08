@@ -118,6 +118,11 @@ public struct SyncRunRecord: Hashable, Sendable, Codable {
 /// same store in memory. All methods are synchronous and must be safe to call from any thread.
 public protocol IngestSink: Sendable {
     /// Persist the batch atomically (records + cursor). Duplicate records are ignored, not errors.
+    /// A batch that breaks the store's structural rules (every record carries the batch's device ID;
+    /// identifiers are 1–256 UTF-8 bytes; doubles are finite; a 0 bpm carries `.deviceMarkedInvalid`,
+    /// `.noSensorContact` or `.outOfRange`; motion `epochMillis` > 0; counts and indices ≥ 0) is rejected
+    /// whole, so nothing in it may be acknowledged. Batches with a cursor or band-history records are
+    /// committed with `synchronous=FULL`.
     func ingest(_ batch: IngestBatch) throws -> IngestResult
     func syncCursor(deviceID: String) throws -> SyncCursor?
     func upsertDevice(_ device: DeviceRecord) throws

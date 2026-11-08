@@ -66,7 +66,7 @@ public struct ReadinessParameters: Hashable, Sendable, Codable {
         let w = [weights.hrv, weights.restingHeartRate, weights.sleepDuration]
         return (1...366).contains(baselineDays) && nights.allSatisfy { $0 >= 1 && $0 <= baselineDays }
             && floors.allSatisfy { $0.isFinite && $0 > 0 }
-            && w.allSatisfy { $0.isFinite && $0 >= 0 } && weights.hrv > 0
+            && w.allSatisfy { $0.isFinite && $0 >= 0 } && weights.hrv > 0 && w.reduce(0, +).isFinite
             && bandThreshold.isFinite && bandThreshold > 0
     }
 }
@@ -106,14 +106,16 @@ public struct ReadinessComponent: Hashable, Sendable, Codable {
     public var standardDeviationUsed: Double?
     /// True for resting heart rate.
     public var signInverted: Bool
-    /// (value − mean) / SD used, sign-inverted for resting HR, rounded to 0.01.
+    /// (value − mean) / SD used, sign-inverted for resting HR, rounded to 0.01 for display. The composite
+    /// is computed from the unrounded z.
     public var z: Double?
     public var weight: Double
     /// Whether the component entered the composite.
     public var isIncluded: Bool
     /// `.available` when included; otherwise why not (missing value, calibrating, …).
     public var availability: Availability
-    /// Calibration progress: retained baseline nights / nights required.
+    /// Calibration progress: retained baseline nights (eligible nights minus those excluded as outliers,
+    /// the baseline's n) / nights required. `baseline.inputs` lists eligible and excluded nights.
     public var calibrationHave: Int
     public var calibrationNeed: Int
 
@@ -139,9 +141,11 @@ public struct ReadinessComponent: Hashable, Sendable, Codable {
 /// Result of ``ReadinessCalculator/compute(day:calendar:lnRMSSD:restingHeartRate:sleepDurationMinutes:parameters:)``.
 public struct ReadinessResult: Hashable, Sendable, Codable {
     public var day: LocalDay
-    /// Σ wᵢzᵢ / Σ wᵢ over included components, in SD units (not a 0–100 score), rounded to 0.01.
+    /// Σ wᵢzᵢ / Σ wᵢ over included components (unrounded zᵢ), in SD units (not a 0–100 score), rounded once
+    /// to 0.01.
     public var composite: MetricValue<Double>
-    /// Band of the rounded composite; nil when the composite is unavailable.
+    /// Band of the rounded composite, so the band always agrees with the value shown; nil when the
+    /// composite is unavailable.
     public var band: ReadinessBand?
     /// HRV, resting HR and sleep, in that order.
     public var components: [ReadinessComponent]
@@ -168,7 +172,7 @@ public struct ReadinessResult: Hashable, Sendable, Codable {
 /// nights. It is descriptive only and carries no training or treatment advice.
 public enum ReadinessCalculator {
     /// - Parameters:
-    ///   - day: the target night, keyed by the local day on which it ends.
+    ///   - day: the target night, keyed by the local (Gregorian) day on which it ends.
     ///   - lnRMSSD: overnight lnRMSSD per night (ln ms), e.g. `HRVAnalysis.lnRMSSD`.
     ///   - restingHeartRate: overnight resting HR per night (bpm), e.g. `OvernightRestingHeartRate`.
     ///   - sleepDurationMinutes: confirmed sleep duration per night (minutes); use one definition consistently.
@@ -182,7 +186,7 @@ public enum ReadinessCalculator {
             return ReadinessResult(day: day, composite: spec.unavailable(.disabled(reason: "Invalid readiness parameters"), window: window),
                                    band: nil, components: [], weights: p.weights, parameters: p)
         }
-        let components = [
+        let computed = [
             component(.hrv, values: lnRMSSD, day: day, calendar: calendar, minimumNights: p.hrvMinimumNights,
                       floor: p.lnRMSSDStandardDeviationFloor, unit: "ln(ms)", parameters: p),
             component(.restingHeartRate, values: restingHeartRate, day: day, calendar: calendar,
@@ -191,6 +195,7 @@ public enum ReadinessCalculator {
             component(.sleepDuration, values: sleepDurationMinutes, day: day, calendar: calendar,
                       minimumNights: p.sleepMinimumNights, floor: p.sleepStandardDeviationFloorMinutes, unit: "min", parameters: p),
         ]
+        let components = computed.map(\.component)
         var inputs = ["scale": "SD units relative to your previous \(p.baselineDays) nights (not a 0–100 score)",
                       "weights": "HRV \(Fmt.number(p.weights.hrv, decimals: 2)), resting HR \(Fmt.number(p.weights.restingHeartRate, decimals: 2)), sleep \(Fmt.number(p.weights.sleepDuration, decimals: 2))"]
         for c in components { inputs[c.kind.rawValue] = describe(c) }
@@ -200,11 +205,12 @@ public enum ReadinessCalculator {
             return ReadinessResult(day: day, composite: spec.unavailable(reason, window: window, inputs: inputs),
                                    band: nil, components: components, weights: p.weights, parameters: p)
         }
+        // Unrounded z values: rounding each z first could move the composite across a band threshold.
         var sumW = 0.0, sumWZ = 0.0
-        for c in components where c.isIncluded {
-            guard let z = c.z else { continue }
-            sumW += c.weight
-            sumWZ += c.weight * z
+        for c in computed where c.component.isIncluded {
+            guard let z = c.unroundedZ else { continue }
+            sumW += c.component.weight
+            sumWZ += c.component.weight * z
         }
         let totalWeight = p.weights.hrv + p.weights.restingHeartRate + p.weights.sleepDuration
         let coverage = totalWeight > 0 ? sumW / totalWeight : nil
@@ -231,8 +237,14 @@ public enum ReadinessCalculator {
         return .withinUsual
     }
 
+    /// A component and its unrounded z (nil when it is not included).
+    struct ComputedComponent {
+        var component: ReadinessComponent
+        var unroundedZ: Double?
+    }
+
     static func component(_ kind: ReadinessComponentKind, values: [LocalDay: Double?], day: LocalDay, calendar: Calendar,
-                          minimumNights: Int, floor: Double, unit: String, parameters p: ReadinessParameters) -> ReadinessComponent {
+                          minimumNights: Int, floor: Double, unit: String, parameters p: ReadinessParameters) -> ComputedComponent {
         let baseline = BaselineCalculator.baseline(
             values: values, targetDay: day, calendar: calendar,
             parameters: BaselineParameters(windowDays: p.baselineDays, minimumDays: minimumNights, unit: "nights"))
@@ -248,20 +260,25 @@ public enum ReadinessCalculator {
         if let entry = values[day], let v = entry, v.isFinite { value = v }
         let sdUsed = baseline.value.map { max($0.standardDeviation ?? 0, floor) }
 
-        func excluded(_ a: Availability) -> ReadinessComponent {
-            ReadinessComponent(kind: kind, value: value, unit: unit, baseline: baseline, standardDeviationFloor: floor,
-                               standardDeviationUsed: sdUsed, signInverted: inverted, z: nil, weight: weight,
-                               isIncluded: false, availability: a, calibrationHave: have, calibrationNeed: minimumNights)
+        func excluded(_ a: Availability) -> ComputedComponent {
+            ComputedComponent(component: ReadinessComponent(kind: kind, value: value, unit: unit, baseline: baseline,
+                                                            standardDeviationFloor: floor, standardDeviationUsed: sdUsed,
+                                                            signInverted: inverted, z: nil, weight: weight, isIncluded: false,
+                                                            availability: a, calibrationHave: have, calibrationNeed: minimumNights),
+                              unroundedZ: nil)
         }
         guard let value else { return excluded(.insufficientData(detail: "No \(name(of: kind)) for this night")) }
         guard let stats = baseline.value, let sd = sdUsed else { return excluded(baseline.availability) }
         guard weight > 0 else { return excluded(.disabled(reason: "Weight is 0")) }
         let raw = (value - stats.mean) / sd
-        let z = Stats.rounded(inverted ? -raw : raw, decimals: 2)
+        let z = inverted ? -raw : raw
         guard z.isFinite else { return excluded(.lowQuality(detail: "The z-score is not finite")) }
-        return ReadinessComponent(kind: kind, value: value, unit: unit, baseline: baseline, standardDeviationFloor: floor,
-                                  standardDeviationUsed: sd, signInverted: inverted, z: z, weight: weight, isIncluded: true,
-                                  availability: .available, calibrationHave: have, calibrationNeed: minimumNights)
+        return ComputedComponent(
+            component: ReadinessComponent(kind: kind, value: value, unit: unit, baseline: baseline, standardDeviationFloor: floor,
+                                          standardDeviationUsed: sd, signInverted: inverted, z: Stats.rounded(z, decimals: 2),
+                                          weight: weight, isIncluded: true, availability: .available, calibrationHave: have,
+                                          calibrationNeed: minimumNights),
+            unroundedZ: z)
     }
 
     static func name(of kind: ReadinessComponentKind) -> String {
@@ -273,10 +290,14 @@ public enum ReadinessCalculator {
     }
 
     static func describe(_ c: ReadinessComponent) -> String {
+        let excludedNights = c.baseline.value?.excluded ?? c.baseline.inputs["excludedOutliers"].flatMap { Int($0) } ?? 0
+        let exclusionNote = excludedNights > 0
+            ? "; \(excludedNights) unusual night\(excludedNights == 1 ? "" : "s") left out of the baseline as \(excludedNights == 1 ? "an outlier" : "outliers")"
+            : ""
         guard c.isIncluded, let v = c.value, let stats = c.baseline.value, let sd = c.standardDeviationUsed, let z = c.z else {
-            return "not included: \(c.availability.explanation) (baseline \(c.calibrationHave) of \(c.calibrationNeed) nights)"
+            return "not included: \(c.availability.explanation) (baseline \(c.calibrationHave) of \(c.calibrationNeed) nights\(exclusionNote))"
         }
         let decimals = c.kind == .hrv ? 3 : 1
-        return "\(Fmt.number(v, decimals: decimals)) \(c.unit) vs baseline \(Fmt.number(stats.mean, decimals: decimals)) ± \(Fmt.number(sd, decimals: decimals)) (n=\(stats.n)); z \(Fmt.signed(z))\(c.signInverted ? " (sign inverted)" : ""); weight \(Fmt.number(c.weight, decimals: 2))"
+        return "\(Fmt.number(v, decimals: decimals)) \(c.unit) vs baseline \(Fmt.number(stats.mean, decimals: decimals)) ± \(Fmt.number(sd, decimals: decimals)) (n=\(stats.n)\(exclusionNote)); z \(Fmt.signed(z))\(c.signInverted ? " (sign inverted)" : ""); weight \(Fmt.number(c.weight, decimals: 2))"
     }
 }

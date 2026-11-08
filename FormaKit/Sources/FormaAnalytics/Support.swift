@@ -31,6 +31,17 @@ enum IntMath {
         let q = a / b
         return (a % b != 0 && a < 0) ? q - 1 : q
     }
+
+    /// Sum that saturates at the type's bounds instead of trapping. Used for totals of public, Codable
+    /// fields, which may hold corrupted values after decoding.
+    static func saturatingSum<T: FixedWidthInteger>(_ xs: [T]) -> T {
+        var total: T = 0
+        for x in xs {
+            let (sum, overflow) = total.addingReportingOverflow(x)
+            total = overflow ? (x > 0 ? .max : .min) : sum
+        }
+        return total
+    }
 }
 
 // MARK: - Binary search on ascending arrays
@@ -200,11 +211,26 @@ enum Fmt {
 
 /// Local-day arithmetic that validates its inputs instead of trusting Foundation's lenient
 /// normalisation (which would silently turn 31 February into 3 March).
+///
+/// **`LocalDay` is a Gregorian date in the calendar's time zone.** Only the time zone of the `Calendar`
+/// passed in is used: a phone set to the Buddhist, Japanese, Hebrew, Islamic, Persian or ROC calendar
+/// (`Calendar.current`) gets the same days, trends and baselines as a Gregorian one. Every day this
+/// module creates is Gregorian, so build the `LocalDay` keys you pass in from Gregorian dates too.
 enum DayMath {
     static let plausibleYears: ClosedRange<Int> = 1900...2200
 
-    /// Start instant of `day` in the calendar's time zone, or nil for a malformed or non-existent day.
+    /// A Gregorian calendar in `calendar`'s time zone (`calendar` itself when it is already Gregorian).
+    static func gregorian(_ calendar: Calendar) -> Calendar {
+        guard calendar.identifier != .gregorian else { return calendar }
+        var g = Calendar(identifier: .gregorian)
+        g.timeZone = calendar.timeZone
+        return g
+    }
+
+    /// Start instant of `day` (its first local instant: 01:00 where a DST change skips midnight), or nil
+    /// for a malformed or non-existent day.
     static func start(of day: LocalDay, calendar: Calendar) -> Date? {
+        let calendar = gregorian(calendar)
         guard plausibleYears.contains(day.year), (1...12).contains(day.month), (1...31).contains(day.day),
               let date = calendar.date(from: DateComponents(year: day.year, month: day.month, day: day.day))
         else { return nil }
@@ -213,10 +239,13 @@ enum DayMath {
         return date
     }
 
-    /// `[local midnight, next local midnight)` of `day` (23 or 25 h on DST changes).
+    /// `[start of day, start of the next day)`: 23 or 25 h on DST changes, and consecutive days always
+    /// tile the timeline (also where a DST change skips midnight and the day starts at 01:00).
     static func range(of day: LocalDay, calendar: Calendar) -> TimeRange? {
+        let calendar = gregorian(calendar)
         guard let s = start(of: day, calendar: calendar),
-              let e = calendar.date(byAdding: .day, value: 1, to: s),
+              let next = self.day(day, offsetBy: 1, calendar: calendar),
+              let e = start(of: next, calendar: calendar),
               let sm = millis(s), let em = millis(e), em > sm
         else { return nil }
         return TimeRange(start: sm, end: em)
@@ -224,6 +253,7 @@ enum DayMath {
 
     /// The local wall-clock time `hour`:00 on `day`, or nil when the day is invalid.
     static func time(hour: Int, on day: LocalDay, calendar: Calendar) -> EpochMillis? {
+        let calendar = gregorian(calendar)
         guard (0...23).contains(hour), start(of: day, calendar: calendar) != nil,
               let date = calendar.date(from: DateComponents(year: day.year, month: day.month, day: day.day, hour: hour))
         else { return nil }
@@ -235,8 +265,9 @@ enum DayMath {
         return m
     }
 
-    /// The day `offset` calendar days away from `day`.
+    /// The (Gregorian) day `offset` calendar days away from `day`.
     static func day(_ day: LocalDay, offsetBy offset: Int, calendar: Calendar) -> LocalDay? {
+        let calendar = gregorian(calendar)
         guard let s = start(of: day, calendar: calendar),
               let d = calendar.date(byAdding: .day, value: offset, to: s)
         else { return nil }
@@ -245,8 +276,9 @@ enum DayMath {
         return LocalDay(year: y, month: m, day: dd)
     }
 
-    /// `count` consecutive days ending with `last` (inclusive), oldest first.
+    /// `count` consecutive (Gregorian) days ending with `last` (inclusive), oldest first.
     static func days(endingOn last: LocalDay, count: Int, calendar: Calendar) -> [LocalDay]? {
+        let calendar = gregorian(calendar)
         guard count >= 0, count <= 3_660, let s = start(of: last, calendar: calendar) else { return nil }
         var out: [LocalDay] = []
         out.reserveCapacity(count)

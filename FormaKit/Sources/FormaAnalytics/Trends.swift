@@ -72,7 +72,9 @@ public struct RecentVersusPrior: Hashable, Sendable, Codable {
     public var priorDays: Int
     /// recentMean − priorMean, in the metric's unit.
     public var difference: Double
-    /// 100 × difference / |priorMean|; nil when priorMean is 0 (undefined).
+    /// 100 × difference / priorMean, only for ratio-scale values: nil when the prior mean is not positive,
+    /// when the recent mean is negative, or for a metric whose values are not on a ratio scale (see
+    /// ``TrendAnalyzer/nonRatioMetricIDs``), where a percentage would be meaningless.
     public var percentDifference: Double?
 
     public init(recentMean: Double, recentDays: Int, priorMean: Double, priorDays: Int, difference: Double, percentDifference: Double?) {
@@ -87,6 +89,7 @@ public struct RecentVersusPrior: Hashable, Sendable, Codable {
 
 /// Descriptive trend statistics over daily values. Missing keys, explicit `nil` and non-finite values
 /// all mean "no data that day". The output describes the numbers only: no causes, no advice.
+/// Days are Gregorian dates in `calendar`'s time zone (see `LocalDay`); only the time zone is used.
 public enum TrendAnalyzer {
     /// Comparison windows (days): the last 7 days (end day included) vs the 28 days before them.
     public static let recentDays = 7
@@ -94,9 +97,11 @@ public enum TrendAnalyzer {
     /// Days with data required in each comparison window.
     public static let recentMinimumDays = 4
     public static let priorMinimumDays = 14
+    /// Metrics whose values are not on a ratio scale (SD units, logarithms): no percentage difference.
+    public static let nonRatioMetricIDs: Set<String> = [MetricID.readiness, MetricID.hrvLnRMSSD]
 
     /// Statistics for `period` ending on `lastDay` (inclusive). Confidence follows the share of days
-    /// with data (≥ 90 % high, ≥ 70 % moderate, otherwise low).
+    /// with data (≥ 90 % high, ≥ 70 % moderate, otherwise low). `daysWithData` is 0 for an invalid end day.
     /// - Parameter metricID: optional spec ID of the summarised metric, echoed in `inputs`.
     public static func summary(of values: [LocalDay: Double?], period: TrendPeriod, endingOn lastDay: LocalDay,
                                calendar: Calendar, metricID: String? = nil) -> TrendSummary {
@@ -137,6 +142,8 @@ public enum TrendAnalyzer {
     }
 
     /// Last-7-day mean vs the prior-28-day mean; available only with ≥ 4 of 7 and ≥ 14 of 28 days with data.
+    /// - Parameter metricID: spec ID of the summarised metric. Pass it: it is echoed in `inputs` and decides
+    ///   whether a percentage difference is meaningful (none for ``nonRatioMetricIDs``).
     public static func recentVersusPrior(of values: [LocalDay: Double?], endingOn lastDay: LocalDay,
                                          calendar: Calendar, metricID: String? = nil) -> MetricValue<RecentVersusPrior> {
         let spec = MetricCatalog.trends
@@ -160,7 +167,8 @@ public enum TrendAnalyzer {
             return spec.unavailable(.insufficientData(detail: detail), coverage: coverage, window: window, inputs: inputs)
         }
         let difference = recentMean - priorMean
-        let percent: Double? = priorMean == 0 ? nil : 100 * difference / abs(priorMean)
+        let ratioScale = !(metricID.map(nonRatioMetricIDs.contains) ?? false)
+        let percent: Double? = ratioScale && priorMean > 0 && recentMean >= 0 ? 100 * difference / priorMean : nil
         guard difference.isFinite, percent?.isFinite ?? true else {
             return spec.unavailable(.lowQuality(detail: "Values are too large to compare"), coverage: coverage, window: window, inputs: inputs)
         }

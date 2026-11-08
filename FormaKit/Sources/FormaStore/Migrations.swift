@@ -19,18 +19,34 @@ enum Migrations {
 
     static let all: [Migration] = [
         Migration(version: 1, name: "initial schema", sql: schemaV1),
+        Migration(version: 2, name: "band records keyed by their own clock", sql: schemaV2),
     ]
+
+    /// v2: a band record keeps ONE identity — (device, source, raw device time) — whatever clock offset was
+    /// applied to its timestamp on each download, so a record the band re-sends (history is not acknowledged
+    /// by default) can never be stored twice. Rows already duplicated under that identity keep the first copy.
+    static let schemaV2 = """
+        DELETE FROM hr_sample
+        WHERE device_time_raw IS NOT NULL
+          AND rowid NOT IN (SELECT MIN(rowid) FROM hr_sample WHERE device_time_raw IS NOT NULL
+                            GROUP BY device_id, source, device_time_raw);
+        CREATE UNIQUE INDEX uq_hr_sample_device_time_raw ON hr_sample(device_id, source, device_time_raw)
+            WHERE device_time_raw IS NOT NULL;
+
+        ALTER TABLE motion_epoch ADD COLUMN device_time_raw INTEGER;
+        CREATE UNIQUE INDEX uq_motion_epoch_device_time_raw ON motion_epoch(device_id, source, device_time_raw)
+            WHERE device_time_raw IS NOT NULL;
+        """
 
     /// Newest schema version this build knows.
     static var latestVersion: Int { all.map(\.version).max() ?? 0 }
 
-    /// Brings `db` up to the newest version in `migrations`, one transaction per step.
-    /// - Throws: `StoreError.notAFormaDatabase` for another application's file,
-    ///   `StoreError.schemaTooNew` for a database written by a newer build, or the SQLite error of
-    ///   a failing step (which is rolled back).
-    static func migrate(_ db: SQLiteConnection, migrations: [Migration] = all) throws {
-        let ordered = migrations.sorted { $0.version < $1.version }
-        let supported = ordered.last?.version ?? 0
+    /// Read-only header check: refuses another application's file and a schema newer than
+    /// `supported`. Reads `application_id` and `user_version` only, so a refused file is left
+    /// byte-for-byte unchanged (run it before anything that rewrites the header, such as enabling WAL).
+    /// - Returns: The file's current schema version.
+    @discardableResult
+    static func checkCompatibility(_ db: SQLiteConnection, supported: Int = latestVersion) throws -> Int {
         let owner = try db.applicationID()
         guard owner == 0 || owner == applicationID else {
             throw StoreError.notAFormaDatabase(applicationID: owner)
@@ -39,6 +55,17 @@ enum Migrations {
         guard found <= supported else {
             throw StoreError.schemaTooNew(found: found, supported: supported)
         }
+        return found
+    }
+
+    /// Brings `db` up to the newest version in `migrations`, one transaction per step.
+    /// - Throws: `StoreError.notAFormaDatabase` for another application's file,
+    ///   `StoreError.schemaTooNew` for a database written by a newer build, or the SQLite error of
+    ///   a failing step (which is rolled back).
+    static func migrate(_ db: SQLiteConnection, migrations: [Migration] = all) throws {
+        let ordered = migrations.sorted { $0.version < $1.version }
+        let supported = ordered.last?.version ?? 0
+        let found = try checkCompatibility(db, supported: supported)
         for migration in ordered where migration.version > found {
             try db.transaction {
                 // Re-read under the write lock: another connection may have migrated meanwhile.

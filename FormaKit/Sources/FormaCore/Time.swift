@@ -28,7 +28,11 @@ public struct TimeRange: Hashable, Sendable, Codable, CustomStringConvertible {
         self.end = max(start, end)
     }
 
-    public var durationMillis: Int64 { end - start }
+    /// Saturates at `Int64.max` for ranges wider than Int64 can represent (never traps).
+    public var durationMillis: Int64 {
+        let (d, overflow) = end.subtractingReportingOverflow(start)
+        return overflow ? .max : d
+    }
     public var durationSeconds: Double { Double(durationMillis) / 1_000 }
     public var isEmpty: Bool { end <= start }
 
@@ -80,6 +84,10 @@ public final class ManualTimeSource: TimeSource, @unchecked Sendable {
 }
 
 /// Calendar helpers that work on local days, which is how people read sleep and daily totals.
+///
+/// Days are always Gregorian dates in the given calendar's time zone, whatever calendar system the
+/// user has chosen, and a day runs from its first instant to the first instant of the next day — so a
+/// day where daylight saving time skips midnight neither overlaps nor gaps with its neighbours.
 public struct LocalDay: Hashable, Sendable, Codable, Comparable, CustomStringConvertible {
     public let year: Int
     public let month: Int
@@ -92,21 +100,36 @@ public struct LocalDay: Hashable, Sendable, Codable, Comparable, CustomStringCon
     }
 
     public init(_ t: EpochMillis, calendar: Calendar) {
-        let c = calendar.dateComponents([.year, .month, .day], from: t.date)
+        let c = Self.gregorian(like: calendar).dateComponents([.year, .month, .day], from: t.date)
         self.init(year: c.year ?? 1970, month: c.month ?? 1, day: c.day ?? 1)
     }
 
-    /// The `[00:00, next 00:00)` range of this day in the calendar's time zone.
+    /// The range from this day's first instant to the next day's first instant, in the calendar's time zone.
     public func range(calendar: Calendar) -> TimeRange {
-        let start = calendar.date(from: DateComponents(year: year, month: month, day: day)) ?? Date(timeIntervalSince1970: 0)
-        let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
+        let g = Self.gregorian(like: calendar)
+        let noon = self.noon(in: g)
+        let start = g.startOfDay(for: noon)
+        let nextNoon = g.date(byAdding: .day, value: 1, to: noon) ?? noon.addingTimeInterval(86_400)
+        let end = g.startOfDay(for: nextNoon)
         return TimeRange(start: EpochMillis(date: start), end: EpochMillis(date: end))
     }
 
     public func adding(days: Int, calendar: Calendar) -> LocalDay {
-        let start = range(calendar: calendar).start.date
-        let shifted = calendar.date(byAdding: .day, value: days, to: start) ?? start
-        return LocalDay(EpochMillis(date: shifted), calendar: calendar)
+        let g = Self.gregorian(like: calendar)
+        let noon = self.noon(in: g)
+        let shifted = g.date(byAdding: .day, value: days, to: noon) ?? noon
+        return LocalDay(EpochMillis(date: shifted), calendar: g)
+    }
+
+    /// Noon is never skipped or repeated by a daylight-saving change, so day arithmetic starts there.
+    private func noon(in g: Calendar) -> Date {
+        g.date(from: DateComponents(year: year, month: month, day: day, hour: 12)) ?? Date(timeIntervalSince1970: 0)
+    }
+
+    private static func gregorian(like calendar: Calendar) -> Calendar {
+        var g = Calendar(identifier: .gregorian)
+        g.timeZone = calendar.timeZone
+        return g
     }
 
     public static func < (a: LocalDay, b: LocalDay) -> Bool {

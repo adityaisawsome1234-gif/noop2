@@ -46,6 +46,18 @@ public struct SQLiteError: Error, Equatable, Sendable, CustomStringConvertible {
         if let sql { text += " [\(sql)]" }
         return text
     }
+
+    /// Another connection holds a conflicting lock (`SQLITE_BUSY` or `SQLITE_LOCKED`); retrying later can succeed.
+    public var isBusy: Bool { code == SQLITE_BUSY || code == SQLITE_LOCKED }
+    /// The disk (or the database's size limit) is full (`SQLITE_FULL`).
+    public var isDiskFull: Bool { code == SQLITE_FULL }
+    /// The file is damaged or is not a database at all (`SQLITE_CORRUPT` or `SQLITE_NOTADB`).
+    public var isCorrupt: Bool { code == SQLITE_CORRUPT || code == SQLITE_NOTADB }
+}
+
+/// `localizedDescription` (and SwiftUI's error alerts) show `description`.
+extension SQLiteError: LocalizedError {
+    public var errorDescription: String? { description }
 }
 
 // MARK: - Values
@@ -136,9 +148,15 @@ public final class SQLiteConnection {
     private var db: OpaquePointer?
     private var savepointSerial = 0
 
-    /// Opens (creating if needed) the database at `path`; pass `SQLiteConnection.inMemoryPath`
-    /// for an in-memory database.
-    public init(path: String) throws {
+    /// Opens (creating if needed) the database at `path`, fully configured (WAL included); pass
+    /// `SQLiteConnection.inMemoryPath` for an in-memory database.
+    public convenience init(path: String) throws {
+        try self.init(path: path, enableWAL: true)
+    }
+
+    /// Opens the database. With `enableWAL: false` every pragma except `journal_mode` is applied, so
+    /// the file's header can be inspected before anything rewrites it; call `enableWAL()` afterwards.
+    init(path: String, enableWAL: Bool) throws {
         self.path = path
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -151,6 +169,7 @@ public final class SQLiteConnection {
         db = handle
         do {
             try configure()
+            if enableWAL { try self.enableWAL() }
         } catch {
             close()
             throw error
@@ -162,9 +181,11 @@ public final class SQLiteConnection {
     /// True until `close()` is called.
     public var isOpen: Bool { db != nil }
 
-    /// True for `:memory:` (and other non-file) databases, which cannot use WAL.
+    /// True for `:memory:` and the empty path (a private temporary database), which cannot use WAL.
+    /// (URI filenames such as `file::memory:` are not special: the connection is not opened with
+    /// `SQLITE_OPEN_URI`, so they name ordinary files.)
     public var isInMemory: Bool {
-        path == Self.inMemoryPath || path.isEmpty || path.hasPrefix("file::memory:")
+        path == Self.inMemoryPath || path.isEmpty
     }
 
     /// Closes the connection. Idempotent. Statements still alive are finalized when released;
@@ -175,21 +196,27 @@ public final class SQLiteConnection {
         sqlite3_close_v2(handle)
     }
 
+    /// Connection-level settings that never modify the file.
     private func configure() throws {
         let handle = try openHandle(nil)
         sqlite3_busy_timeout(handle, Self.busyTimeoutMillis)
         try execute("PRAGMA foreign_keys = ON")
+        try execute("PRAGMA synchronous = NORMAL")
+    }
+
+    /// Switches the database to `journal_mode=WAL` (persistent: it rewrites the file header). A
+    /// failure is ignored for in-memory databases, which cannot use WAL.
+    func enableWAL() throws {
         let walSQL = "PRAGMA journal_mode = WAL"
         if isInMemory {
             _ = try? scalarText(walSQL)
-        } else {
-            let mode = try scalarText(walSQL)
-            guard mode?.lowercased() == "wal" else {
-                throw SQLiteError(code: SQLITE_ERROR, message: "could not enable WAL (journal_mode is \(mode ?? "unknown"))",
-                                  sql: walSQL)
-            }
+            return
         }
-        try execute("PRAGMA synchronous = NORMAL")
+        let mode = try scalarText(walSQL)
+        guard mode?.lowercased() == "wal" else {
+            throw SQLiteError(code: SQLITE_ERROR, message: "could not enable WAL (journal_mode is \(mode ?? "unknown"))",
+                              sql: walSQL)
+        }
     }
 
     // MARK: Statements
@@ -221,14 +248,19 @@ public final class SQLiteConnection {
         return SQLiteStatement(handle: statement, connection: self, sql: sql)
     }
 
-    /// Prepares `sql`, binds `values` to parameters 1...n, steps to completion and returns
-    /// `changes` (rows inserted/updated/deleted by this statement).
+    /// Prepares `sql`, binds `values` to parameters 1...n, steps to completion and returns the rows
+    /// this statement inserted, updated or deleted (0 for statements that change no rows, such as
+    /// SELECT, DDL and most PRAGMAs, and for an INSERT skipped by `ON CONFLICT DO NOTHING`).
     @discardableResult
     public func run(_ sql: String, _ values: [any SQLiteValueConvertible] = []) throws -> Int {
+        let handle = try openHandle(sql)
+        let changesBefore = sqlite3_total_changes(handle)
         let statement = try prepare(sql)
         try statement.bind(values: values)
         while try statement.step() == .row {}
-        return changes
+        // `sqlite3_changes` still reports the previous INSERT/UPDATE/DELETE after a statement that
+        // changed nothing, so only trust it when this statement moved the running total.
+        return sqlite3_total_changes(handle) == changesBefore ? 0 : changes
     }
 
     /// Runs a query and decodes every row; rows for which `decode` returns nil are skipped.
@@ -416,7 +448,9 @@ public final class SQLiteStatement {
         guard rc == SQLITE_OK else { throw connection.error(rc, sql: sql) }
     }
 
-    // Typed conveniences for `bind(_:at:)`; nil binds NULL. `Bool` binds 1/0, `[UInt8]` a blob.
+    // Typed conveniences for `bind(_:at:)`; a typed nil (`Int64?.none`, an optional variable) binds
+    // NULL. `Bool` binds 1/0, `[UInt8]` a blob. A bare `nil` literal matches every overload, so bind
+    // an untyped NULL with `bindNull(at:)` or `bind(SQLiteValue.null, at:)`.
     public func bind(_ value: Int64?, at index: Int) throws { try bind(value.sqliteValue, at: index) }
     public func bind(_ value: Int?, at index: Int) throws { try bind(value.sqliteValue, at: index) }
     public func bind(_ value: Bool?, at index: Int) throws { try bind(value.sqliteValue, at: index) }

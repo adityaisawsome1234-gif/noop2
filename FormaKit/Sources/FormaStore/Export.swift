@@ -5,9 +5,16 @@ import FormaCore
 ///
 /// Format: RFC 4180 (comma separated, CRLF line endings, fields containing a comma, double quote,
 /// CR or LF are quoted with inner quotes doubled), UTF-8, one header row whose column names carry
-/// their units (`ts_epoch_ms`, `interval_ms`, `activity_g`, ...). A missing value is an empty cell,
-/// never 0. Timestamps appear twice: epoch milliseconds and ISO 8601 UTC. Codes (`source`,
-/// `quality_flags`, `timing_basis`) are accompanied by readable names.
+/// their units (`ts_epoch_ms`, `interval_ms`, ...; motion `activity` is in source-specific units, see
+/// `MotionEpoch.activity`). A missing value is an empty cell, never 0: that includes `activity` of a motion epoch with `sample_count` 0, which by definition
+/// has no motion data (the backup keeps the stored value). Timestamps appear twice: epoch
+/// milliseconds and ISO 8601 UTC. Codes (`source`, `quality_flags`, `timing_basis`) are accompanied
+/// by readable names.
+///
+/// Text cells (labels, device names, detector and metric text) are written exactly as stored. A
+/// spreadsheet may evaluate a cell that begins with `=`, `+`, `-` or `@` as a formula when the file
+/// is opened; Forma does not rewrite such text (that would change the data), so open exports from
+/// devices or labels you do not trust with formula evaluation disabled.
 extension FormaStore {
     /// Files written by `exportCSV`, in the order they are returned.
     public enum CSVFile: String, CaseIterable, Sendable {
@@ -30,8 +37,8 @@ extension FormaStore {
                         "record_key", "index_in_record", "received_at_epoch_ms", "timing_basis", "timing_basis_name",
                         "quality_flags", "quality_flag_names", "batch_id"]
             case .motion:
-                return ["ts_epoch_ms", "ts_utc_iso8601", "device_id", "epoch_length_ms", "activity_g", "sample_count",
-                        "source", "source_name", "quality_flags", "quality_flag_names", "batch_id"]
+                return ["ts_epoch_ms", "ts_utc_iso8601", "device_id", "epoch_length_ms", "activity", "sample_count",
+                        "source", "source_name", "device_time_raw", "quality_flags", "quality_flag_names", "batch_id"]
             case .aux:
                 return ["ts_epoch_ms", "ts_utc_iso8601", "device_id", "kind", "value", "unit", "validated", "source",
                         "source_name", "quality_flags", "quality_flag_names", "batch_id"]
@@ -51,10 +58,13 @@ extension FormaStore {
     }
 
     /// Writes one CSV file per table into `directory` (created if needed; existing files with the
-    /// same names are replaced only once their new content is complete).
+    /// same names are atomically replaced once their new content is complete). Files are streamed
+    /// page by page, so memory use stays bounded.
     /// - Parameter range: Limit measurements to timestamps in the range and sessions/derived values to
     ///   windows overlapping it; nil exports everything. Devices are always exported in full.
     /// - Returns: The written files, in `CSVFile.allCases` order.
+    /// - Throws: `StoreError.fileError` (also when a file would replace this store's own database),
+    ///   `SQLiteError`, or `CancellationError` when the calling task is cancelled.
     @discardableResult
     public func exportCSV(to directory: URL, range: TimeRange? = nil) throws -> [URL] {
         do {
@@ -62,9 +72,11 @@ extension FormaStore {
         } catch {
             throw StoreError.fileError("cannot create \(directory.path(percentEncoded: false)): \(error.localizedDescription)")
         }
+        let urls = CSVFile.allCases.map { directory.appendingPathComponent($0.rawValue) }
+        for url in urls { try refuseDatabaseFileAsDestination(url) }
         var written: [URL] = []
-        for file in CSVFile.allCases {
-            let url = directory.appendingPathComponent(file.rawValue)
+        for (file, url) in zip(CSVFile.allCases, urls) {
+            try Task.checkCancellation()
             _ = try AtomicFile.write(to: url) { output in
                 let csv = CSVWriter(output: output)
                 try csv.writeRow(file.columns)
@@ -100,10 +112,11 @@ extension FormaStore {
         case .motion:
             try forEachPage(.motion, range: range, decode: RowDecoder.motion) { page in
                 for m in page {
+                    // sampleCount 0 means "no motion data for the epoch": its activity is not a measured 0.
                     try csv.writeRow([F.int(m.timestamp), F.iso(m.timestamp), m.deviceID, F.int(m.epochMillis),
-                                      F.number(m.activity), F.int(m.sampleCount), F.int(m.source.rawValue),
-                                      m.source.description, F.int(m.quality.rawValue), F.flagNames(m.quality),
-                                      F.int(m.batchID)])
+                                      m.sampleCount == 0 ? nil : F.number(m.activity), F.int(m.sampleCount),
+                                      F.int(m.source.rawValue), m.source.description, F.int(m.deviceTimeRaw),
+                                      F.int(m.quality.rawValue), F.flagNames(m.quality), F.int(m.batchID)])
                 }
             }
         case .aux:

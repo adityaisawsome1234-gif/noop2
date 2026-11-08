@@ -61,7 +61,11 @@ public struct HeartRateWindowSummary: Hashable, Sendable, Codable {
 /// a window can therefore cover the window's first seconds.
 public struct HeartRateSeries: Hashable, Sendable {
     /// Quality flags that make a sample unusable for analytics (the raw record is kept in storage).
-    public static let excludedFlags: QualityFlags = [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped]
+    /// `.unvalidatedField` is included: a value decoded from a field whose meaning is not yet validated
+    /// for the firmware never enters a series, coverage, zones or any metric. Once a field is validated,
+    /// the ingest or feature layer should stop setting (or remove) the flag.
+    public static let excludedFlags: QualityFlags = [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped,
+                                                     .unvalidatedField]
     /// Longest time one sample may stand for, ms.
     public static let maxSpanMillis: Int64 = 5_000
     /// Non-history samples within ± this many ms of a usable band-history sample are dropped.
@@ -87,8 +91,9 @@ public struct HeartRateSeries: Hashable, Sendable {
 
     // MARK: Usability and merging
 
-    /// True when the sample may enter analytics: none of ``excludedFlags``, bpm within
-    /// `HeartRateSample.plausibleRange` (25–240), and a timestamp within ±2^52 ms of the epoch.
+    /// True when the sample may enter analytics: none of ``excludedFlags`` (outOfRange, deviceMarkedInvalid,
+    /// noSensorContact, clockUnmapped, unvalidatedField), bpm within `HeartRateSample.plausibleRange`
+    /// (25–240), and a timestamp within ±2^52 ms of the epoch.
     public static func isUsable(_ sample: HeartRateSample) -> Bool {
         sample.quality.isDisjoint(with: excludedFlags)
             && HeartRateSample.plausibleRange.contains(sample.bpm)
@@ -217,7 +222,8 @@ public struct HeartRateSeries: Hashable, Sendable {
         return out
     }
 
-    /// Covered time inside `range`, ms (0 for an empty or invalid range).
+    /// Covered time inside `range`, ms. An empty range covers 0 ms; an invalid range (timestamps beyond
+    /// ±2^52 ms) is not evaluated and also gives 0, so use ``coverage(in:)`` (nil for both) to tell them apart.
     public func coveredMillis(in range: TimeRange) -> Int64 {
         index.integrate(range).covered
     }
@@ -229,6 +235,7 @@ public struct HeartRateSeries: Hashable, Sendable {
     }
 
     /// Time-weighted mean heart rate inside `range` (bpm, unrounded); nil when nothing is covered.
+    /// A building block without coverage or confidence: show ``summary(in:)`` to people instead.
     public func timeWeightedMean(in range: TimeRange) -> Double? {
         let (covered, weighted) = index.integrate(range)
         guard covered > 0 else { return nil }

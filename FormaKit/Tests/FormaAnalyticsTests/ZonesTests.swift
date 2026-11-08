@@ -21,8 +21,9 @@ struct ZonesTests {
         #expect(HeartRateZones.label(forZone: 3) == "Zone 3")
     }
 
-    @Test func boundaryValuesSurviveFloatingPointProducts() {
-        // 0.6 × 190 and 0.7 × 190 are not exactly representable products; the bound must still be inclusive.
+    @Test func integerBoundsAreInclusiveForHRmax190And187() {
+        // 0.6 × 190 = 114 and 0.7 × 190 = 133 happen to be exact in binary floating point; these cases only
+        // pin inclusive integer bounds and a non-integer bound (93.5). The tolerance itself is pinned below.
         let z190 = HeartRateZones(maxHeartRate: MaxHeartRate(bpm: 190, basis: .userOverride))
         #expect(z190.zone(forBPM: 113) == 1)
         #expect(z190.zone(forBPM: 114) == 2)
@@ -31,6 +32,27 @@ struct ZonesTests {
         let z187 = HeartRateZones(maxHeartRate: MaxHeartRate(bpm: 187, basis: .userOverride))
         #expect(z187.zone(forBPM: 93) == 0)   // 93.5 is the zone-1 bound
         #expect(z187.zone(forBPM: 94) == 1)
+    }
+
+    @Test func boundOneUlpAboveAnIntegerStillIncludesThatInteger() {
+        // A product that lands one ulp above the integer (133.00000000000003) must not push 133 bpm into the
+        // zone below: the 1e-9 bpm tolerance makes the lower bound inclusive despite floating-point error.
+        let above = 133.0.nextUp
+        #expect(above > 133)
+        let t = ZoneThresholds(model: .percentMax, boundaries: [0.7], lowerBoundsBPM: [above],
+                               maxHeartRate: MaxHeartRate(bpm: 190, basis: .userOverride), restingHeartRate: nil)
+        #expect(t.zone(forBPM: 133) == 1)
+        #expect(t.zone(forBPM: 132.999_999) == 0)       // far more than the tolerance below the bound
+        // HeartRateZones.zone(forBPM:) agrees with thresholds().value?.zone(forBPM:) everywhere.
+        for hrMax in [150.0, 182.8, 187, 190, 203.5] {
+            for model in HeartRateZoneModel.allCases {
+                let zones = HeartRateZones(model: model, maxHeartRate: MaxHeartRate(bpm: hrMax, basis: .userOverride), restingHeartRate: 52)
+                let thresholds = zones.thresholds().value
+                for bpm in stride(from: 40.0, through: 230, by: 0.5) {
+                    #expect(zones.zone(forBPM: bpm) == thresholds?.zone(forBPM: bpm), "HRmax \(hrMax) \(model) \(bpm)")
+                }
+            }
+        }
     }
 
     @Test func heartRateReserveUsesKarvonen() throws {
@@ -129,9 +151,15 @@ struct ZonesTests {
         #expect(withEstimate.maxHeartRate?.bpm == 190)
     }
 
-    @Test func ageEstimatedHRmaxCapsZoneConfidence() {
-        let zones = HeartRateZones(maxHeartRate: MaxHeartRate(bpm: 182.8, basis: .estimatedFromAge, ageYears: 36))
-        #expect(zones.thresholds().confidence == .moderate)
+    /// Zones built on the age estimate are never more confident than the estimate itself (low).
+    @Test func ageEstimatedHRmaxCapsZoneConfidence() throws {
+        let estimate = try #require(MaxHeartRateResolver.resolve(profile: UserProfile(birthYear: 1990), asOf: clock.now(),
+                                                                 calendar: Fixture.utc).value)
+        #expect(estimate.confidenceCap == .low)
+        let zones = HeartRateZones(maxHeartRate: estimate)
+        #expect(zones.thresholds().confidence == .low)
+        #expect(zones.thresholds().confidence
+            <= MaxHeartRateResolver.resolve(profile: UserProfile(birthYear: 1990), asOf: clock.now(), calendar: Fixture.utc).confidence)
         #expect(HeartRateZones(maxHeartRate: MaxHeartRate(bpm: 190, basis: .userOverride)).thresholds().confidence == .high)
     }
 }

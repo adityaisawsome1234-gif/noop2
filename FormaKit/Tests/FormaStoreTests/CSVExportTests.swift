@@ -77,7 +77,7 @@ struct CSVExportTests {
         #expect(try intervals.value(0, "timing_basis_name") == "reconstructedFromRecordTime")
         let motion = try CSVTable(readCSV(urls[2]))
         #expect(try motion.value(0, "epoch_length_ms") == "1000")
-        #expect(try motion.value(0, "activity_g") == "1e-05")
+        #expect(try motion.value(0, "activity") == "1e-05")
         #expect(try motion.value(0, "sample_count") == "25")
         let aux = try CSVTable(readCSV(urls[3]))
         #expect(try aux.value(0, "kind") == "skinTemperatureCelsius")
@@ -158,16 +158,19 @@ struct CSVExportTests {
         #expect(try readCSV(urls[0]).count == 2 * count + 1)
     }
 
-    @Test func exportPagingUsesTheTimestampIndexWithoutSorting() throws {
+    @Test(arguments: MeasurementTable.allCases, [false, true])
+    func exportPagingUsesTheTimestampIndexWithoutSorting(_ table: MeasurementTable, _ hasRange: Bool) throws {
         let store = try makeStore()
+        // The exact statement forEachPage runs (not a copy), with and without a range bound.
+        let sql = FormaStore.pageSQL(table, hasRange: hasRange)
+        var values: [any SQLiteValueConvertible] = [0, 0, 0]
+        if hasRange { values.append(1) }
+        values.append(10)
         let plan = try store.withConnectionForTesting { db in
-            try db.query("""
-                EXPLAIN QUERY PLAN SELECT rowid, ts_ms FROM hr_sample WHERE ts_ms >= ? AND (ts_ms > ? OR rowid > ?)
-                AND ts_ms < ? ORDER BY ts_ms, rowid LIMIT ?
-                """, [0, 0, 0, 1, 10]) { $0.string(3) }
+            try db.query("EXPLAIN QUERY PLAN " + sql, values) { $0.string(3) }
         }
-        #expect(plan.contains { $0.contains("idx_hr_sample_ts") })
-        #expect(!plan.contains { $0.contains("TEMP B-TREE") })
+        #expect(plan.contains { $0.contains("idx_\(table.name)_ts") }, "\(plan)")
+        #expect(!plan.contains { $0.contains("TEMP B-TREE") }, "\(plan)")
     }
 
     @Test func iso8601FormattingCoversTheWholeRange() {

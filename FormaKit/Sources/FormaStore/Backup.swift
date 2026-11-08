@@ -33,6 +33,8 @@ public struct BackupSummary: Hashable, Sendable {
 public struct ImportReport: Hashable, Sendable {
     /// At most this many error messages are kept in `errors`.
     public static let maxRecordedErrors = 20
+    /// At most this many cursors (one per device) are kept in `cursorsNotApplied`.
+    public static let maxReportedCursors = 32
 
     /// Name of the imported file (also stored as the note of the import's `ingest_batch` rows).
     public var fileName: String
@@ -42,24 +44,29 @@ public struct ImportReport: Hashable, Sendable {
     public var sourceSchemaVersion: Int?
     /// Export time from the header, epoch milliseconds (UTC), if present.
     public var exportedAt: EpochMillis?
-    /// `ingest_batch` rows created for imported measurements (one per device, source `.backupImport`,
-    /// note = file name).
+    /// `ingest_batch` rows holding the newly stored measurements (one per device, source
+    /// `.backupImport`, note = file name). A batch is created only for a device with at least one
+    /// newly stored measurement, so re-importing a file adds no rows at all.
     public var batchIDs: [Int64]
     /// Records newly stored, per type.
     public var inserted: [BackupRecordType: Int]
-    /// Valid records that were already present (same dedup key), per type.
+    /// Valid records that were already present (same dedup key, or the same setting value), per type.
     public var duplicates: [BackupRecordType: Int]
-    /// Valid records deliberately not applied, per type: sync cursors (see `importBackup`) and settings
-    /// that only describe the exporting phone.
+    /// Valid records deliberately not applied, per type: every sync cursor (see `importBackup`),
+    /// settings that only describe the exporting phone, and settings whose key already holds a
+    /// different value on this phone (the local value is kept).
     public var notApplied: [BackupRecordType: Int]
     /// Lines skipped because they could not be read or failed validation.
     public var invalidLines: Int
     /// Reasons for the `maxRecordedErrors` lowest-numbered invalid lines, as "line N: reason", in line order.
     public var errors: [String]
     /// Smallest range covering every newly stored measurement and session (`[oldest, newest + 1 ms)`);
-    /// derived values inside it should be recomputed. Nil when nothing new was stored.
+    /// derived values inside it should be recomputed. Nil when nothing new was stored. Always inside
+    /// `FormaStore.backupTimeWindow`.
     public var importedRange: TimeRange?
-    /// Sync cursors found in the backup. Informational only; never applied to sync state.
+    /// Sync cursors found in the backup, for information only (never applied to sync state): the most
+    /// recently updated cursor of each device, for at most `maxReportedCursors` devices, so a hostile
+    /// file cannot make the report grow without bound. `notApplied[.cursor]` counts every cursor line.
     public var cursorsNotApplied: [SyncCursor]
 
     /// Records newly stored, all types together.
@@ -73,8 +80,10 @@ public struct ImportReport: Hashable, Sendable {
 /// Line 1 is the header `{"format":"forma-backup","formatVersion":1,"schemaVersion":N,"exportedAt":ms,"app":"Forma"}`.
 /// Every following line is one record `{"type":"device"|"hr"|"rr"|"motion"|"aux"|"session"|"correction"|"setting"|"cursor","data":{...}}`
 /// whose `data` keys are the database column names (snake_case; timestamps in epoch ms UTC; NULL as
-/// `null`; blobs as base64). Derived metrics, provenance batches, raw frames, connection history
-/// and sync runs are not included: they are recomputable or device-local diagnostics.
+/// `null`; blobs as base64). Not included: derived metrics (recomputable), raw frames, connection
+/// history and sync runs (device-local diagnostics), and provenance batches — format 1 does not carry
+/// the adapter, parser version and firmware behind each measurement, so restored measurements point
+/// to a backup-import batch instead (a future format version can add batch records).
 extension FormaStore {
     /// Value of the header's `format` field.
     public static let backupFormatName = "forma-backup"
@@ -82,14 +91,31 @@ extension FormaStore {
     public static let backupFormatVersion = 1
     /// Longest accepted backup line (1 MiB). Longer lines are skipped and reported, never loaded.
     public static let maxBackupLineBytes = 1_048_576
+    /// Timeline timestamps a backup may contain: `[1970-01-01T00:00:00.000Z, 10000-01-01T00:00:00.000Z)`.
+    /// No band data predates the Unix epoch, every instant inside has a four-digit-year ISO 8601 form,
+    /// and the difference of any two of them fits easily in `Int64`, so ranges built from imported data
+    /// never overflow. Applies to measurement `ts_ms` and session `start_ms`/`end_ms`.
+    public static let backupTimeWindow = TimeRange(start: 0, end: 253_402_300_800_000)
+    /// Longest motion epoch a backup may contain, in milliseconds (one day).
+    public static let maxBackupEpochMillis: Int64 = 86_400_000
     /// Records applied per transaction (and per store-lock acquisition) during import.
     static let importChunkSize = 2_000
+    /// Line bytes parsed into one pending chunk before it is applied, whatever its record count, so
+    /// a file of large records (long labels, settings) never piles up in memory.
+    static let importChunkByteBudget = 8 * 1_024 * 1_024
 
-    /// Streams the whole store into a backup file (written to `<name>.partial`, synced, then moved
-    /// into place). Measurements are read page by page, so memory use stays bounded and ingest can
-    /// continue while the export runs.
+    /// Streams the whole store into a backup file (written to `<name>.partial`, synced, then renamed
+    /// over the destination atomically).
+    ///
+    /// Devices, settings, cursors, sessions and corrections are read in one consistent snapshot (one
+    /// store-lock acquisition), so every correction's session is in the file even while the user edits
+    /// sessions. Measurements are read page by page afterwards, so memory use stays bounded and ingest
+    /// can continue while the export runs (records ingested meanwhile may or may not be included).
+    /// - Throws: `StoreError.fileError` (also when `url` is this store's own database file),
+    ///   `SQLiteError`, or `CancellationError` when the calling task is cancelled.
     @discardableResult
     public func exportBackup(to url: URL) throws -> BackupSummary {
+        try refuseDatabaseFileAsDestination(url)
         let exportedAt = timeSource.now()
         var counts: [BackupRecordType: Int] = [:]
         var lineCount = 0
@@ -107,20 +133,25 @@ extension FormaStore {
             }
             try output.write(BackupLine.header(exportedAt: exportedAt))
             lineCount += 1
-            for device in try devices() {
+            let snapshot = try locked { _ in
+                BackupSnapshot(devices: try devices(), settings: try allSettings(), cursors: try syncCursors(),
+                               sessions: try sessions(includeCandidates: true, includeDeleted: true),
+                               corrections: try corrections())
+            }
+            for device in snapshot.devices {
                 try emit(.device, BackupLine.device(device))
             }
-            for (key, value) in try allSettings().sorted(by: { $0.key < $1.key })
+            for (key, value) in snapshot.settings.sorted(by: { $0.key < $1.key })
             where !StoreSettingKey.deviceLocal.contains(key) {
                 try emit(.setting, BackupLine.setting(key: key, value: value))
             }
-            for cursor in try syncCursors() {
+            for cursor in snapshot.cursors {
                 try emit(.cursor, BackupLine.cursor(cursor))
             }
-            for session in try sessions(includeCandidates: true, includeDeleted: true) {
+            for session in snapshot.sessions {
                 try emit(.session, BackupLine.session(session))
             }
-            for correction in try corrections() {
+            for correction in snapshot.corrections {
                 try emit(.correction, BackupLine.correction(correction))
             }
             try forEachPage(.heartRate, range: nil, decode: RowDecoder.heartRate) { page in
@@ -162,25 +193,40 @@ extension FormaStore {
     /// `maxBackupLineBytes` are skipped and reported, never loaded).
     ///
     /// - The header must name the `forma-backup` format; a newer `formatVersion` is refused.
-    /// - Each line is validated (JSON shape, field types, known codes, finite numbers, the same
-    ///   structural rules as live ingest). Invalid lines are counted and skipped; the first 20 reasons
-    ///   are kept in the report.
-    /// - Records go through the same dedup keys as sync, so importing the same file twice adds nothing.
-    ///   Measurements keep their original `source`; their provenance is a new `ingest_batch` per device
-    ///   with source `.backupImport` and the file name as note.
-    /// - Sessions become new rows unless an identical (kind, start, end, label) session exists;
-    ///   corrections are attached to the imported (or matching) session; settings are added only when
-    ///   the key is not set on this phone.
-    /// - Sync cursors are NOT applied (they are returned in `cursorsNotApplied`): a cursor written on
-    ///   another phone, or before this store's own last sync, can point past history the band has not
-    ///   yet delivered here; applying it would make the next sync skip — and the band then discard —
-    ///   records that were never stored.
+    /// - Each line is validated: JSON shape, field types, known codes, finite numbers, the structural
+    ///   rules of live ingest and, because a file is untrusted, timeline timestamps inside
+    ///   `backupTimeWindow` and motion epochs of at most `maxBackupEpochMillis`. Invalid lines are
+    ///   counted and skipped; the reasons for the first 20 are kept in the report.
+    /// - Records go through the same dedup keys as sync, so importing the same file twice adds nothing
+    ///   (not even provenance rows). Measurements keep their original `source`; their provenance is a
+    ///   new `ingest_batch` per device with source `.backupImport` and the file name as note.
+    /// - Sessions: a backup session is skipped when a session with the same kind, start, end and
+    ///   label already exists, except a row created by this same import (two equal sessions in one
+    ///   file stay two), and a deleted backup session only matches a deleted row. Of several matches,
+    ///   the one with the same deleted state and creation time is used. Otherwise the session is
+    ///   inserted with its original origin: `.imported` is not applied because it would turn
+    ///   unconfirmed candidates into confirmed sessions. Corrections follow their session.
+    /// - Settings are added only when the key is not set on this phone; a different local value is
+    ///   kept (counted in `notApplied`). `user_profile` must decode as a `UserProfile`.
+    /// - Sync cursors are NOT applied (they are reported in `cursorsNotApplied`, nothing is stored): a
+    ///   cursor written on another phone, or before this store's own last sync, can point past history
+    ///   the band has not yet delivered here; applying it would make the next sync skip — and the band
+    ///   then discard — records that were never stored.
     ///
-    /// Records are applied in transactions of `importChunkSize` lines, taking the store lock per chunk.
-    /// If the import throws midway (I/O or database error), earlier chunks stay applied; running the
-    /// import again is safe because of the dedup keys.
-    /// - Throws: `StoreError.fileError`, `.invalidBackup`, `.unsupportedBackupVersion`, `SQLiteError`.
+    /// Records are applied in transactions of at most `importChunkSize` lines (or about 8 MiB of
+    /// lines), taking the store lock per chunk. If the import throws midway (I/O or database error,
+    /// cancellation of the calling task), earlier chunks stay applied; running the import again is
+    /// safe because of the dedup keys. If `deleteAllData` runs meanwhile, the import stops with
+    /// `StoreError.interrupted` rather than restoring the rest of the file into the emptied store.
+    /// - Throws: `StoreError.fileError`, `.invalidBackup`, `.unsupportedBackupVersion`, `.interrupted`,
+    ///   `SQLiteError`, `CancellationError`.
     public func importBackup(from url: URL) throws -> ImportReport {
+        try importBackup(from: url, afterChunk: { _ in })
+    }
+
+    /// `importBackup(from:)` calling `afterChunk(n)` after the n-th chunk was committed, outside the
+    /// store lock (a test seam for what happens between chunks).
+    func importBackup(from url: URL, afterChunk: (Int) throws -> Void) throws -> ImportReport {
         let reader: BoundedLineReader
         do {
             reader = try BoundedLineReader(url: url, maxLineBytes: Self.maxBackupLineBytes)
@@ -188,12 +234,22 @@ extension FormaStore {
             throw StoreError.fileError("cannot open \(url.lastPathComponent): \(error.localizedDescription)")
         }
         let header = try readBackupHeader(reader)
-        var state = ImportState(report: ImportReport(
+        let generation = try locked { _ in dataGeneration }
+        var state = ImportState(generation: generation, report: ImportReport(
             fileName: url.lastPathComponent, formatVersion: header.formatVersion,
             sourceSchemaVersion: header.schemaVersion, exportedAt: header.exportedAt, batchIDs: [], inserted: [:],
             duplicates: [:], notApplied: [:], invalidLines: 0, errors: [], importedRange: nil, cursorsNotApplied: []))
         let decoder = JSONDecoder()
         var pending: [(line: Int, record: BackupRecord)] = []
+        var pendingBytes = 0
+        var chunks = 0
+        func flush() throws {
+            try applyImportChunk(pending, state: &state)
+            pending.removeAll(keepingCapacity: true)
+            pendingBytes = 0
+            chunks += 1
+            try afterChunk(chunks)
+        }
         var lineNumber = 1
         while let line = try reader.next() {
             lineNumber += 1
@@ -205,17 +261,17 @@ extension FormaStore {
                 do {
                     let envelope = try decoder.decode(BackupEnvelope.self, from: Data(bytes))
                     pending.append((lineNumber, envelope.record))
+                    pendingBytes += bytes.count
                 } catch {
                     state.reject(line: lineNumber, BackupLineError.describe(error))
                 }
             }
-            if pending.count >= Self.importChunkSize {
-                try applyImportChunk(pending, state: &state)
-                pending.removeAll(keepingCapacity: true)
+            if pending.count >= Self.importChunkSize || pendingBytes >= Self.importChunkByteBudget {
+                try flush()
             }
         }
         if !pending.isEmpty {
-            try applyImportChunk(pending, state: &state)
+            try flush()
         }
         return state.finishedReport()
     }
@@ -246,31 +302,49 @@ extension FormaStore {
 
     /// Applies one chunk of parsed records in a single transaction.
     private func applyImportChunk(_ chunk: [(line: Int, record: BackupRecord)], state: inout ImportState) throws {
+        try Task.checkCancellation()
         try locked { db in
+            guard dataGeneration == state.generation else {
+                throw StoreError.interrupted("all data was deleted while the backup was being imported; the import "
+                                             + "stopped so the rest of the file is not restored into the emptied store")
+            }
             try db.transaction {
-                // Batches made by earlier chunks are gone if the store was wiped in between.
-                for (deviceID, batchID) in state.batchIDs {
-                    if try db.scalarInt64("SELECT 1 FROM ingest_batch WHERE id = ?", [batchID]) == nil {
-                        state.batchIDs[deviceID] = nil
-                        state.report.batchIDs.removeAll { $0 == batchID }
-                    }
-                }
                 let writer = MeasurementWriter(db: db)
+                // A device's import batch is created just before its first record that is actually new,
+                // so a batch never exists without records (deleting one later would have to scan every
+                // measurement table, whose batch_id columns are not indexed). Until then each record is
+                // looked up by its dedup key instead of being inserted.
+                func importMeasurement(_ type: BackupRecordType, deviceID: String, at instant: EpochMillis,
+                                       exists: () throws -> Bool, insert: (Int64) throws -> Bool) throws {
+                    let batchID: Int64
+                    if let existing = state.batchIDs[deviceID] {
+                        batchID = existing
+                    } else if try exists() {
+                        state.count(type, stored: false, instant: instant)
+                        return
+                    } else {
+                        batchID = try createImportBatch(for: deviceID, db: db, state: &state)
+                    }
+                    state.count(type, stored: try insert(batchID), instant: instant)
+                }
                 for (line, record) in chunk {
                     switch record {
                     case .heartRate(let sample):
-                        let batchID = try importBatchID(for: sample.deviceID, db: db, state: &state)
-                        state.count(.hr, stored: try writer.insert(sample, batchID: batchID), instant: sample.timestamp)
+                        try importMeasurement(.hr, deviceID: sample.deviceID, at: sample.timestamp,
+                                              exists: { try writer.exists(sample) },
+                                              insert: { try writer.insert(sample, batchID: $0) })
                     case .beatInterval(let interval):
-                        let batchID = try importBatchID(for: interval.deviceID, db: db, state: &state)
-                        state.count(.rr, stored: try writer.insert(interval, batchID: batchID), instant: interval.timestamp)
+                        try importMeasurement(.rr, deviceID: interval.deviceID, at: interval.timestamp,
+                                              exists: { try writer.exists(interval) },
+                                              insert: { try writer.insert(interval, batchID: $0) })
                     case .motion(let epoch):
-                        let batchID = try importBatchID(for: epoch.deviceID, db: db, state: &state)
-                        state.count(.motion, stored: try writer.insert(epoch, batchID: batchID), instant: epoch.timestamp)
+                        try importMeasurement(.motion, deviceID: epoch.deviceID, at: epoch.timestamp,
+                                              exists: { try writer.exists(epoch) },
+                                              insert: { try writer.insert(epoch, batchID: $0) })
                     case .aux(let measurement):
-                        let batchID = try importBatchID(for: measurement.deviceID, db: db, state: &state)
-                        state.count(.aux, stored: try writer.insert(measurement, batchID: batchID),
-                                    instant: measurement.timestamp)
+                        try importMeasurement(.aux, deviceID: measurement.deviceID, at: measurement.timestamp,
+                                              exists: { try writer.exists(measurement) },
+                                              insert: { try writer.insert(measurement, batchID: $0) })
                     case .device(let device):
                         let stored = try db.run(StoreSQL.insertDeviceIfAbsent,
                                                 [device.id, device.family.rawValue, device.name, device.firmwareVersion,
@@ -281,24 +355,17 @@ extension FormaStore {
                     case .correction(let backupSessionID, let correction):
                         try importCorrection(correction, backupSessionID: backupSessionID, line: line, db: db, state: &state)
                     case .setting(let key, let value):
-                        if StoreSettingKey.deviceLocal.contains(key) {
-                            state.report.notApplied[.setting, default: 0] += 1
-                        } else {
-                            let stored = try db.run("INSERT INTO setting (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
-                                                    [key, value]) > 0
-                            state.count(.setting, stored: stored)
-                        }
+                        try importSetting(key: key, value: value, db: db, state: &state)
                     case .cursor(let cursor):
-                        state.report.notApplied[.cursor, default: 0] += 1
-                        state.report.cursorsNotApplied.append(cursor)
+                        state.noteCursor(cursor)
                     }
                 }
             }
         }
     }
 
-    private func importBatchID(for deviceID: String, db: SQLiteConnection, state: inout ImportState) throws -> Int64 {
-        if let existing = state.batchIDs[deviceID] { return existing }
+    /// The provenance row for this import's measurements of one device (source `.backupImport`).
+    private func createImportBatch(for deviceID: String, db: SQLiteConnection, state: inout ImportState) throws -> Int64 {
         let provenance = Provenance(deviceID: deviceID, adapterID: "forma-backup",
                                     parserVersion: "\(Self.backupFormatName)/\(state.report.formatVersion)",
                                     firmwareVersion: nil, source: .backupImport, syncRunID: nil,
@@ -311,14 +378,17 @@ extension FormaStore {
 
     private func importSession(_ session: Session, backupID: Int64?, db: SQLiteConnection,
                                state: inout ImportState) throws {
-        let existing = try db.scalarInt64("""
-            SELECT id FROM session WHERE kind = ? AND start_ms = ? AND end_ms = ? AND label IS ? ORDER BY id LIMIT 1
-            """, [session.kind.rawValue, session.range.start, session.range.end, session.label])
-        if let existing {
+        var sql = "SELECT id FROM session WHERE kind = ? AND start_ms = ? AND end_ms = ? AND label IS ?"
+        if session.deleted { sql += " AND deleted = 1" }
+        sql += " ORDER BY (deleted = ?) DESC, (created_at = ?) DESC, id"
+        let candidates = try db.query(sql, [session.kind.rawValue, session.range.start, session.range.end,
+                                            session.label, session.deleted, session.createdAt]) { $0.int64(0) }
+        if let match = candidates.first(where: { !state.createdSessionIDs.contains($0) }) {
             state.count(.session, stored: false)
-            if let backupID { state.sessionIDs[backupID] = existing }
+            if let backupID { state.sessionIDs[backupID] = match }
         } else {
             let newID = try Self.insertSessionRow(session, db: db)
+            state.createdSessionIDs.insert(newID)
             state.count(.session, stored: true, range: session.range)
             if let backupID { state.sessionIDs[backupID] = newID }
         }
@@ -345,23 +415,54 @@ extension FormaStore {
         }
         state.count(.correction, stored: !exists)
     }
+
+    private func importSetting(key: String, value: String, db: SQLiteConnection, state: inout ImportState) throws {
+        if StoreSettingKey.deviceLocal.contains(key) {
+            state.report.notApplied[.setting, default: 0] += 1
+        } else if let local = try db.scalarText("SELECT value FROM setting WHERE key = ?", [key]) {
+            if local == value {
+                state.count(.setting, stored: false)
+            } else {
+                state.report.notApplied[.setting, default: 0] += 1
+            }
+        } else {
+            try db.run("INSERT INTO setting (key, value) VALUES (?, ?)", [key, value])
+            state.count(.setting, stored: true)
+        }
+    }
+}
+
+/// The small, cross-referenced tables of a backup, read under one store-lock acquisition.
+private struct BackupSnapshot {
+    let devices: [DeviceRecord]
+    let settings: [String: String]
+    let cursors: [SyncCursor]
+    let sessions: [Session]
+    let corrections: [UserCorrection]
 }
 
 // MARK: - Import bookkeeping
 
 private struct ImportState {
+    /// `FormaStore.dataGeneration` when the import started.
+    let generation: UInt64
     var report: ImportReport
-    /// Import provenance batch per device ID.
+    /// Import provenance batch per device ID (created with the device's first new record).
     var batchIDs: [String: Int64] = [:]
     /// Session id in the backup → session id in this store.
     var sessionIDs: [Int64: Int64] = [:]
+    /// Session rows inserted by this import (never matched as duplicates of later backup sessions).
+    var createdSessionIDs: Set<Int64> = []
     var oldest: EpochMillis?
     var end: EpochMillis?
+    /// Position in `report.cursorsNotApplied` per device ID.
+    private var cursorPositions: [String: Int] = [:]
     /// The `maxRecordedErrors` lowest-numbered rejections so far, sorted by line. Some problems are only
     /// found when a chunk is applied, after later lines were parsed, so arrival order is not line order.
     private var firstErrors: [(line: Int, reason: String)] = []
 
-    init(report: ImportReport) {
+    init(generation: UInt64, report: ImportReport) {
+        self.generation = generation
         self.report = report
     }
 
@@ -387,6 +488,19 @@ private struct ImportState {
         if let range {
             oldest = min(oldest ?? range.start, range.start)
             end = max(end ?? range.end, range.end)
+        }
+    }
+
+    /// Counts a cursor line and keeps the newest cursor per device (bounded, see `ImportReport`).
+    mutating func noteCursor(_ cursor: SyncCursor) {
+        report.notApplied[.cursor, default: 0] += 1
+        if let position = cursorPositions[cursor.deviceID] {
+            if cursor.updatedAt > report.cursorsNotApplied[position].updatedAt {
+                report.cursorsNotApplied[position] = cursor
+            }
+        } else if report.cursorsNotApplied.count < ImportReport.maxReportedCursors {
+            cursorPositions[cursor.deviceID] = report.cursorsNotApplied.count
+            report.cursorsNotApplied.append(cursor)
         }
     }
 
@@ -458,6 +572,7 @@ enum BackupLine {
         o.add("sample_count", m.sampleCount)
         o.add("source", m.source.rawValue)
         o.add("quality", m.quality.rawValue)
+        o.add("device_time_raw", m.deviceTimeRaw)
         return o.line
     }
 
@@ -644,7 +759,7 @@ struct BackupEnvelope: Decodable {
             record = .correction(backupSessionID: data.sessionID, try data.model())
         case .setting:
             let data = try container.decode(SettingData.self, forKey: .data)
-            try FormaStore.validateSettingKey(data.key)
+            try data.validate()
             record = .setting(key: data.key, value: data.value)
         case .cursor: record = .cursor(try container.decode(CursorData.self, forKey: .data).model())
         }
@@ -700,6 +815,7 @@ private struct HeartRateData: Decodable {
                                      receivedAt: receivedAt, clockOffsetMillis: clockOffset,
                                      quality: QualityFlags(rawValue: quality))
         try RecordValidator.validate(sample, at: "data")
+        try BackupValidator.instant(timestamp, "data.ts_ms")
         return sample
     }
 }
@@ -733,6 +849,7 @@ private struct BeatIntervalData: Decodable {
                                     timingBasis: try knownCode(timingBasis, "timing_basis"),
                                     quality: QualityFlags(rawValue: quality))
         try RecordValidator.validate(interval, at: "data")
+        try BackupValidator.instant(timestamp, "data.ts_ms")
         return interval
     }
 }
@@ -745,6 +862,8 @@ private struct MotionData: Decodable {
     let sampleCount: Int
     let source: Int
     let quality: Int64
+    /// Absent in backups written before schema v2.
+    let deviceTimeRaw: Int64?
 
     enum CodingKeys: String, CodingKey {
         case activity, source, quality
@@ -752,13 +871,16 @@ private struct MotionData: Decodable {
         case timestamp = "ts_ms"
         case epochMillis = "epoch_ms"
         case sampleCount = "sample_count"
+        case deviceTimeRaw = "device_time_raw"
     }
 
     func model() throws -> MotionEpoch {
         let epoch = MotionEpoch(deviceID: deviceID, timestamp: timestamp, epochMillis: epochMillis, activity: activity,
                                 sampleCount: sampleCount, source: try knownCode(source, "source"),
-                                quality: QualityFlags(rawValue: quality))
+                                quality: QualityFlags(rawValue: quality), deviceTimeRaw: deviceTimeRaw)
         try RecordValidator.validate(epoch, at: "data")
+        try BackupValidator.instant(timestamp, "data.ts_ms")
+        try BackupValidator.epochLength(epochMillis)
         return epoch
     }
 }
@@ -783,6 +905,7 @@ private struct AuxData: Decodable {
                                          value: value, source: try knownCode(source, "source"), validated: validated,
                                          quality: QualityFlags(rawValue: quality))
         try RecordValidator.validate(measurement, at: "data")
+        try BackupValidator.instant(timestamp, "data.ts_ms")
         return measurement
     }
 }
@@ -812,6 +935,7 @@ private struct SessionData: Decodable {
 
     func model() throws -> Session {
         guard end >= start else { throw BackupLineError("session end_ms is before start_ms") }
+        try BackupValidator.sessionBounds(start: start, end: end)
         let session = Session(kind: try knownCode(kind, "session kind"), range: TimeRange(start: start, end: end),
                               origin: try knownCode(origin, "session origin"), label: label, deviceID: deviceID,
                               detector: detector, confidence: confidence, createdAt: createdAt, updatedAt: updatedAt,
@@ -847,6 +971,19 @@ private struct CorrectionData: Decodable {
 private struct SettingData: Decodable {
     let key: String
     let value: String
+
+    /// Key rules of `setSetting`; well-known keys must also hold what their readers expect, so a
+    /// restored `user_profile` can never make `userProfile()` fail.
+    func validate() throws {
+        try FormaStore.validateSettingKey(key)
+        if key == StoreSettingKey.userProfile {
+            do {
+                _ = try JSONDecoder().decode(UserProfile.self, from: Data(value.utf8))
+            } catch {
+                throw BackupLineError("setting user_profile is not a valid user profile")
+            }
+        }
+    }
 }
 
 private struct CursorData: Decodable {

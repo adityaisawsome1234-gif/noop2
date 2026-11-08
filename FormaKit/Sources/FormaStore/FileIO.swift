@@ -1,5 +1,12 @@
 import Foundation
 import FormaCore
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 // MARK: - Buffered writing
 
@@ -56,10 +63,11 @@ final class BufferedFileWriter {
     }
 }
 
-/// Writes a file through a temporary `<name>.partial` sibling that replaces the destination only
-/// after everything was written and synced, so a failed export never leaves a truncated file under
-/// the final name. Missing parent directories are created; an existing directory at the destination
-/// is refused, never removed.
+/// Writes a file through a temporary `<name>.partial` sibling that is written and synced completely
+/// and then renamed over the destination with `rename(2)`, which replaces an existing file
+/// atomically: at every moment the final name holds either the previous file or the complete new
+/// one, never a truncated file and never nothing (also if the app is killed mid-way). Missing parent
+/// directories are created; an existing directory at the destination is refused, never removed.
 enum AtomicFile {
     static func write(to url: URL, _ body: (BufferedFileWriter) throws -> Void) throws -> Int64 {
         let destination = url.path(percentEncoded: false)
@@ -77,8 +85,7 @@ enum AtomicFile {
         do {
             try body(writer)
             try writer.finish()
-            try FileOps.removeRegularFile(atPath: destination)
-            try FileManager.default.moveItem(at: temporary, to: url)
+            try FileOps.replace(url, withFileAt: temporary)
             return writer.bytesFlushed
         } catch {
             writer.abandon()
@@ -101,13 +108,61 @@ enum FileOps {
         if isDirectory.boolValue { throw StoreError.fileError("\(path) is a directory") }
         try FileManager.default.removeItem(atPath: path)
     }
+
+    /// Moves `source` over `destination` with `rename(2)`: an existing destination file is replaced
+    /// atomically (same directory, so same file system).
+    static func replace(_ destination: URL, withFileAt source: URL) throws {
+        var failure: Int32 = 0
+        let renamed = source.withUnsafeFileSystemRepresentation { sourcePath in
+            destination.withUnsafeFileSystemRepresentation { destinationPath -> Bool in
+                guard let sourcePath, let destinationPath else {
+                    failure = EINVAL
+                    return false
+                }
+                if rename(sourcePath, destinationPath) == 0 { return true }
+                failure = errno
+                return false
+            }
+        }
+        guard renamed else {
+            throw StoreError.fileError("cannot move \(source.lastPathComponent) to \(destination.path(percentEncoded: false)): "
+                                       + String(cString: strerror(failure)))
+        }
+    }
+
+    /// (device, inode) of the file at `path` (following symlinks), or nil if it does not exist.
+    /// Two paths name the same file exactly when their identities are equal (hard links included).
+    static func identity(atPath path: String) -> [UInt64]? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let device = unsigned(attributes[.systemNumber]),
+              let inode = unsigned(attributes[.systemFileNumber]) else { return nil }
+        return [device, inode]
+    }
+
+    /// The absolute path with `.`/`..` and symlinks resolved (as far as the path exists).
+    static func canonicalPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path(percentEncoded: false)
+    }
+
+    private static func unsigned(_ value: Any?) -> UInt64? {
+        switch value {
+        case let number as UInt64: return number
+        case let number as Int: return UInt64(bitPattern: Int64(number))
+        case let number as Int64: return UInt64(bitPattern: number)
+        case let number as UInt: return UInt64(number)
+        case let number as UInt32: return UInt64(number)
+        case let number as Int32: return UInt64(bitPattern: Int64(number))
+        case let number as NSNumber: return number.uint64Value
+        default: return nil
+        }
+    }
 }
 
 // MARK: - Bounded line reading
 
 /// Reads a file line by line (LF-terminated, a CR before the LF is dropped) without ever holding
 /// more than `maxLineBytes` plus one read chunk in memory. Over-long lines are skipped while being
-/// read and reported as `.tooLong`, never loaded.
+/// read and reported as `.tooLong`, never loaded. Read failures throw `StoreError.fileError`.
 final class BoundedLineReader {
     enum Line {
         case text([UInt8])
@@ -115,6 +170,7 @@ final class BoundedLineReader {
     }
 
     private let handle: FileHandle
+    private let name: String
     private let maxLineBytes: Int
     private let chunkSize: Int
     private var buffer: [UInt8] = []
@@ -126,6 +182,7 @@ final class BoundedLineReader {
 
     init(url: URL, maxLineBytes: Int, chunkSize: Int = 64 * 1_024) throws {
         handle = try FileHandle(forReadingFrom: url)
+        name = url.lastPathComponent
         self.maxLineBytes = max(1, maxLineBytes)
         self.chunkSize = max(1, chunkSize)
     }
@@ -178,7 +235,13 @@ final class BoundedLineReader {
                 dropAll()
                 return line.count > maxLineBytes ? .tooLong(byteCount: line.count) : .text(line)
             }
-            guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: chunkSize)
+            } catch {
+                throw StoreError.fileError("cannot read \(name): \(error.localizedDescription)")
+            }
+            guard let chunk, !chunk.isEmpty else {
                 reachedEOF = true
                 continue
             }

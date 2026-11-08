@@ -4,7 +4,7 @@ import FormaCore
 public struct RestingHeartRateParameters: Hashable, Sendable, Codable {
     /// Length of each averaging window, ms (5 min).
     public var windowMillis: Int64
-    /// Step between window starts, ms (1 min).
+    /// Step between window starts, ms (1 min). Must lie in 1 s … `maximumSleepWindowMillis`.
     public var stepMillis: Int64
     /// A window is eligible when usable heart rate covers at least this fraction of it.
     public var minimumWindowCoverage: Double
@@ -14,7 +14,7 @@ public struct RestingHeartRateParameters: Hashable, Sendable, Codable {
     public var shortWindowThresholdMillis: Int64
     /// Coverage fraction required inside a sleep window shorter than 5 h.
     public var shortWindowMinimumCoverage: Double
-    /// Longer sleep windows are rejected as malformed, ms (24 h).
+    /// Longer sleep windows are rejected as malformed, ms (24 h; at most 7 days).
     public var maximumSleepWindowMillis: Int64
 
     public init(windowMillis: Int64 = 300_000, stepMillis: Int64 = 60_000, minimumWindowCoverage: Double = 0.8,
@@ -31,9 +31,12 @@ public struct RestingHeartRateParameters: Hashable, Sendable, Codable {
 
     public static let `default` = RestingHeartRateParameters()
 
+    /// Every time value is bounded by `maximumSleepWindowMillis` (≤ 7 days), so window arithmetic on a
+    /// sane sleep window can never overflow, and the window count is at most 7 days / 1 s.
     var isValid: Bool {
-        windowMillis > 0 && stepMillis >= 1_000 && windowMillis <= maximumSleepWindowMillis
-            && maximumSleepWindowMillis <= 7 * 24 * 3_600_000
+        maximumSleepWindowMillis > 0 && maximumSleepWindowMillis <= 7 * 24 * 3_600_000
+            && windowMillis > 0 && windowMillis <= maximumSleepWindowMillis
+            && stepMillis >= 1_000 && stepMillis <= maximumSleepWindowMillis
             && minimumWindowCoverage.isFinite && minimumWindowCoverage > 0 && minimumWindowCoverage <= 1
             && shortWindowMinimumCoverage.isFinite && shortWindowMinimumCoverage >= 0 && shortWindowMinimumCoverage <= 1
             && minimumCoveredMillis >= 0 && shortWindowThresholdMillis >= 0
@@ -46,7 +49,9 @@ public struct OvernightRestingHeartRate: Hashable, Sendable, Codable {
     public var restingHeartRate: MetricValue<Double>
     /// The 5-minute window that produced the estimate.
     public var lowestWindow: TimeRange?
-    /// Windows with ≥ 80 % coverage / all windows evaluated.
+    /// Windows with ≥ 80 % coverage / all windows of the sleep window. Both are counted whenever the sleep
+    /// window is valid (also when the overall coverage gate fails); both are 0 when nothing was evaluated
+    /// (invalid parameters, an empty, invalid or over-long sleep window, or one shorter than 5 min).
     public var eligibleWindows: Int
     public var totalWindows: Int
     /// Covered heart rate inside the sleep window, ms; nil for an empty or invalid window.
@@ -107,31 +112,16 @@ public enum RestingHeartRateEstimator {
             return fail(.insufficientData(detail: "The sleep window is shorter than \(Fmt.duration(p.windowMillis))"),
                         window: sleepWindow, covered: covered, coverage: coverage)
         }
-        var inputs = ["coveredHeartRate": Fmt.duration(covered), "coverage": Fmt.percent(coverage),
-                      "usableSamples": "\(series.samples(in: sleepWindow).count)"]
 
-        if duration >= p.shortWindowThresholdMillis {
-            inputs["required"] = Fmt.duration(p.minimumCoveredMillis) + " of covered heart rate"
-            guard covered >= p.minimumCoveredMillis else {
-                return fail(.insufficientData(detail: "Needs at least \(Fmt.duration(p.minimumCoveredMillis)) of overnight heart rate; have \(Fmt.duration(covered))"),
-                            window: sleepWindow, covered: covered, coverage: coverage, inputs: inputs)
-            }
-        } else {
-            inputs["required"] = Fmt.percent(p.shortWindowMinimumCoverage) + " coverage (sleep window shorter than \(Fmt.duration(p.shortWindowThresholdMillis)))"
-            guard Threshold.meets(Double(covered), of: Double(duration), fraction: p.shortWindowMinimumCoverage) else {
-                return fail(.insufficientData(detail: "Needs heart rate for at least \(Fmt.percent(p.shortWindowMinimumCoverage)) of a sleep window shorter than \(Fmt.duration(p.shortWindowThresholdMillis)); have \(Fmt.percent(coverage, decimals: 1))"),
-                            window: sleepWindow, covered: covered, coverage: coverage, inputs: inputs)
-            }
-        }
-
+        // Scan every window first, so the counts are real even when a gate below withholds the value.
+        // Windows are indexed (start = sleep start + k × step), so no running sum can overflow:
+        // k × step ≤ duration − window ≤ 7 days.
         var best: (mean: Double, window: TimeRange)?
-        var total = 0
+        let total = (duration - p.windowMillis) / p.stepMillis + 1
         var eligible = 0
-        var start = sleepWindow.start
-        while start <= sleepWindow.end - p.windowMillis {
+        for k in 0..<total {
+            let start = sleepWindow.start + k * p.stepMillis
             let window = TimeRange(start: start, end: start + p.windowMillis)
-            start += p.stepMillis
-            total += 1
             let (c, w) = series.index.integrate(window)
             guard c > 0, Threshold.meets(Double(c), of: Double(p.windowMillis), fraction: p.minimumWindowCoverage) else {
                 continue
@@ -141,16 +131,35 @@ public enum RestingHeartRateEstimator {
             if let current = best, current.mean <= mean { continue }
             best = (mean, window)
         }
-        inputs["eligibleWindows"] = "\(eligible) of \(total)"
+        let totalWindows = Int(total)
+
+        var inputs = ["coveredHeartRate": Fmt.duration(covered), "coverage": Fmt.percent(coverage),
+                      "usableSamples": "\(series.samples(in: sleepWindow).count)",
+                      "eligibleWindows": "\(eligible) of \(totalWindows)"]
+        if duration >= p.shortWindowThresholdMillis {
+            inputs["required"] = Fmt.duration(p.minimumCoveredMillis) + " of covered heart rate"
+            guard covered >= p.minimumCoveredMillis else {
+                return fail(.insufficientData(detail: "Needs at least \(Fmt.duration(p.minimumCoveredMillis)) of overnight heart rate; have \(Fmt.duration(covered))"),
+                            window: sleepWindow, covered: covered, coverage: coverage, total: totalWindows,
+                            eligible: eligible, inputs: inputs)
+            }
+        } else {
+            inputs["required"] = Fmt.percent(p.shortWindowMinimumCoverage) + " coverage (sleep window shorter than \(Fmt.duration(p.shortWindowThresholdMillis)))"
+            guard Threshold.meets(Double(covered), of: Double(duration), fraction: p.shortWindowMinimumCoverage) else {
+                return fail(.insufficientData(detail: "Needs heart rate for at least \(Fmt.percent(p.shortWindowMinimumCoverage)) of a sleep window shorter than \(Fmt.duration(p.shortWindowThresholdMillis)); have \(Fmt.percent(coverage, decimals: 1))"),
+                            window: sleepWindow, covered: covered, coverage: coverage, total: totalWindows,
+                            eligible: eligible, inputs: inputs)
+            }
+        }
         guard let best else {
             return fail(.lowQuality(detail: "No \(Fmt.duration(p.windowMillis)) window reached \(Fmt.percent(p.minimumWindowCoverage)) heart-rate coverage"),
-                        window: sleepWindow, covered: covered, coverage: coverage, total: total, eligible: 0, inputs: inputs)
+                        window: sleepWindow, covered: covered, coverage: coverage, total: totalWindows, eligible: 0, inputs: inputs)
         }
-        inputs["lowestWindow"] = best.window.description
+        inputs["lowestWindow"] = "\(Fmt.duration(best.window.start - sleepWindow.start)) to \(Fmt.duration(best.window.end - sleepWindow.start)) after the start of the sleep window"
         inputs["label"] = label
         let value = spec.number(Stats.rounded(best.mean, decimals: 1), coverage: coverage,
                                 confidence: .forAvailable(coverage: coverage), window: sleepWindow, inputs: inputs)
         return OvernightRestingHeartRate(restingHeartRate: value, lowestWindow: best.window, eligibleWindows: eligible,
-                                         totalWindows: total, coveredMillis: covered, coverage: coverage)
+                                         totalWindows: totalWindows, coveredMillis: covered, coverage: coverage)
     }
 }

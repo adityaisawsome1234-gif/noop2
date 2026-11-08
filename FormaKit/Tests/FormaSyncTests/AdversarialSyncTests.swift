@@ -806,7 +806,7 @@ fileprivate let advEverything = TimeRange(start: 0, end: .max)
             default: return []
             }
         }
-        let engine2 = advEngine(store)
+        let engine2 = advEngine(store, readClock: true)
         let run2 = Task { await engine2.run(link: link2) }
         await advWait { link2.wrote(AdvOp.ack) }
         await advDrain(engine2, link2, at: advT(10_101))

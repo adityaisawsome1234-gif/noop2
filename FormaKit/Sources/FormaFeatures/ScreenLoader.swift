@@ -50,10 +50,18 @@ public struct LoaderContext: Sendable {
 public enum ScreenLoader {
     // MARK: Data access with validation filtering
 
-    /// Heart rate usable for metrics: drops fields still awaiting validation.
+    /// Heart rate usable for metrics. Samples from a field still awaiting validation are dropped. Band-history
+    /// samples are kept once the user validated that field for this adapter and firmware: the flag is cleared
+    /// on the copies handed to analytics (storage keeps it as evidence), because analytics exclude it.
     static func heartRates(_ ctx: LoaderContext, in range: TimeRange) throws -> [HeartRateSample] {
         let raw = try ctx.store.heartRates(in: range, deviceID: ctx.deviceID)
-        return raw.filter { !$0.quality.contains(.unvalidatedField) || ($0.source == .deviceHistory && ctx.historyHeartRateValidated) }
+        return raw.compactMap { sample in
+            guard sample.quality.contains(.unvalidatedField) else { return sample }
+            guard sample.source == .deviceHistory, ctx.historyHeartRateValidated else { return nil }
+            var usable = sample
+            usable.quality.remove(.unvalidatedField)
+            return usable
+        }
     }
 
     static func beats(_ ctx: LoaderContext, in range: TimeRange) throws -> [BeatInterval]? {
@@ -67,7 +75,13 @@ public enum ScreenLoader {
     static func motion(_ ctx: LoaderContext, in range: TimeRange) throws -> [MotionEpoch]? {
         guard ctx.motionSupported else { return nil }
         let raw = try ctx.store.motion(in: range, deviceID: ctx.deviceID)
-        return raw.filter { !$0.quality.contains(.unvalidatedField) || ctx.allowUnvalidatedMotion }
+        return raw.compactMap { epoch in
+            guard epoch.quality.contains(.unvalidatedField) else { return epoch }
+            guard ctx.allowUnvalidatedMotion else { return nil }
+            var usable = epoch
+            usable.quality.remove(.unvalidatedField)
+            return usable
+        }
     }
 
     static func maxHeartRate(_ ctx: LoaderContext) -> MaxHeartRate? {
@@ -118,7 +132,9 @@ public enum ScreenLoader {
     }
 
     /// Version folded into the cache key; bump when any underlying method changes.
-    static let dailyCacheVersion = 1
+    /// Bump whenever a cached daily value would change (it is also mixed with the analytics spec versions).
+    static let dailyCacheVersion = 2 * 1_000 + MetricCatalog.overnightRestingHeartRate.version * 100
+        + MetricCatalog.hrvRMSSD.version * 10 + MetricCatalog.edwardsLoad.version
 
     /// The confirmed sleep window that ended on `day` (the main one if several).
     static func confirmedSleep(_ ctx: LoaderContext, endingOn day: LocalDay) throws -> [Session] {
@@ -218,7 +234,7 @@ public enum ScreenLoader {
         } else {
             cards.append(MetricCardState(id: "rhr", title: "Resting HR (overnight)",
                                          metric: .unavailable(.insufficientData(detail: "Needs a confirmed sleep window for last night"),
-                                                              specID: MetricID.overnightRestingHeartRate, specVersion: 1),
+                                                              specID: MetricID.overnightRestingHeartRate, specVersion: MetricCatalog.overnightRestingHeartRate.version),
                                          unit: "bpm", valueText: nil, status: .estimate))
         }
 
@@ -232,7 +248,7 @@ public enum ScreenLoader {
             let availability: Availability = ctx.beatIntervalsSupported
                 ? .insufficientData(detail: "Needs a confirmed sleep window with beat-to-beat intervals")
                 : .unsupportedSensor(sensor: "beat-to-beat intervals")
-            cards.append(MetricCardState(id: "hrv", title: "HRV (RMSSD)", metric: .unavailable(availability, specID: MetricID.hrvRMSSD, specVersion: 1),
+            cards.append(MetricCardState(id: "hrv", title: "HRV (RMSSD)", metric: .unavailable(availability, specID: MetricID.hrvRMSSD, specVersion: MetricCatalog.hrvRMSSD.version),
                                          unit: "ms", valueText: nil, status: .estimate))
         }
 
@@ -240,7 +256,7 @@ public enum ScreenLoader {
         if nights.isEmpty {
             cards.append(MetricCardState(id: "sleep", title: "Sleep",
                                          metric: .unavailable(.insufficientData(detail: "No confirmed sleep window ending today"),
-                                                              specID: MetricID.sleepSummary, specVersion: 1),
+                                                              specID: MetricID.sleepSummary, specVersion: MetricCatalog.sleepSummary.version),
                                          unit: "h", valueText: nil, status: .estimate))
         } else {
             var totalMs: Int64 = 0
@@ -253,7 +269,7 @@ public enum ScreenLoader {
             let hours = Double(totalMs) / 3_600_000
             let metric = MetricValue<Double>(value: hours, availability: .available, coverage: nil,
                                              confidence: usedMotion ? .moderate : .low, window: mainNight?.range,
-                                             specID: MetricID.sleepSummary, specVersion: 1,
+                                             specID: MetricID.sleepSummary, specVersion: MetricCatalog.sleepSummary.version,
                                              inputs: ["basis": usedMotion ? "sleep estimate from motion" : "time in confirmed window"])
             cards.append(MetricCardState(id: "sleep", title: usedMotion ? "Sleep (estimate)" : "Time in sleep window", metric: metric,
                                          unit: "h", valueText: DisplayFormat.number(hours, digits: 1), status: .estimate,
@@ -334,9 +350,9 @@ public enum ScreenLoader {
             let summary = SleepSummary.fromConfirmedWindow(s.range, motion: mot, heartRate: hr)
             let sleepEst: MetricValue<Double> = summary.sleepDurationEstimate.value.map {
                 MetricValue(value: Double($0) / 3_600_000, availability: .available, coverage: summary.motionCoverage,
-                            confidence: summary.sleepDurationEstimate.confidence, window: s.range, specID: MetricID.sleepSummary, specVersion: 1)
+                            confidence: summary.sleepDurationEstimate.confidence, window: s.range, specID: MetricID.sleepSummary, specVersion: MetricCatalog.sleepSummary.version)
             } ?? .unavailable(mot == nil ? .unsupportedSensor(sensor: SleepDetector.motionSensorName) : summary.sleepDurationEstimate.availability,
-                              specID: MetricID.sleepSummary, specVersion: 1, window: s.range)
+                              specID: MetricID.sleepSummary, specVersion: MetricCatalog.sleepSummary.version, window: s.range)
             let rhr = RestingHeartRateEstimator.estimate(sleepWindow: s.range, series: HeartRateSeries(hr)).restingHeartRate
             let hrv = HRVAnalyzer.analyze(beats: try beats(ctx, in: s.range), range: s.range).rmssd
             let coverage = CoverageTimeline.build(window: s.range, sampleTimes: HeartRateSeries.usable(hr).map(\.timestamp),

@@ -84,6 +84,9 @@ extension FormaStore {
     }
 
     /// The smallest range `[oldest, newest + 1 ms)` containing every stored measurement; nil when empty.
+    /// Timestamps are reported as stored. Backup import only admits `backupTimeWindow`, but `ingest`
+    /// stores whatever the sync engine delivers, so callers doing arithmetic on the bounds of data
+    /// they did not validate should use overflow-checked operations.
     public func dataBounds() throws -> TimeRange? {
         try locked { db in
             var oldest: EpochMillis?
@@ -161,19 +164,28 @@ extension FormaStore {
 
     // MARK: Paging (exports)
 
+    /// The keyset-pagination query `forEachPage` runs: rows after `(ts_ms, rowid)` = (?2, ?3) with
+    /// `ts_ms >= ?1` (and `ts_ms < ?4` with a range), in `(ts_ms, rowid)` order, `LIMIT` last. The
+    /// `(ts_ms)` index delivers exactly that order, so no page ever needs a sort.
+    static func pageSQL(_ table: MeasurementTable, hasRange: Bool) -> String {
+        var sql = "SELECT rowid, ts_ms, \(table.columns) FROM \(table.name) WHERE ts_ms >= ? AND (ts_ms > ? OR rowid > ?)"
+        if hasRange { sql += " AND ts_ms < ?" }
+        return sql + " ORDER BY ts_ms, rowid LIMIT ?"
+    }
+
     /// Streams a measurement table in `(ts_ms, rowid)` order, `pageSize` rows per lock acquisition,
     /// and hands each decoded page to `body` with the lock released (keyset pagination, so ingest
     /// can interleave with a long export). Rows written concurrently behind the read position are
     /// not included: the result is not a point-in-time snapshot.
+    /// - Throws: `CancellationError` (checked before every page) when the calling task is cancelled.
     func forEachPage<Row>(_ table: MeasurementTable, range: TimeRange?, pageSize: Int = 4_096,
                           decode: (SQLiteStatement, Int) -> Row?, body: ([Row]) throws -> Void) throws {
-        var sql = "SELECT rowid, ts_ms, \(table.columns) FROM \(table.name) WHERE ts_ms >= ? AND (ts_ms > ? OR rowid > ?)"
-        if range != nil { sql += " AND ts_ms < ?" }
-        sql += " ORDER BY ts_ms, rowid LIMIT ?"
+        let sql = Self.pageSQL(table, hasRange: range != nil)
         let limit = max(1, pageSize)
         var afterTimestamp = range?.start ?? Int64.min
         var afterRowID = Int64.min
         while true {
+            try Task.checkCancellation()
             var fetched = 0
             var lastKey: (timestamp: Int64, rowID: Int64)?
             let page: [Row] = try locked { db in

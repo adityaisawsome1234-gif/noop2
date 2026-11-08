@@ -6,13 +6,14 @@ import FormaCore
 /// Nothing here touches the network.
 ///
 /// ## Thread safety
-/// Every public method may be called from any thread. All access to the single SQLite connection
-/// is serialized through one recursive lock that is held for the whole call, so each call sees and
-/// leaves a consistent database. Long-running exports and imports take the lock once per page or
-/// chunk, so ingest can interleave with them. Because no mutable state is touched outside that
-/// lock, the class is declared `@unchecked Sendable`. Calls block while they wait for the lock, so
-/// run long ones (export, import, deleteAllData) off the main thread. Use one `FormaStore` per
-/// database file per process: retention bookkeeping is cached per instance.
+/// Every public method may be called from any thread. All access to the single SQLite connection,
+/// and every mutable property of this class, is serialized through one recursive lock that is held
+/// for the whole call, so each call sees and leaves a consistent database. Long-running exports and
+/// imports take the lock once per page or chunk, so ingest can interleave with them. Because no
+/// mutable state is touched outside that lock, the class is declared `@unchecked Sendable`. Calls
+/// block while they wait for the lock, so run long ones (export, import, deleteAllData) off the main
+/// thread; exports and imports also stop with `CancellationError` when their task is cancelled.
+/// Use one `FormaStore` per database file per process: retention bookkeeping is cached per instance.
 ///
 /// ## Honesty rules
 /// Values are stored exactly as delivered (flags are data, implausible values are flagged upstream,
@@ -33,12 +34,28 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
     let timeSource: any TimeSource
 
     private let lock = NSRecursiveLock()
+    // Everything below is read and written only while `lock` is held.
     private var connection: SQLiteConnection?
     private var rawCaptureEnabledCache: Bool?
     private var rawFrameUsageCache: RawFrameUsage?
     private var connectionEventCountCache: Int?
-    /// Overridable by tests; read under the lock.
-    var connectionEventLimit = FormaStore.defaultConnectionEventLimit
+    private var connectionEventLimitValue = FormaStore.defaultConnectionEventLimit
+    /// Incremented by every `deleteAllData`, so a running import notices the wipe (see `importBackup`).
+    private(set) var dataGeneration: UInt64 = 0
+
+    /// Connection-history bound (overridable by tests). Takes the store lock.
+    var connectionEventLimit: Int {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return connectionEventLimitValue
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            connectionEventLimitValue = newValue
+        }
+    }
 
     private struct RawFrameUsage {
         var frames: Int
@@ -46,12 +63,16 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
     }
 
     /// Opens (creating and migrating if needed) the store.
+    ///
+    /// The file's header is checked before anything can modify it, so a file this build must not
+    /// touch (another app's database, a newer schema, a damaged file or no database at all) is
+    /// refused and left byte-for-byte unchanged; only then is WAL enabled and the schema migrated.
     /// - Parameters:
     ///   - path: Database file path (parent directories are created), or nil for an in-memory store.
     ///   - timeSource: Clock for stored "now" values; inject `ManualTimeSource` in tests and replays.
-    ///   - rawFrameRetention: Bounds for diagnostics raw-frame capture.
-    /// - Throws: `StoreError.schemaTooNew` / `.notAFormaDatabase` for files this build must not touch,
-    ///   `StoreError.fileError`, or `SQLiteError`.
+    ///   - rawFrameRetention: Bounds for diagnostics raw-frame capture (applied once on open).
+    /// - Throws: `StoreError.schemaTooNew` / `.notAFormaDatabase` / `.databaseUnreadable` for files
+    ///   this build must not touch, `StoreError.fileError`, or `SQLiteError`.
     public init(path: String?, timeSource: any TimeSource = SystemTimeSource(),
                 rawFrameRetention: RawFrameRetention = .default) throws {
         let databasePath: String
@@ -72,8 +93,15 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
         self.path = path
         self.timeSource = timeSource
         self.rawFrameRetention = rawFrameRetention
-        let db = try SQLiteConnection(path: databasePath)
-        try Migrations.migrate(db)
+        let db: SQLiteConnection
+        do {
+            db = try SQLiteConnection(path: databasePath, enableWAL: false)
+            try Migrations.checkCompatibility(db)
+            try db.enableWAL()
+            try Migrations.migrate(db)
+        } catch let error as SQLiteError where error.isCorrupt {
+            throw StoreError.databaseUnreadable("\(URL(fileURLWithPath: databasePath).lastPathComponent): \(error.message)")
+        }
         connection = db
         try enforceRawFrameRetention()
     }
@@ -118,12 +146,25 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
     /// (stamped with that batch id; records whose dedup key already exists are skipped and counted as
     /// duplicates), and the cursor if one is given. If anything fails, everything is rolled back and
     /// the error rethrown, so a history acknowledgement can safely depend on this returning.
-    /// - Throws: `StoreError.invalidRecord` (before writing anything) for an empty or mismatched
-    ///   device ID, a non-finite number, or another structurally impossible value; `SQLiteError`.
+    ///
+    /// Durability: batches that carry a cursor or band history are committed with
+    /// `synchronous=FULL` (the write-ahead log is synced before this returns), because the band may
+    /// discard acknowledged history; live batches use the connection's `synchronous=NORMAL`.
+    ///
+    /// Validation (the whole batch is rejected, nothing written): every record and the cursor must
+    /// carry `provenance.deviceID`; identifiers are 1...256 UTF-8 bytes; doubles are finite;
+    /// `bpm` is 0...65 535 and a 0 must carry `.deviceMarkedInvalid`, `.noSensorContact` or
+    /// `.outOfRange`; motion `epochMillis` > 0; counts and indices ≥ 0. Timestamps are stored as
+    /// given (the sync engine flags or withholds unmapped device times); backup import is stricter.
+    /// - Throws: `StoreError.invalidRecord` (before writing anything); `SQLiteError`.
     public func ingest(_ batch: IngestBatch) throws -> IngestResult {
         try RecordValidator.validate(batch)
+        let durable = batch.cursor != nil || batch.provenance.source == .deviceHistory
         return try locked { db in
-            try db.transaction {
+            let switchSync = durable && !db.isInTransaction
+            if switchSync { try db.execute("PRAGMA synchronous = FULL") }
+            defer { if switchSync { try? db.execute("PRAGMA synchronous = NORMAL") } }
+            return try db.transaction {
                 let batchID = try Self.insertProvenance(batch.provenance, db: db)
                 let writer = MeasurementWriter(db: db)
                 var inserted = 0
@@ -139,6 +180,24 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
                     try Self.upsertCursor(cursor, db: db)
                 }
                 return IngestResult(batchID: batchID, inserted: inserted, duplicates: duplicates)
+            }
+        }
+    }
+
+    /// Makes every committed transaction survive power loss and OS crashes. The sync engine calls this
+    /// before acknowledging history to the band. History and cursor batches are already committed with
+    /// `synchronous=FULL`; on Apple platforms a plain fsync can leave data in the drive's cache, so this
+    /// also checkpoints the write-ahead log into the database with a full flush (`F_FULLFSYNC` there).
+    /// - Throws: `StoreError.fileError` when the checkpoint cannot complete (another connection holds a
+    ///   reader on an older snapshot), so the caller does not acknowledge.
+    public func ensureDurable() throws {
+        try locked { db in
+            guard !db.isInMemory else { return }
+            try db.execute("PRAGMA checkpoint_fullfsync = ON")
+            let checkpoint = try db.prepare("PRAGMA wal_checkpoint(FULL)")
+            if try checkpoint.step() == .row, let busy = checkpoint.int(0), busy != 0 {
+                throw StoreError.fileError("saved band history could not be flushed to storage because another connection "
+                                           + "is reading the database; nothing was acknowledged")
             }
         }
     }
@@ -185,7 +244,7 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
                     try db.run("INSERT INTO connection_event (\(RowDecoder.connectionEventColumns)) VALUES (?, ?, ?, ?)",
                                [event.deviceID, event.timestamp, event.kind.rawValue, event.detail])
                     connectionEventCountCache = count + 1
-                    let limit = max(1, connectionEventLimit)
+                    let limit = max(1, connectionEventLimitValue)
                     if count + 1 > limit {
                         let keep = limit - limit / 10
                         try db.run("DELETE FROM connection_event WHERE id IN (SELECT id FROM connection_event ORDER BY id LIMIT ?)",
@@ -201,18 +260,20 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
     }
 
     /// Stores raw evidence only while raw capture is enabled (`setRawCaptureEnabled`, default off),
-    /// then enforces `rawFrameRetention`. A frame larger than `maxTotalBytes` is not stored (it could
-    /// never fit within the bound); payload bytes are never truncated or altered.
+    /// then enforces `rawFrameRetention`. A frame whose size (payload plus text fields, see
+    /// `RawFrameRetention.maxTotalBytes`) exceeds `maxTotalBytes` is not stored: it could never fit
+    /// within the bound. Payload bytes are never truncated or altered.
     public func recordRawFrame(_ frame: RawFrameRecord) throws {
+        let size = Self.rawFrameSize(frame)
         try locked { db in
-            guard try loadRawCaptureEnabled(db), frame.bytes.count <= rawFrameRetention.maxTotalBytes else { return }
+            guard try loadRawCaptureEnabled(db), size <= rawFrameRetention.maxTotalBytes else { return }
             do {
                 try db.transaction {
                     var usage = try currentRawFrameUsage(db)
                     try db.run("INSERT INTO raw_frame (\(RowDecoder.rawFrameColumns)) VALUES (?, ?, ?, ?, ?)",
                                [frame.deviceID, frame.receivedAt, frame.characteristic, frame.bytes, frame.parseStatus])
                     usage.frames += 1
-                    usage.bytes += frame.bytes.count
+                    usage.bytes += size
                     rawFrameUsageCache = usage
                     try enforceRawFrameRetention(db, now: timeSource.now())
                 }
@@ -339,6 +400,18 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
         }
     }
 
+    /// Bytes a frame counts against `RawFrameRetention.maxTotalBytes`: payload plus the UTF-8 text.
+    static func rawFrameSize(_ frame: RawFrameRecord) -> Int {
+        frame.bytes.count + frame.characteristic.utf8.count + frame.parseStatus.utf8.count
+            + (frame.deviceID?.utf8.count ?? 0)
+    }
+
+    /// `rawFrameSize` in SQL (TEXT is cast to BLOB so `length` counts bytes, embedded NULs included).
+    static let rawFrameSizeSQL = """
+        length(bytes) + length(CAST(characteristic AS BLOB)) + length(CAST(parse_status AS BLOB)) \
+        + COALESCE(length(CAST(device_id AS BLOB)), 0)
+        """
+
     private func loadRawCaptureEnabled(_ db: SQLiteConnection) throws -> Bool {
         if let cached = rawCaptureEnabledCache { return cached }
         let enabled = try db.scalarText("SELECT value FROM setting WHERE key = ?",
@@ -349,7 +422,7 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
 
     private func currentRawFrameUsage(_ db: SQLiteConnection) throws -> RawFrameUsage {
         if let cached = rawFrameUsageCache { return cached }
-        let statement = try db.prepare("SELECT COUNT(*), COALESCE(SUM(length(bytes)), 0) FROM raw_frame")
+        let statement = try db.prepare("SELECT COUNT(*), COALESCE(SUM(\(Self.rawFrameSizeSQL)), 0) FROM raw_frame")
         guard try statement.step() == .row else { return RawFrameUsage(frames: 0, bytes: 0) }
         let usage = RawFrameUsage(frames: statement.int(0) ?? 0, bytes: statement.int(1) ?? 0)
         rawFrameUsageCache = usage
@@ -358,7 +431,9 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
 
     /// Deletes frames older than the age bound, then — if the count or byte bound is exceeded — the
     /// oldest frames (by insertion order) until both are back under 90 % of their bound. The newest
-    /// frame is always kept; it fits on its own because oversized frames are never stored.
+    /// frame is kept when it fits the bounds on its own (always the case right after a capture,
+    /// because a frame larger than `maxTotalBytes` is never stored); when the bound was lowered below
+    /// it, it is deleted too, so the stored total never stays above `maxTotalBytes`.
     private func enforceRawFrameRetention(_ db: SQLiteConnection, now: EpochMillis) throws {
         let policy = rawFrameRetention
         let (cutoff, overflow) = now.subtractingReportingOverflow(policy.maxAgeMillis)
@@ -372,9 +447,10 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
         var frames = usage.frames
         var bytes = usage.bytes
         var lastDeletedID: Int64?
-        let oldest = try db.prepare("SELECT id, length(bytes) FROM raw_frame ORDER BY id")
-        while frames > 1, frames > targetFrames || bytes > targetBytes, try oldest.step() == .row {
-            guard let id = oldest.int64(0) else { break }
+        let oldest = try db.prepare("SELECT id, \(Self.rawFrameSizeSQL) FROM raw_frame ORDER BY id")
+        while frames > targetFrames || bytes > targetBytes {
+            if frames == 1, bytes <= policy.maxTotalBytes { break }
+            guard try oldest.step() == .row, let id = oldest.int64(0) else { break }
             lastDeletedID = id
             frames -= 1
             bytes -= oldest.int(1) ?? 0
@@ -465,9 +541,14 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
 
     // MARK: - Deletion
 
-    /// Deletes every row of every table (settings too unless `keepSettings`) in one transaction, then
-    /// rebuilds the file with VACUUM and truncates the WAL so deleted data does not linger in free
-    /// pages or the log.
+    /// Deletes every row of every table (settings too unless `keepSettings`) in one transaction run
+    /// with `secure_delete` (freed content is overwritten with zeros as part of the commit), then
+    /// rebuilds the file with VACUUM and checkpoints and truncates the write-ahead log, so deleted data
+    /// does not linger in free pages or in the log. A running `importBackup` stops at its next chunk.
+    /// - Throws: An error from the deletion itself (then nothing was deleted), or — after the rows were
+    ///   deleted and overwritten — from VACUUM (for example a full disk) or a log that could not be
+    ///   truncated because another connection is reading the database (`StoreError.fileError`); the
+    ///   log is then emptied at a later checkpoint, and `destroyDatabaseFiles(at:)` removes it at once.
     public func deleteAllData(keepSettings: Bool = false) throws {
         try locked { db in
             defer {
@@ -475,29 +556,72 @@ public final class FormaStore: IngestSink, @unchecked Sendable {
                 rawFrameUsageCache = nil
                 connectionEventCountCache = nil
             }
+            let secureDelete = try db.scalarInt64("PRAGMA secure_delete") ?? 0
+            try db.execute("PRAGMA secure_delete = ON")
+            defer { try? db.execute("PRAGMA secure_delete = \(secureDelete)") }
             try db.transaction {
                 for table in Schema.deletionOrder where !(keepSettings && table == "setting") {
                     try db.execute("DELETE FROM \(table)")
                 }
             }
-            try db.execute("VACUUM")
-            if !db.isInMemory {
-                try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dataGeneration &+= 1
+            var compactionError: (any Error)?
+            do {
+                try db.execute("VACUUM")
+            } catch {
+                compactionError = error
             }
+            if !db.isInMemory {
+                let checkpoint = try db.prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+                if try checkpoint.step() == .row, let busy = checkpoint.int(0), busy != 0 {
+                    throw StoreError.fileError("all data was deleted, but the write-ahead log could not be truncated "
+                                               + "because another connection is reading the database")
+                }
+            }
+            if let compactionError { throw compactionError }
         }
     }
 
     /// Removes a database file and its `-wal`, `-shm` and `-journal` companions. Close every store
-    /// using the file first. Missing files are not an error.
+    /// using the file first. Missing files are not an error. Only regular files are deleted: if any of
+    /// the four paths is a directory, nothing is deleted and `StoreError.fileError` is thrown.
     public static func destroyDatabaseFiles(at path: String) throws {
         guard !path.isEmpty, path != SQLiteConnection.inMemoryPath else { return }
-        let fileManager = FileManager.default
-        for file in [path, path + "-wal", path + "-shm", path + "-journal"] where fileManager.fileExists(atPath: file) {
+        let files = [path, path + "-wal", path + "-shm", path + "-journal"]
+        for file in files where FileOps.isDirectory(atPath: file) {
+            throw StoreError.fileError("\(file) is a directory, not a database file; nothing was deleted")
+        }
+        for file in files {
             do {
-                try fileManager.removeItem(atPath: file)
+                try FileOps.removeRegularFile(atPath: file)
+            } catch let error as StoreError {
+                throw error
             } catch {
                 throw StoreError.fileError("cannot delete \(file): \(error.localizedDescription)")
             }
+        }
+    }
+
+    // MARK: - Export destinations
+
+    /// Throws when `url` names this store's own database file or one of its companions (by path, or
+    /// as the same file under another name such as a hard link): an export there would replace the
+    /// live database with text.
+    func refuseDatabaseFileAsDestination(_ url: URL) throws {
+        guard let path, path != SQLiteConnection.inMemoryPath else { return }
+        let database = URL(fileURLWithPath: path)
+        let suffixes = ["", "-wal", "-shm", "-journal"]
+        let destinationName = url.lastPathComponent
+        let samePlace = FileOps.canonicalPath(url.deletingLastPathComponent())
+            == FileOps.canonicalPath(database.deletingLastPathComponent())
+        let sameName = suffixes.contains { database.lastPathComponent + $0 == destinationName }
+        var sameFile = false
+        if let target = FileOps.identity(atPath: url.path(percentEncoded: false)) {
+            sameFile = suffixes.contains { FileOps.identity(atPath: path + $0) == target }
+        }
+        if (samePlace && sameName) || sameFile {
+            throw StoreError.fileError("\(url.path(percentEncoded: false)) is this store's database file; "
+                                       + "choose another destination")
         }
     }
 }

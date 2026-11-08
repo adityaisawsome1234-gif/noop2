@@ -776,7 +776,8 @@ public actor SyncEngine {
         }
         if let m = r.motion, m.sampleCount > 0, m.spanMillis > 0 {
             historyMotion.append(MotionEpoch(deviceID: device.id, timestamp: ts, epochMillis: m.spanMillis, activity: m.activity,
-                                             sampleCount: m.sampleCount, source: .deviceHistory, quality: flags.union(.unvalidatedField)))
+                                             sampleCount: m.sampleCount, source: .deviceHistory, quality: flags.union(.unvalidatedField),
+                                             deviceTimeRaw: raw))
         }
         if !r.beatIntervalsMillis.isEmpty {
             // Intervals within one record: the last one ends at the record time (reconstruction, documented).

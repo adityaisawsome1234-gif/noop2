@@ -58,10 +58,11 @@ public struct BaselineStatistics: Hashable, Sendable, Codable {
 /// Personal baselines from the previous N days.
 public enum BaselineCalculator {
     /// Baseline for `targetDay` from the `windowDays` calendar days before it (the target day itself is
-    /// never used). Non-finite values and explicit nils count as missing. Outliers with
-    /// |x − median| > 3 × 1.4826 × MAD are excluded when MAD > 0; with MAD = 0 nothing is excluded.
-    /// Fewer than `minimumDays` retained values → `calibrating(have: n, need: minimumDays, unit:)`.
-    /// Coverage = eligible days / window days; confidence follows coverage.
+    /// never used; days are Gregorian dates in `calendar`'s time zone). Non-finite values and explicit nils
+    /// count as missing. Outliers with |x − median| > 3 × 1.4826 × MAD are excluded when MAD > 0; with
+    /// MAD = 0 nothing is excluded. Fewer than `minimumDays` retained values →
+    /// `calibrating(have: n, need: minimumDays, unit:)`, with `inputs["excludedOutliers"]` saying how many
+    /// eligible values were excluded. Coverage = eligible days / window days; confidence follows coverage.
     public static func baseline(values: [LocalDay: Double?], targetDay: LocalDay, calendar: Calendar,
                                 parameters p: BaselineParameters = .default) -> MetricValue<BaselineStatistics> {
         let spec = MetricCatalog.baseline

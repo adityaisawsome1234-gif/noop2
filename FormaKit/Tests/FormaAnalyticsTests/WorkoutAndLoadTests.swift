@@ -117,8 +117,11 @@ struct WorkoutAndLoadTests {
         let zones = HeartRateZones(maxHeartRate: MaxHeartRate(bpm: 182.8, basis: .estimatedFromAge, ageYears: 36))
         let summary = WorkoutAnalyzer.summarize(range: range, samples: samples, zones: zones)
         #expect(summary.meanHeartRate.confidence == .high)
-        #expect(summary.timeInZones.confidence == .moderate)
-        #expect(summary.edwardsTRIMP.confidence == .moderate)
+        // Capped at the confidence of the age estimate itself (low).
+        #expect(summary.timeInZones.confidence == .low)
+        #expect(summary.edwardsTRIMP.confidence == .low)
+        #expect(TrainingLoad.banisterTRIMP(range: range, samples: samples, hrMax: zones.maxHeartRate, restingHeartRate: 60,
+                                           sex: .female).confidence == .low)
     }
 
     @Test func edwardsTRIMPHandExample() {

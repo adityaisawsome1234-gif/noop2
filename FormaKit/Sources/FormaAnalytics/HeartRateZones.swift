@@ -33,10 +33,11 @@ public struct MaxHeartRate: Hashable, Sendable, Codable {
         }
     }
 
-    /// Ceiling on the confidence of anything derived from this HRmax: an age-based estimate
-    /// (individual error ≈ ±10 bpm) caps zone and load confidence at `.moderate`.
+    /// Ceiling on the confidence of anything derived from this HRmax. An age-based estimate (individual
+    /// error ≈ ±10 bpm) is itself reported with `.low` confidence by ``MaxHeartRateResolver``, so zones,
+    /// time in zone and load built on it are capped at `.low` too; a user override does not cap (`.high`).
     public var confidenceCap: Confidence {
-        basis == .userOverride ? .high : .moderate
+        basis == .userOverride ? .high : .low
     }
 }
 
@@ -54,7 +55,8 @@ public enum MaxHeartRateResolver {
     /// Reference dates (epoch ms, 1900-01-01 … 2200-01-01 UTC) for which an age is computed at all.
     static let plausibleReferenceDates: ClosedRange<EpochMillis> = -2_208_988_800_000...7_258_118_400_000
 
-    /// 208 − 0.7 × age, rounded to 0.1 bpm.
+    /// 208 − 0.7 × age, rounded to 0.1 bpm. A building block: it does not check ``ageRange``, so use
+    /// ``resolve(profile:asOf:calendar:)`` for values shown to people.
     public static func tanakaEstimate(ageYears: Int) -> Double {
         Stats.rounded(tanakaIntercept - tanakaSlope * Double(ageYears), decimals: 1)
     }
@@ -192,39 +194,59 @@ public struct HeartRateZones: Hashable, Sendable, Codable {
         return true
     }
 
-    /// Zone bounds in bpm, or the reason they cannot be computed.
+    /// Zone bounds in bpm, or the reason they cannot be computed. Confidence is ``MaxHeartRate/confidenceCap``
+    /// (high for your own HRmax, low for the age estimate).
     public func thresholds() -> MetricValue<ZoneThresholds> {
         let spec = MetricCatalog.heartRateZones
-        guard Self.validBoundaries(boundaries) else {
-            return spec.unavailable(.disabled(reason: "Zone boundaries must be strictly increasing fractions in (0, 1]"), window: nil)
+        switch resolution() {
+        case .failed(let availability, let hrMax):
+            var inputs: [String: String] = [:]
+            if let hrMax { inputs = baseInputs(hrMax) }
+            return spec.unavailable(availability, window: nil, inputs: inputs)
+        case .resolved(let bounds, let hrMax, let resting):
+            var inputs = baseInputs(hrMax)
+            if let resting { inputs["restingHeartRate"] = Fmt.bpm(resting) }
+            let thresholds = ZoneThresholds(model: model, boundaries: boundaries, lowerBoundsBPM: bounds,
+                                            maxHeartRate: hrMax, restingHeartRate: resting)
+            return spec.available(thresholds, coverage: nil, confidence: hrMax.confidenceCap, window: nil, inputs: inputs)
         }
-        guard let hrMax = maxHeartRate, hrMax.bpm.isFinite, hrMax.bpm > 0 else {
-            return spec.unavailable(.insufficientData(detail: MaxHeartRateResolver.missingInputDetail), window: nil)
-        }
-        var inputs = ["model": model.rawValue,
-                      "maxHeartRate": Fmt.bpm(hrMax.bpm) + " (\(hrMax.label))",
-                      "boundaries": boundaries.map { Fmt.percent($0) }.joined(separator: ", ")]
-        let bounds: [Double]
-        var resting: Double?
-        switch model {
-        case .percentMax:
-            bounds = boundaries.map { $0 * hrMax.bpm }
-        case .heartRateReserve:
-            guard let r = restingHeartRate, Self.restingHeartRateRange.contains(r), r < hrMax.bpm else {
-                return spec.unavailable(.insufficientData(detail: Self.missingRestingDetail), window: nil, inputs: inputs)
-            }
-            resting = r
-            inputs["restingHeartRate"] = Fmt.bpm(r)
-            bounds = boundaries.map { r + $0 * (hrMax.bpm - r) }
-        }
-        let thresholds = ZoneThresholds(model: model, boundaries: boundaries, lowerBoundsBPM: bounds,
-                                        maxHeartRate: hrMax, restingHeartRate: resting)
-        return spec.available(thresholds, coverage: nil, confidence: hrMax.confidenceCap, window: nil, inputs: inputs)
     }
 
-    /// Zone (0…k) of `bpm`, or nil when thresholds are unavailable.
+    /// Zone (0…k) of `bpm`, or nil when thresholds are unavailable. Cheap enough to call per chart point:
+    /// it resolves the bounds without building the explanation that ``thresholds()`` carries.
     public func zone(forBPM bpm: Double) -> Int? {
-        thresholds().value?.zone(forBPM: bpm)
+        guard case .resolved(let bounds, _, _) = resolution() else { return nil }
+        return Self.zoneIndex(bpm: bpm, lowerBounds: bounds)
+    }
+
+    /// Resolved lower bounds (bpm), or why they cannot be computed (with HRmax when it was usable).
+    enum Resolution {
+        case resolved(bounds: [Double], hrMax: MaxHeartRate, resting: Double?)
+        case failed(Availability, hrMax: MaxHeartRate?)
+    }
+
+    func resolution() -> Resolution {
+        guard Self.validBoundaries(boundaries) else {
+            return .failed(.disabled(reason: "Zone boundaries must be strictly increasing fractions in (0, 1]"), hrMax: nil)
+        }
+        guard let hrMax = maxHeartRate, hrMax.bpm.isFinite, hrMax.bpm > 0 else {
+            return .failed(.insufficientData(detail: MaxHeartRateResolver.missingInputDetail), hrMax: nil)
+        }
+        switch model {
+        case .percentMax:
+            return .resolved(bounds: boundaries.map { $0 * hrMax.bpm }, hrMax: hrMax, resting: nil)
+        case .heartRateReserve:
+            guard let r = restingHeartRate, Self.restingHeartRateRange.contains(r), r < hrMax.bpm else {
+                return .failed(.insufficientData(detail: Self.missingRestingDetail), hrMax: hrMax)
+            }
+            return .resolved(bounds: boundaries.map { r + $0 * (hrMax.bpm - r) }, hrMax: hrMax, resting: r)
+        }
+    }
+
+    private func baseInputs(_ hrMax: MaxHeartRate) -> [String: String] {
+        ["model": model.rawValue,
+         "maxHeartRate": Fmt.bpm(hrMax.bpm) + " (\(hrMax.label))",
+         "boundaries": boundaries.map { Fmt.percent($0) }.joined(separator: ", ")]
     }
 
     /// Count of ascending lower bounds that `bpm` reaches (inclusive, with a 1e-9 bpm tolerance).

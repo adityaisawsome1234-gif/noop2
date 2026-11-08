@@ -23,10 +23,12 @@ struct CatalogTests {
         let ids = MetricCatalog.all.map(\.id)
         #expect(Set(ids).count == ids.count)
         let expected = [MetricID.heartRateSeries, MetricID.maxHeartRate, MetricID.heartRateZones, MetricID.workoutSummary,
-                        MetricID.overnightRestingHeartRate, MetricID.hrvRMSSD, MetricID.hrvRawRMSSD, MetricID.trends,
-                        MetricID.baseline, MetricID.sleepCandidate, MetricID.sleepSummary, MetricID.edwardsLoad,
-                        MetricID.banisterTRIMP, MetricID.readiness]
+                        MetricID.overnightRestingHeartRate, MetricID.hrvRMSSD, MetricID.hrvLnRMSSD, MetricID.hrvRawRMSSD,
+                        MetricID.trends, MetricID.baseline, MetricID.sleepCandidate, MetricID.sleepSummary,
+                        MetricID.sleepContinuity, MetricID.sleepHeartRate, MetricID.edwardsLoad, MetricID.banisterTRIMP,
+                        MetricID.readiness]
         #expect(Set(ids) == Set(expected))
+        #expect(ids.count == expected.count)
         for spec in MetricCatalog.all {
             #expect(spec.version >= 1)
             #expect(!spec.method.isEmpty && !spec.unit.isEmpty && !spec.qualityGates.isEmpty && !spec.limitations.isEmpty)
@@ -50,9 +52,11 @@ struct CatalogTests {
         #expect(HeartRateSeries.maxSpanMillis == 5_000)
         #expect(HeartRateSeries.historyPrecedenceMillis == 5_000)
         #expect(HeartRateSeries.defaultMaxGapMillis == 10_000)
-        #expect(HeartRateSeries.excludedFlags == [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped])
+        #expect(HeartRateSeries.excludedFlags == [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped,
+                                                  .unvalidatedField])
         expectMentions(MetricCatalog.heartRateSeries, ["±5 s", "for at most 5 s", "more than 10 s apart", "25–240",
-                                                       "live vendor stream > backup import > standard Heart Rate Service"])
+                                                       "live vendor stream > backup import > standard Heart Rate Service",
+                                                       "clockUnmapped or unvalidatedField"])
     }
 
     @Test func zoneAndMaxHeartRateParameters() {

@@ -60,22 +60,51 @@ struct DiagnosticsTests {
         #expect(try store.rawFrames().map(\.receivedAt) == (0..<kept).map { t0 + 34 - Int64($0) })
     }
 
+    /// Summed size of the stored frames as retention counts it (payload plus text fields).
+    private func storedSize(_ store: FormaStore) throws -> Int {
+        try store.withConnectionForTesting { db in
+            Int(try db.scalarInt64("SELECT COALESCE(SUM(\(FormaStore.rawFrameSizeSQL)), 0) FROM raw_frame") ?? -1)
+        }
+    }
+
     @Test func retentionBoundsTheTotalBytes() throws {
+        let bound = 200
         let store = try makeStore(retention: RawFrameRetention(maxAgeMillis: EpochMillis.millisPerDay, maxFrames: 1_000,
-                                                               maxTotalBytes: 100))
+                                                               maxTotalBytes: bound))
         try store.setRawCaptureEnabled(true)
+        // Characteristic UUID (36 bytes) + "ok" + "band-A" count as well as the payload.
+        let overhead = FormaStore.rawFrameSize(frame(t0, size: 0))
+        #expect(overhead == 44)
         for index in 0..<20 {
             try store.recordRawFrame(frame(t0 + Int64(index), size: 30))
-            #expect(try frameStats(store).bytes <= 100)
+            #expect(try storedSize(store) <= bound)
         }
         #expect(try store.rawFrames(limit: 1).first?.receivedAt == t0 + 19)
         // A frame that alone exceeds the byte bound is not stored (and evicts nothing).
         let before = try frameStats(store)
-        try store.recordRawFrame(frame(t0 + 100, size: 101))
+        try store.recordRawFrame(frame(t0 + 100, size: bound - overhead + 1))
         #expect(try frameStats(store) == before)
         // A frame of exactly the bound is kept, alone.
-        try store.recordRawFrame(frame(t0 + 101, size: 100))
-        #expect(try frameStats(store) == (1, 100))
+        try store.recordRawFrame(frame(t0 + 101, size: bound - overhead))
+        #expect(try frameStats(store) == (1, bound - overhead))
+        #expect(try storedSize(store) == bound)
+    }
+
+    @Test func verboseDiagnosticTextCountsTowardsTheByteBound() throws {
+        let store = try makeStore(retention: RawFrameRetention(maxAgeMillis: EpochMillis.millisPerDay, maxFrames: 1_000,
+                                                               maxTotalBytes: 10_000))
+        try store.setRawCaptureEnabled(true)
+        for index in 0..<50 {
+            // Tiny payloads with a long parse status: before, only the payload was counted.
+            try store.recordRawFrame(RawFrameRecord(deviceID: deviceA, receivedAt: t0 + Int64(index), characteristic: "c",
+                                                    bytes: Data([1]), parseStatus: String(repeating: "e", count: 1_000)))
+            #expect(try storedSize(store) <= 10_000)
+        }
+        #expect(try frameStats(store).count < 10)
+        // A frame whose text alone exceeds the bound is not stored.
+        try store.recordRawFrame(RawFrameRecord(deviceID: nil, receivedAt: t0 + 99, characteristic: "c", bytes: Data(),
+                                                parseStatus: String(repeating: "\u{1F600}", count: 2_600)))
+        #expect(try store.rawFrames(limit: 1).first?.receivedAt == t0 + 49)
     }
 
     @Test func retentionDropsFramesOlderThanTheAgeBound() throws {

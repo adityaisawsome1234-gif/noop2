@@ -24,6 +24,13 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case unsupportedBackupVersion(found: Int, supported: Int)
     /// A file could not be created, read, written or deleted.
     case fileError(String)
+    /// The database file is damaged or is not an SQLite database (`SQLITE_CORRUPT` / `SQLITE_NOTADB`
+    /// while opening). It was not modified; `FormaStore.destroyDatabaseFiles(at:)` removes it so a
+    /// fresh, empty store can be created.
+    case databaseUnreadable(String)
+    /// A long-running operation stopped before finishing, for example an import during which all
+    /// data was deleted. The detail says what was and was not applied.
+    case interrupted(String)
 
     public var description: String {
         switch self {
@@ -40,8 +47,16 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .unsupportedBackupVersion(let found, let supported):
             return "The backup uses format version \(found), but this build reads up to \(supported). Update Forma."
         case .fileError(let detail): return "File error: \(detail)"
+        case .databaseUnreadable(let detail):
+            return "The database file is damaged or is not a database (\(detail)). It was left unchanged."
+        case .interrupted(let detail): return "The operation stopped: \(detail)"
         }
     }
+}
+
+/// `localizedDescription` (and SwiftUI's error alerts) show `description`.
+extension StoreError: LocalizedError {
+    public var errorDescription: String? { description }
 }
 
 /// Bounds for diagnostics raw-frame capture. All three are always enforced (oldest frames are
@@ -51,8 +66,10 @@ public struct RawFrameRetention: Hashable, Sendable {
     public let maxAgeMillis: Int64
     /// Maximum number of stored frames (at least 1).
     public let maxFrames: Int
-    /// Maximum summed payload size of stored frames, in bytes (at least 1). A single frame larger
-    /// than this is not stored at all.
+    /// Maximum summed size of stored frames, in bytes (at least 1). A frame's size is its payload plus
+    /// the UTF-8 bytes of its characteristic, parse status and device ID, so verbose diagnostic text
+    /// counts too. A single frame larger than this is not stored at all, and when the bound is lowered
+    /// (for example between launches) frames are deleted until the stored total fits again.
     public let maxTotalBytes: Int
 
     public init(maxAgeMillis: Int64, maxFrames: Int, maxTotalBytes: Int) {

@@ -14,8 +14,9 @@ public struct ZoneDurations: Hashable, Sendable, Codable {
         millis.indices.contains(zone) ? millis[zone] : nil
     }
 
-    /// Sum over all zones (equals the covered time of the workout).
-    public var totalMillis: Int64 { millis.reduce(0, +) }
+    /// Sum over all zones (equals the covered time of the workout). Saturates at `Int64.max`/`.min`
+    /// instead of trapping when the values were decoded from a corrupted record.
+    public var totalMillis: Int64 { IntMath.saturatingSum(millis) }
 }
 
 /// Heart-rate summary of one workout (spec `forma.workout.summary`).
@@ -26,11 +27,13 @@ public struct WorkoutSummary: Hashable, Sendable, Codable {
     public var durationMillis: Int64?
     /// Covered ms / workout ms (0…1); nil for an empty or invalid range.
     public var coverage: Double?
-    /// Usable canonical samples inside the workout.
+    /// Usable canonical samples inside the workout (0 for an empty range; an invalid range is not
+    /// evaluated and also reports 0, with `coverage` nil).
     public var usableSampleCount: Int
     /// Time-weighted mean over coverage spans, bpm, rounded to 0.1.
     public var meanHeartRate: MetricValue<Double>
-    /// Highest usable sample inside the workout, bpm (single-sample statistic: artifact-sensitive).
+    /// Peak heart rate observed in the workout: the highest usable sample inside it, bpm (a single-sample
+    /// statistic, so artifact-sensitive). Not the HRmax used for zones, which is in `zoneThresholds`.
     public var maxHeartRate: MetricValue<Int>
     /// Zone bounds used (available even when the workout has no heart rate).
     public var zoneThresholds: MetricValue<ZoneThresholds>
@@ -60,7 +63,7 @@ public struct WorkoutSummary: Hashable, Sendable, Codable {
 /// Every optional value is withheld (nil, with the reason) when the workout has no usable samples
 /// (`insufficientData`) or when usable heart rate covers less than 50 % of it (`lowQuality`).
 /// Confidence follows coverage (≥ 90 % high, ≥ 70 % moderate, otherwise low); zone time and load are
-/// further capped at `.moderate` when HRmax is estimated from age.
+/// further capped at `.low` when HRmax is estimated from age (``MaxHeartRate/confidenceCap``).
 public enum WorkoutAnalyzer {
     /// Minimum heart-rate coverage of the workout for any heart-rate value.
     public static let minimumCoverage = TrainingLoad.workoutMinimumCoverage
@@ -101,7 +104,11 @@ public enum WorkoutAnalyzer {
         if let failure = gate.failure {
             mean = spec.unavailable(failure, coverage: coverage, window: range, inputs: inputs)
             maxHR = spec.unavailable(failure, coverage: coverage, window: range, inputs: inputs)
-            timeInZones = zoneSpec.unavailable(failure, coverage: coverage, window: range, inputs: inputs)
+            // A missing setting (HRmax, resting HR) is the reason a person can act on, so it comes first.
+            timeInZones = thresholds.value == nil
+                ? zoneSpec.unavailable(thresholds.availability, coverage: coverage, window: range,
+                                       inputs: inputs.merging(thresholds.inputs) { a, _ in a })
+                : zoneSpec.unavailable(failure, coverage: coverage, window: range, inputs: inputs)
         } else {
             let confidence = Confidence.forAvailable(coverage: coverage)
             let (covered, weighted) = series.index.integrate(range)
