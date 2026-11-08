@@ -1,0 +1,40 @@
+# Continuous integration for Forma. Runs only when you push this repository to GitHub.
+#  - linux: FormaKit tests with Swift 6.4 + no-network audit
+#  - ios:   FormaKit tests on macOS and an unsigned iOS Simulator build of the app with Xcode 27
+# No secrets are needed; nothing is signed or uploaded.
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    container: swift:6.4.2-noble
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SQLite headers
+        run: apt-get update && apt-get install -y libsqlite3-dev
+      - name: FormaKit tests
+        run: swift test --package-path FormaKit
+      - name: No-network audit
+        run: bash Tools/audit-no-network.sh
+
+  ios:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 27
+        run: |
+          XC=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then echo "Xcode 27 not found on this runner image"; ls /Applications; exit 1; fi
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+      - name: FormaKit tests (macOS)
+        run: swift test --package-path FormaKit
+      - name: Build app for iOS Simulator (unsigned)
+        run: |
+          xcodebuild -project Forma.xcodeproj -scheme Forma \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build | tail -n 200
