@@ -61,4 +61,7 @@ extension UIWindow.Level {
 @MainActor open class UIApplication: UIResponder {
     open class var shared: UIApplication { UIApplication() }
     open var connectedScenes: Set<UIScene> { [] }
+    /// SDK: `UIApplication.State` (active, inactive, background).
+    public enum State: Int, Sendable { case active, inactive, background }
+    open var applicationState: UIApplication.State { .active }
 }

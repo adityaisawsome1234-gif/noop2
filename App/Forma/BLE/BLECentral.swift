@@ -7,21 +7,37 @@ import FormaFeatures
 
 /// Owns the app's single `CBCentralManager`.
 ///
-/// - Created once at process start with a constant restoration identifier (iOS 27 scene-based apps get
-///   no launch options, so the identifier is never derived from them).
-/// - Reconnects by keeping a pending `connect()` outstanding (pending connects never time out); applies
-///   backoff only after connection *failures*.
-/// - Scans only when the user is choosing a band: filtered by service UUIDs, time-boxed to 30 s.
-///   Unfiltered scanning is offered only explicitly, in the foreground.
+/// - Created with a constant restoration identifier (iOS 27 scene-based apps get no launch options, so the
+///   identifier is never derived from them). A connection iOS restores is set up with `defaultProfile` at
+///   once: on a relaunch for a Bluetooth event the app model may ask for it late, or not at all.
+/// - Keeps a pending `connect()` outstanding while collection is on (pending connects never time out). A
+///   failed attempt, or a connection that drops before it stayed up for a while, backs off before the next
+///   attempt. The backoff wait holds a process assertion, and when iOS ends it early the connect is issued
+///   at once, so Forma is never suspended with nothing pending that could wake it again.
+/// - Notifications that arrive while a connection is being set up are kept, in order, and handed to its
+///   link right after `.ready`.
+/// - Scans only when the user is choosing a band: filtered by service UUIDs, time-boxed to 30 s (and
+///   stopped before Forma is suspended). Unfiltered scanning is offered only explicitly, in the foreground.
+///   A scan iOS restored after terminating Forma is stopped.
 /// - All Core Bluetooth calls happen on `queue`, the same serial queue that receives delegate callbacks.
 final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
     static let restoreIdentifier = "com.forma.central.v1"
     private static let selectedPeripheralKey = "forma.selectedPeripheralID"
+    /// A connection that stays up this long resets the failure count; one that drops sooner counts as a
+    /// failed attempt (so a band that accepts and then drops the link at once is retried with backoff).
+    private static let stableConnectionSeconds: TimeInterval = 30
+    /// Notifications kept while a connection is set up (a pairing prompt can hold setup up for a while).
+    private static let setupEventLimit = 4_096
+    private static let scanSeconds: Double = 30
 
     let queue = DispatchQueue(label: "com.forma.ble", qos: .userInitiated)
+    private let queueKey = DispatchSpecificKey<Bool>()
     private var central: CBCentralManager!
     private let handlerLock = NSLock()
     private var handler: (@Sendable (CentralEvent) -> Void)?
+    /// Events raised before the app model installs its handler (e.g. state restoration at launch),
+    /// delivered in order when it does.
+    private var pendingEvents: [CentralEvent] = []
 
     // State below is only touched on `queue`.
     private var target: CBPeripheral?
@@ -29,37 +45,60 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
     private var wantConnected = false
     private var consecutiveFailures = 0
     private let reconnectPolicy = ReconnectPolicy()
+    private var pendingReconnect: ProtectedDelay?
+    private var reconnectGeneration: UInt64 = 0
+    private var encryptionProblemReported = false
+
+    // The connection to `target` this central knows about (from its own connect, or adopted after restoration).
+    private var connectedPeripheralID: UUID?
+    private var setupInProgress = false
+    private var linkUpSince: Date?
+    /// The connection was cancelled because it could not be used: its disconnect counts as a failed attempt.
+    private var failNextDisconnect = false
     private var link: CoreBluetoothLink?
-    private var pendingNotifyConfirmations: Set<CBUUID> = []
-    private var discoveredForScan: [UUID: CBPeripheral] = [:]
-    private var scanStopWork: DispatchWorkItem?
+    private var writeChannel: GATTWriteChannel?
+    private var setupEvents: [LinkEvent] = []
     private var characteristicsByUUID: [String: CBCharacteristic] = [:]
-    private var pendingServiceDiscoveries = 0
+    private var pendingCharacteristicDiscoveries: Set<ObjectIdentifier> = []
+    private var pendingNotifyConfirmations: Set<ObjectIdentifier> = []
 
-    /// Profiles the app knows how to drive. Used for scan filters and post-discovery adapter selection.
+    // Scanning and restoration.
+    private var discoveredForScan: [UUID: CBPeripheral] = [:]
+    private var scanTimeBox: ProtectedDelay?
+    private var scanGeneration: UInt64 = 0
+    private var stopRestoredScan = false
+    private var unwantedRestoredPeripherals: [CBPeripheral] = []
+
+    /// Profiles the app knows how to drive. Used for scan filters and to label scan results.
     let knownProfiles: [GATTProfile]
+    /// Used for a connection the app model has not asked for (yet): one restored by iOS.
+    let defaultProfile: GATTProfile
 
-    init(knownProfiles: [GATTProfile]) {
+    init(knownProfiles: [GATTProfile], defaultProfile: GATTProfile) {
         self.knownProfiles = knownProfiles
+        self.defaultProfile = defaultProfile
         super.init()
-        central = CBCentralManager(delegate: self, queue: queue, options: [
-            CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier,
-            CBCentralManagerOptionShowPowerAlertKey: true,
-        ])
+        queue.setSpecific(key: queueKey, value: true)
+        // Created on `queue`: every delegate callback runs there too, so none can find `central` unset.
+        queue.sync {
+            central = CBCentralManager(delegate: self, queue: queue, options: [
+                CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier,
+                // Forma explains a switched-off Bluetooth itself, instead of a system alert on every launch.
+                CBCentralManagerOptionShowPowerAlertKey: false,
+            ])
+        }
     }
 
-    /// Events raised before the app model installs its handler (e.g. state restoration at launch) are
-    /// buffered and delivered when the handler is set, so nothing is lost.
-    private var pendingEvents: [CentralEvent] = []
-
     func setEventHandler(_ handler: @escaping @Sendable (CentralEvent) -> Void) {
-        let backlog: [CentralEvent] = handlerLock.withLock {
-            self.handler = handler
-            let b = pendingEvents
-            pendingEvents.removeAll()
-            return b
+        // On `queue`, where every event is raised: the backlog is delivered before any newer event.
+        queue.async {
+            let backlog: [CentralEvent] = self.handlerLock.withLock {
+                self.handler = handler
+                defer { self.pendingEvents.removeAll() }
+                return self.pendingEvents
+            }
+            for e in backlog { handler(e) }
         }
-        for e in backlog { handler(e) }
     }
 
     private func onEvent(_ event: CentralEvent) {
@@ -68,6 +107,11 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
             return handler
         }
         h?(event)
+    }
+
+    /// Runs `work` on `queue` and waits for it (directly when already there).
+    private func runOnQueue(_ work: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) == true { work() } else { queue.sync(execute: work) }
     }
 
     var savedPeripheralID: String? { Self.savedPeripheralUUID?.uuidString }
@@ -79,6 +123,11 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
         return UUID(uuidString: s)
     }
 
+    /// Forgets the saved band without a central (nothing to cancel when none was ever created).
+    static func forgetSavedPeripheral() {
+        savePeripheralID(nil)
+    }
+
     private static func savePeripheralID(_ id: UUID?) {
         if let id { UserDefaults.standard.set(id.uuidString, forKey: selectedPeripheralKey) }
         else { UserDefaults.standard.removeObject(forKey: selectedPeripheralKey) }
@@ -86,12 +135,15 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
 
     // MARK: Public API (thread-safe; hops to `queue`)
 
-    /// Start keeping the selected band connected (collection on).
+    /// Start keeping the selected band connected (collection on). This also resumes reconnecting after it
+    /// backed off or paused: the failure count starts again.
     func connectSelected(profile: GATTProfile) {
         queue.async {
             self.targetProfile = profile
             self.wantConnected = true
             self.consecutiveFailures = 0
+            self.encryptionProblemReported = false
+            self.cancelPendingReconnect()
             self.establishConnection()
         }
     }
@@ -100,7 +152,8 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
     func disconnect() {
         queue.async {
             self.wantConnected = false
-            if let p = self.target { self.central.cancelPeripheralConnection(p) }
+            self.cancelPendingReconnect()
+            if let p = self.target, self.central.state == .poweredOn { self.central.cancelPeripheralConnection(p) }
         }
     }
 
@@ -108,67 +161,98 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
         guard let peripheralID = UUID(uuidString: peripheralID) else { return }
         queue.async {
             Self.savePeripheralID(peripheralID)
-            if let current = self.target, current.identifier != peripheralID {
-                self.central.cancelPeripheralConnection(current)
-                self.target = nil
-            }
-            self.target = self.discoveredForScan[peripheralID]
-                ?? self.central.retrievePeripherals(withIdentifiers: [peripheralID]).first
             self.targetProfile = profile
+            if let current = self.target, current.identifier != peripheralID {
+                self.release(current, reason: "another band was selected")
+            }
+            if self.target == nil {
+                self.target = self.discoveredForScan[peripheralID]
+                    ?? (self.central.state == .poweredOn ? self.central.retrievePeripherals(withIdentifiers: [peripheralID]).first : nil)
+            }
         }
     }
 
     func forgetSelected() {
         queue.async {
             self.wantConnected = false
-            if let p = self.target { self.central.cancelPeripheralConnection(p) }
-            self.target = nil
+            if let p = self.target { self.release(p, reason: "band forgotten") }
             Self.savePeripheralID(nil)
         }
     }
 
     func startScan(includeUnfiltered: Bool) {
-        queue.async {
-            guard self.central.state == .poweredOn else {
-                self.onEvent(.bluetoothProblem(Self.describe(self.central.state)))
-                return
-            }
-            self.central.stopScan()
-            self.discoveredForScan.removeAll()
-            // Bands already connected to this iPhone (e.g. by another app) do not need to advertise.
-            let connectedServices = self.knownProfiles.flatMap { [$0.vendorService].compactMap { $0 } } + [UUIDs.heartRateService]
-            let connected = self.central.retrieveConnectedPeripherals(withServices: connectedServices.map { CBUUID(string: $0) })
-            for p in connected {
-                self.discoveredForScan[p.identifier] = p
-                let device = DiscoveredDevice(id: p.identifier.uuidString, name: p.name, rssi: nil, family: self.family(name: p.name, services: []),
-                                              advertisedServiceUUIDs: [], manufacturerDataHex: nil, connectedToThisPhone: true,
-                                              lastSeen: EpochMillis(date: Date()))
-                self.onEvent(.discovered(device, advertisement: [:]))
-            }
-            let filter: [CBUUID]? = includeUnfiltered ? nil
-                : Array(Set(self.knownProfiles.flatMap { $0.scanServiceFilter } + [UUIDs.heartRateService])).map { CBUUID(string: $0) }
-            self.central.scanForPeripherals(withServices: filter, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
-            self.onEvent(.connectionEvent(ConnectionEvent(deviceID: nil, timestamp: EpochMillis(date: Date()), kind: .scanStarted,
-                                                          detail: includeUnfiltered ? "unfiltered (foreground)" : "filtered")))
-            self.scanStopWork?.cancel()
-            let work = DispatchWorkItem { [weak self] in self?.stopScanOnQueue() }
-            self.scanStopWork = work
-            self.queue.asyncAfter(deadline: .now() + 30, execute: work)
-        }
+        queue.async { self.startScanOnQueue(includeUnfiltered: includeUnfiltered) }
     }
 
     func stopScan() {
         queue.async { self.stopScanOnQueue() }
     }
 
+    // MARK: Scanning (on queue)
+
+    private func startScanOnQueue(includeUnfiltered: Bool) {
+        guard central.state == .poweredOn else {
+            onEvent(.bluetoothProblem(Self.describe(central.state)))
+            // No scan started: the picker must not keep waiting for one.
+            onEvent(.scanStopped)
+            return
+        }
+        stopRestoredScan = false
+        central.stopScan()
+        discoveredForScan.removeAll()
+        reportConnectedBands()
+        let filter: [CBUUID]? = includeUnfiltered ? nil
+            : Array(Set(knownProfiles.flatMap { $0.scanServiceFilter } + [UUIDs.heartRateService])).map { CBUUID(string: $0) }
+        central.scanForPeripherals(withServices: filter, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        onEvent(.connectionEvent(ConnectionEvent(deviceID: nil, timestamp: EpochMillis(date: Date()), kind: .scanStarted,
+                                                 detail: includeUnfiltered ? "unfiltered (foreground)" : "filtered")))
+        // The time-box holds a process assertion: if Forma leaves the foreground with the picker open, the
+        // scan stops before iOS suspends Forma instead of running on unattended.
+        cancelScanTimeBox()
+        let generation = scanGeneration
+        scanTimeBox = ProtectedDelay(seconds: Self.scanSeconds, reason: "forma.scan") { [weak self] in
+            self?.runOnQueue { self?.scanTimeBoxEnded(generation) }
+        }
+    }
+
+    /// Bands already connected to this iPhone (e.g. by another app) do not need to advertise. One query per
+    /// service, so each band is labelled with the service it was found by.
+    private func reportConnectedBands() {
+        var found: [UUID: (peripheral: CBPeripheral, services: [String])] = [:]
+        let services = Array(Set(knownProfiles.compactMap(\.vendorService) + [UUIDs.heartRateService]))
+        for service in services {
+            for p in central.retrieveConnectedPeripherals(withServices: [CBUUID(string: service)]) {
+                found[p.identifier, default: (peripheral: p, services: [])].services.append(service)
+            }
+        }
+        for entry in found.values {
+            let p = entry.peripheral
+            discoveredForScan[p.identifier] = p
+            let device = DiscoveredDevice(id: p.identifier.uuidString, name: p.name, rssi: nil, family: family(name: p.name, services: entry.services),
+                                          advertisedServiceUUIDs: [], manufacturerDataHex: nil, connectedToThisPhone: true,
+                                          lastSeen: EpochMillis(date: Date()))
+            onEvent(.discovered(device, advertisement: [:]))
+        }
+    }
+
     private func stopScanOnQueue() {
-        scanStopWork?.cancel()
-        scanStopWork = nil
+        cancelScanTimeBox()
         if central.isScanning {
             central.stopScan()
             onEvent(.connectionEvent(ConnectionEvent(deviceID: nil, timestamp: EpochMillis(date: Date()), kind: .scanStopped)))
         }
         onEvent(.scanStopped)
+    }
+
+    private func scanTimeBoxEnded(_ generation: UInt64) {
+        guard generation == scanGeneration else { return } // the scan was stopped or restarted meanwhile
+        stopScanOnQueue()
+    }
+
+    private func cancelScanTimeBox() {
+        scanGeneration &+= 1
+        scanTimeBox?.cancel()
+        scanTimeBox = nil
     }
 
     // MARK: Connection management (on queue)
@@ -185,9 +269,17 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
         p.delegate = self
         switch p.state {
         case .connected:
-            discover(p)
+            // Connected before this process knew about it (state restoration): adopt the connection.
+            if connectedPeripheralID != p.identifier { beginConnection(p) }
+            if link != nil {
+                onEvent(.stateChanged(.connected)) // already set up: a repeated request only re-reports the state
+            } else if setupInProgress {
+                onEvent(.stateChanged(.connecting))
+            } else {
+                setUp(p)
+            }
         case .connecting:
-            onEvent(.stateChanged(.connecting))
+            onEvent(.stateChanged(.searching)) // a pending connect is already outstanding
         default:
             onEvent(.stateChanged(.searching))
             central.connect(p, options: nil) // pending connect: completes whenever the band is in range
@@ -195,41 +287,91 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
         }
     }
 
-    private func discover(_ p: CBPeripheral) {
-        guard let profile = targetProfile else { return }
+    /// Starts tracking a connection to `p`; nothing from an earlier connection carries over.
+    private func beginConnection(_ p: CBPeripheral) {
+        endConnection(reason: "replaced by a new connection")
+        connectedPeripheralID = p.identifier
+        writeChannel = GATTWriteChannel(peripheral: p, queue: queue)
+        failNextDisconnect = false
+    }
+
+    /// Forgets the current connection: closes its link, fails its writes and drops what setup collected.
+    private func endConnection(reason: String) {
+        link?.close(reason: reason, at: EpochMillis(date: Date()))
+        link = nil
+        writeChannel?.failAll()
+        writeChannel = nil
+        connectedPeripheralID = nil
+        setupInProgress = false
+        linkUpSince = nil
+        setupEvents.removeAll()
         characteristicsByUUID.removeAll()
+        pendingCharacteristicDiscoveries.removeAll()
+        pendingNotifyConfirmations.removeAll()
+    }
+
+    /// Stops using `p`: cancels its connection and any pending reconnect, and closes its link. Callbacks that
+    /// still arrive for it are ignored.
+    private func release(_ p: CBPeripheral, reason: String) {
+        cancelPendingReconnect()
+        if central.state == .poweredOn { central.cancelPeripheralConnection(p) }
+        endConnection(reason: reason)
+        failNextDisconnect = false
+        target = nil
+    }
+
+    /// Gives up on a connection that cannot be used. Its disconnect counts as a failed attempt, so a band that
+    /// keeps failing this way is retried with backoff instead of in a tight loop.
+    private func abandon(_ p: CBPeripheral, reason: String) {
+        onEvent(.connectionEvent(ConnectionEvent(deviceID: p.identifier.uuidString, timestamp: EpochMillis(date: Date()),
+                                                 kind: .connectFailed, detail: reason)))
+        setupInProgress = false
+        setupEvents.removeAll()
+        failNextDisconnect = true
+        central.cancelPeripheralConnection(p)
+    }
+
+    private func isSettingUp(_ p: CBPeripheral) -> Bool {
+        setupInProgress && connectedPeripheralID == p.identifier
+    }
+
+    /// Discovers services and characteristics (reusing what the connection already knows, e.g. after state
+    /// restoration), enables notifications and reads device information, then hands over a link.
+    private func setUp(_ p: CBPeripheral) {
+        setupInProgress = true
+        characteristicsByUUID.removeAll()
+        pendingCharacteristicDiscoveries.removeAll()
         pendingNotifyConfirmations.removeAll()
         onEvent(.stateChanged(.connecting))
-        // Reuse already-discovered services (e.g. after state restoration).
         if let services = p.services, !services.isEmpty {
-            pendingServiceDiscoveries = services.count
             for s in services {
                 if let chars = s.characteristics, !chars.isEmpty {
-                    register(chars, on: p)
-                    pendingServiceDiscoveries -= 1
+                    register(chars)
                 } else {
+                    pendingCharacteristicDiscoveries.insert(ObjectIdentifier(s))
                     p.discoverCharacteristics(nil, for: s)
                 }
             }
-            if pendingServiceDiscoveries == 0 { subscribe(p) }
+            if pendingCharacteristicDiscoveries.isEmpty { subscribe(p) }
             return
         }
+        let profile = targetProfile ?? defaultProfile
         // An empty list means "discover everything" (used when the band's family is not known yet).
         p.discoverServices(profile.discoverServices.isEmpty ? nil : profile.discoverServices.map { CBUUID(string: $0) })
     }
 
-    private func register(_ characteristics: [CBCharacteristic], on p: CBPeripheral) {
+    private func register(_ characteristics: [CBCharacteristic]) {
         for c in characteristics {
             characteristicsByUUID[UUIDs.normalize(c.uuid.uuidString)] = c
         }
     }
 
     private func subscribe(_ p: CBPeripheral) {
-        guard let profile = targetProfile else { return }
+        let profile = targetProfile ?? defaultProfile
         for uuid in profile.subscribeCharacteristics {
             guard let c = characteristicsByUUID[uuid], c.properties.contains(.notify) || c.properties.contains(.indicate) else { continue }
             if c.isNotifying { continue }
-            pendingNotifyConfirmations.insert(c.uuid)
+            pendingNotifyConfirmations.insert(ObjectIdentifier(c))
             p.setNotifyValue(true, for: c)
         }
         // One-shot reads: device information and battery level (decoded by the adapter like notifications).
@@ -240,6 +382,12 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
     }
 
     private func finishSetup(_ p: CBPeripheral) {
+        setupInProgress = false
+        // Collection was turned off while setting up: the connection is being cancelled, so no link.
+        guard wantConnected else {
+            setupEvents.removeAll()
+            return
+        }
         var services: [String: [String]] = [:]
         var summaries: [GATTServiceSummary] = []
         for s in p.services ?? [] {
@@ -251,26 +399,103 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
                                           properties: Self.describe($0.properties), notifying: $0.isNotifying)
             }))
         }
-        let newLink = CoreBluetoothLink(peripheral: p, queue: queue, characteristics: characteristicsByUUID)
-        link?.close(reason: "replaced by new connection", at: EpochMillis(date: Date()))
+        let channel = writeChannel ?? GATTWriteChannel(peripheral: p, queue: queue)
+        writeChannel = channel
+        link?.close(reason: "replaced by a new link", at: EpochMillis(date: Date()))
+        let newLink = CoreBluetoothLink(peripheral: p, queue: queue, characteristics: characteristicsByUUID, writes: channel,
+                                        onConsumerGone: { [weak self] gone in self?.linkConsumerGone(gone) },
+                                        onOverflow: { [weak self] full in self?.linkOverflowed(full) })
         link = newLink
+        if linkUpSince == nil { linkUpSince = Date() }
         newLink.emit(.ready(services: services))
-        consecutiveFailures = 0
+        // Notifications and reads that arrived during setup, in arrival order and with their own receive times.
+        let early = setupEvents
+        setupEvents.removeAll()
+        for e in early { newLink.emit(e) }
         onEvent(.stateChanged(.connected))
         onEvent(.connectionEvent(ConnectionEvent(deviceID: p.identifier.uuidString, timestamp: EpochMillis(date: Date()), kind: .servicesDiscovered,
                                                  detail: "\(services.count) services")))
         onEvent(.linkReady(newLink, services: summaries))
     }
 
-    private func scheduleReconnect(after failure: Bool) {
+    /// The app model stopped reading `gone` (its sync engine was stopped). While collection stays on, the
+    /// connection gets a fresh link, so an engine the model starts next always has one to read — also when the
+    /// model's request to connect was handled before the old reader went away.
+    private func linkConsumerGone(_ gone: CoreBluetoothLink) {
+        guard gone === link else { return }
+        link = nil
+        // One hop later: the model usually stops its engine right before selecting another band, forgetting
+        // this one or turning collection off, and those requests (already queued) are honoured first.
+        queue.async { [weak self] in self?.setUpAgainIfWanted() }
+    }
+
+    private func setUpAgainIfWanted() {
+        guard wantConnected, link == nil, !setupInProgress, let p = target, p.identifier == connectedPeripheralID,
+              p.state == .connected else { return }
+        setUp(p)
+    }
+
+    /// The app model fell so far behind that the link could not keep every notification, so the link ended.
+    /// Restart the connection rather than continue across the hole; the band keeps whatever history was not
+    /// acknowledged.
+    private func linkOverflowed(_ full: CoreBluetoothLink) {
+        guard full === link, let p = target, p.identifier == connectedPeripheralID else { return }
+        link = nil
+        abandon(p, reason: "notifications arrived faster than they could be stored; reconnecting")
+    }
+
+    // MARK: Reconnecting (on queue)
+
+    /// After a disconnect or a failed attempt. A disconnect after a connection that stayed up re-issues the
+    /// pending connect at once; failures back off.
+    private func scheduleReconnect(failure: Bool) {
+        cancelPendingReconnect()
         guard wantConnected else { return }
-        if failure { consecutiveFailures += 1 }
-        let delay = reconnectPolicy.delay(afterFailures: failure ? consecutiveFailures : 0, jitterUnit: Double.random(in: 0..<1))
-        if delay > 0 {
-            onEvent(.connectionEvent(ConnectionEvent(deviceID: target?.identifier.uuidString, timestamp: EpochMillis(date: Date()),
-                                                     kind: .reconnectScheduled, detail: "in \(Int(delay)) s")))
+        consecutiveFailures = failure ? consecutiveFailures + 1 : 0
+        let delay = reconnectPolicy.delay(afterFailures: consecutiveFailures, jitterUnit: Double.random(in: 0..<1))
+        guard delay > 0 else {
+            establishConnection()
+            return
         }
-        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.establishConnection() }
+        let now = EpochMillis(date: Date())
+        onEvent(.stateChanged(.disconnected(since: now)))
+        onEvent(.connectionEvent(ConnectionEvent(deviceID: target?.identifier.uuidString, timestamp: now, kind: .reconnectScheduled,
+                                                 detail: "in \(Int(delay.rounded())) s, after \(consecutiveFailures) failed attempt(s)")))
+        // The wait holds a process assertion. If iOS refuses it, or ends it before the delay is over (Forma is
+        // about to be suspended), the connect is issued at once: a timer cannot fire in a suspended app, and
+        // without a pending connect nothing would wake Forma again.
+        let generation = reconnectGeneration
+        pendingReconnect = ProtectedDelay(seconds: delay, reason: "forma.reconnect") { [weak self] in
+            self?.runOnQueue { self?.reconnectDelayEnded(generation) }
+        }
+    }
+
+    private func reconnectDelayEnded(_ generation: UInt64) {
+        guard generation == reconnectGeneration else { return } // cancelled or replaced meanwhile
+        pendingReconnect = nil
+        establishConnection()
+    }
+
+    private func cancelPendingReconnect() {
+        reconnectGeneration &+= 1
+        pendingReconnect?.cancel()
+        pendingReconnect = nil
+    }
+
+    /// The band dropped its pairing with this iPhone. Every attempt would fail the same way until the user
+    /// forgets the band in iOS Settings, so reconnecting pauses until the app model asks again (selecting the
+    /// band, or reopening Forma).
+    private func pauseForLostPairing() {
+        wantConnected = false
+        cancelPendingReconnect()
+        onEvent(.stateChanged(.disconnected(since: EpochMillis(date: Date()))))
+        onEvent(.pairingProblem("The band no longer recognizes this iPhone's pairing. Forget the band in iOS Settings → Bluetooth, then select it again in Forma. Forma stops reconnecting until you reopen it or select the band."))
+    }
+
+    private func reportEncryptionProblemIfNeeded(_ error: Error?) {
+        guard !encryptionProblemReported, Self.isCBError(error, .encryptionTimedOut) else { return }
+        encryptionProblemReported = true
+        onEvent(.pairingProblem("Securing the connection to the band timed out. If iOS shows a Bluetooth pairing request, accept it; Forma does not bypass pairing."))
     }
 
     // MARK: Helpers
@@ -342,37 +567,67 @@ final class BLECentral: NSObject, BandCentral, @unchecked Sendable {
             || error.code == CBATTError.Code.insufficientEncryption.rawValue
             || error.code == CBATTError.Code.insufficientEncryptionKeySize.rawValue
     }
+
+    /// A Core Bluetooth error (`CBErrorDomain`) with this code; other domains reuse the same numbers.
+    static func isCBError(_ error: Error?, _ code: CBError.Code) -> Bool {
+        guard let error = error as NSError?, error.domain == CBErrorDomain else { return false }
+        return error.code == code.rawValue
+    }
 }
 
 // MARK: - CBCentralManagerDelegate
 
 extension BLECentral: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        onEvent(.bluetoothProblem(Self.describe(central.state)))
-        if let unavailable = Self.linkState(for: central.state) {
+        let state = central.state
+        onEvent(.bluetoothProblem(Self.describe(state)))
+        if let unavailable = Self.linkState(for: state) {
             onEvent(.stateChanged(unavailable))
             onEvent(.connectionEvent(ConnectionEvent(deviceID: target?.identifier.uuidString, timestamp: EpochMillis(date: Date()),
-                                                     kind: central.state == .poweredOff ? .bluetoothOff : .unauthorized,
-                                                     detail: Self.describe(central.state))))
-            link?.close(reason: "Bluetooth unavailable", at: EpochMillis(date: Date()))
-            link = nil
+                                                     kind: state == .unauthorized ? .unauthorized : .bluetoothOff,
+                                                     detail: Self.describe(state))))
+            cancelPendingReconnect()
+            endConnection(reason: "Bluetooth unavailable")
+            failNextDisconnect = false
+            if scanTimeBox != nil {
+                cancelScanTimeBox()
+                onEvent(.scanStopped)
+            }
+            if state != .poweredOff {
+                // Below "powered off" every CBPeripheral of this manager is invalid; the band is retrieved again
+                // by its saved identifier once Bluetooth is back.
+                target = nil
+                discoveredForScan.removeAll()
+                unwantedRestoredPeripherals.removeAll()
+            }
             return
         }
         onEvent(.connectionEvent(ConnectionEvent(deviceID: target?.identifier.uuidString, timestamp: EpochMillis(date: Date()), kind: .bluetoothOn)))
+        // Restored state Forma does not want: a scan whose picker is gone, and peripherals other than the band.
+        if stopRestoredScan {
+            stopRestoredScan = false
+            stopScanOnQueue()
+        }
+        for p in unwantedRestoredPeripherals { central.cancelPeripheralConnection(p) }
+        unwantedRestoredPeripherals.removeAll()
         establishConnection()
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
         let saved = Self.savedPeripheralUUID
-        if let p = restored.first(where: { $0.identifier == saved }) ?? restored.first {
+        // Only the selected band is adopted; setup finishes with `defaultProfile` once Bluetooth is on
+        // (centralManagerDidUpdateState → establishConnection), without waiting for the app model.
+        if let saved, let p = restored.first(where: { $0.identifier == saved }) {
             target = p
             p.delegate = self
             wantConnected = true
         }
+        unwantedRestoredPeripherals = restored.filter { $0.identifier != saved }
+        stopRestoredScan = dict[CBCentralManagerRestoredStateScanServicesKey] != nil
         onEvent(.connectionEvent(ConnectionEvent(deviceID: target?.identifier.uuidString, timestamp: EpochMillis(date: Date()),
-                                                 kind: .restoredByOS, detail: "\(restored.count) peripheral(s)")))
-        // Remaining work happens in centralManagerDidUpdateState(.poweredOn) → establishConnection().
+                                                 kind: .restoredByOS,
+                                                 detail: "\(restored.count) peripheral(s)" + (stopRestoredScan ? ", scan (stopped)" : ""))))
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
@@ -401,29 +656,62 @@ extension BLECentral: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard peripheral.identifier == target?.identifier, wantConnected else {
+            // No longer wanted: another band was selected, or collection was turned off meanwhile.
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         onEvent(.connectionEvent(ConnectionEvent(deviceID: peripheral.identifier.uuidString, timestamp: EpochMillis(date: Date()), kind: .connected)))
         peripheral.delegate = self
-        discover(peripheral)
+        cancelPendingReconnect()
+        // Already adopted (restoration set it up before this callback arrived): nothing to redo.
+        if connectedPeripheralID == peripheral.identifier, link != nil || setupInProgress { return }
+        beginConnection(peripheral)
+        setUp(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        guard peripheral.identifier == target?.identifier else { return }
         onEvent(.connectionEvent(ConnectionEvent(deviceID: peripheral.identifier.uuidString, timestamp: EpochMillis(date: Date()),
                                                  kind: .connectFailed, detail: error?.localizedDescription)))
-        onEvent(.stateChanged(.disconnected(since: EpochMillis(date: Date()))))
-        scheduleReconnect(after: true)
+        endConnection(reason: "connection failed")
+        failNextDisconnect = false
+        // Bluetooth went away meanwhile: its state is what the app shows, and `.poweredOn` reconnects.
+        guard central.state == .poweredOn else { return }
+        if Self.isCBError(error, .peerRemovedPairingInformation) {
+            pauseForLostPairing()
+            return
+        }
+        reportEncryptionProblemIfNeeded(error)
+        guard wantConnected else {
+            onEvent(.stateChanged(.disconnected(since: EpochMillis(date: Date()))))
+            return
+        }
+        scheduleReconnect(failure: true)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        // A band that is no longer selected was released (and its link closed) when it was replaced.
+        guard peripheral.identifier == target?.identifier else { return }
         let now = EpochMillis(date: Date())
-        link?.close(reason: error?.localizedDescription ?? "disconnected", at: now)
-        link = nil
+        let stayedUp = linkUpSince.map { Date().timeIntervalSince($0) >= Self.stableConnectionSeconds } ?? false
+        let failure = failNextDisconnect || !stayedUp
+        failNextDisconnect = false
+        endConnection(reason: error?.localizedDescription ?? "disconnected")
         onEvent(.connectionEvent(ConnectionEvent(deviceID: peripheral.identifier.uuidString, timestamp: now, kind: .disconnected,
                                                  detail: error?.localizedDescription)))
-        onEvent(.stateChanged(wantConnected ? .searching : .disconnected(since: now)))
-        if (error as NSError?)?.code == CBError.Code.peerRemovedPairingInformation.rawValue {
-            onEvent(.pairingProblem("The band no longer recognizes this iPhone's pairing. Forget the band in iOS Settings → Bluetooth, then select it again in Forma."))
+        // Bluetooth went away meanwhile: its state is what the app shows, and `.poweredOn` reconnects.
+        guard central.state == .poweredOn else { return }
+        if Self.isCBError(error, .peerRemovedPairingInformation) {
+            pauseForLostPairing()
+            return
         }
-        scheduleReconnect(after: false) // re-issue a pending connect immediately
+        reportEncryptionProblemIfNeeded(error)
+        guard wantConnected else {
+            onEvent(.stateChanged(.disconnected(since: now)))
+            return
+        }
+        scheduleReconnect(failure: failure) // reports "searching" (pending connect) or "disconnected" (backing off)
     }
 }
 
@@ -431,47 +719,100 @@ extension BLECentral: CBCentralManagerDelegate {
 
 extension BLECentral: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard isSettingUp(peripheral) else { return }
         let services = peripheral.services ?? []
         guard error == nil, !services.isEmpty else {
-            onEvent(.connectionEvent(ConnectionEvent(deviceID: peripheral.identifier.uuidString, timestamp: EpochMillis(date: Date()),
-                                                     kind: .connectFailed, detail: "service discovery failed: \(error?.localizedDescription ?? "no services")")))
-            central.cancelPeripheralConnection(peripheral)
+            abandon(peripheral, reason: "service discovery failed: \(error?.localizedDescription ?? "no services")")
             return
         }
-        pendingServiceDiscoveries = services.count
+        pendingCharacteristicDiscoveries = Set(services.map { ObjectIdentifier($0) })
         for s in services { peripheral.discoverCharacteristics(nil, for: s) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        if let chars = service.characteristics { register(chars, on: peripheral) }
-        pendingServiceDiscoveries -= 1
-        if pendingServiceDiscoveries <= 0 { subscribe(peripheral) }
+        // Each service answers once; anything else (a repeat, or a reply from an earlier setup) is ignored.
+        guard isSettingUp(peripheral), pendingCharacteristicDiscoveries.remove(ObjectIdentifier(service)) != nil else { return }
+        if let chars = service.characteristics { register(chars) }
+        if pendingCharacteristicDiscoveries.isEmpty { subscribe(peripheral) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        guard peripheral.identifier == target?.identifier else { return }
         if Self.isPairingError(error) {
             onEvent(.pairingProblem("The band requires a paired (encrypted) connection for \(Self.name(for: UUIDs.normalize(characteristic.uuid.uuidString))). Accept the iOS pairing prompt, or the data path stays unavailable. Forma does not bypass pairing."))
         }
-        pendingNotifyConfirmations.remove(characteristic.uuid)
-        if pendingNotifyConfirmations.isEmpty, link == nil { finishSetup(peripheral) }
+        guard isSettingUp(peripheral), pendingNotifyConfirmations.remove(ObjectIdentifier(characteristic)) != nil else { return }
+        if pendingNotifyConfirmations.isEmpty { finishSetup(peripheral) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard peripheral.identifier == target?.identifier else { return }
         guard error == nil, let value = characteristic.value else {
             if Self.isPairingError(error) {
                 onEvent(.pairingProblem("Reading \(Self.name(for: UUIDs.normalize(characteristic.uuid.uuidString))) requires pairing."))
             }
             return
         }
-        link?.emit(.notification(characteristic: UUIDs.normalize(characteristic.uuid.uuidString), bytes: [UInt8](value),
-                                 receivedAt: EpochMillis(date: Date())))
+        let event = LinkEvent.notification(characteristic: UUIDs.normalize(characteristic.uuid.uuidString), bytes: [UInt8](value),
+                                           receivedAt: EpochMillis(date: Date()))
+        if let link {
+            link.emit(event)
+        } else if isSettingUp(peripheral) {
+            // Kept for the link this setup is about to hand over (e.g. the notification that relaunched Forma).
+            guard setupEvents.count < Self.setupEventLimit else {
+                abandon(peripheral, reason: "setup did not finish while notifications kept arriving")
+                return
+            }
+            setupEvents.append(event)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        link?.completeWrite(characteristic: UUIDs.normalize(characteristic.uuid.uuidString), error: error)
+        guard peripheral.identifier == connectedPeripheralID else { return }
+        writeChannel?.didWrite(key: UUIDs.normalize(characteristic.uuid.uuidString), error: error)
     }
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-        link?.readyForWriteWithoutResponse()
+        guard peripheral.identifier == connectedPeripheralID else { return }
+        writeChannel?.pump()
+    }
+}
+
+// MARK: - Protected delay
+
+/// Waits `seconds` while holding a process assertion (`performExpiringActivity`), then runs `action` once.
+/// If iOS refuses the assertion, or ends it before the time is up because Forma is about to be suspended,
+/// `action` runs at once instead: the work is done before suspension rather than by a timer that cannot fire
+/// in a suspended app. `cancel()` stops it (and releases the assertion) without running `action`.
+private final class ProtectedDelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private let wake = DispatchSemaphore(value: 0)
+    private let action: @Sendable () -> Void
+
+    init(seconds: Double, reason: String, action: @escaping @Sendable () -> Void) {
+        self.action = action
+        ProcessInfo.processInfo.performExpiringActivity(withReason: reason) { [self] expired in
+            if !expired { _ = wake.wait(timeout: .now() + seconds) }
+            fire()
+            wake.signal() // releases a first invocation still waiting after an early expiry
+        }
+    }
+
+    func cancel() {
+        let wasFinished: Bool = lock.withLock {
+            defer { finished = true }
+            return finished
+        }
+        if !wasFinished { wake.signal() }
+    }
+
+    private func fire() {
+        let run: Bool = lock.withLock {
+            if finished { return false }
+            finished = true
+            return true
+        }
+        if run { action() }
     }
 }

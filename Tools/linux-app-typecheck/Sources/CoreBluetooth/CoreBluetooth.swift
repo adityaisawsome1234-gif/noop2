@@ -4,11 +4,13 @@ public let CBCentralManagerOptionRestoreIdentifierKey = "kCBInitOptionRestoreIde
 public let CBCentralManagerOptionShowPowerAlertKey = "kCBInitOptionShowPowerAlert"
 public let CBCentralManagerScanOptionAllowDuplicatesKey = "kCBScanOptionAllowDuplicates"
 public let CBCentralManagerRestoredStatePeripheralsKey = "kCBRestoredPeripherals"
+public let CBCentralManagerRestoredStateScanServicesKey = "kCBRestoredScanServices"
 public let CBAdvertisementDataServiceUUIDsKey = "kCBAdvDataServiceUUIDs"
 public let CBAdvertisementDataLocalNameKey = "kCBAdvDataLocalName"
 public let CBAdvertisementDataManufacturerDataKey = "kCBAdvDataManufacturerData"
 public let CBAdvertisementDataIsConnectable = "kCBAdvDataIsConnectable"
 public let CBATTErrorDomain = "CBATTErrorDomain"
+public let CBErrorDomain = "CBErrorDomain"
 
 public enum CBManagerState: Int { case unknown = 0, resetting, unsupported, unauthorized, poweredOff, poweredOn }
 public enum CBPeripheralState: Int { case disconnected = 0, connecting, connected, disconnecting }
@@ -89,7 +91,13 @@ public protocol CBCentralManagerDelegate: AnyObject {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?)
 }
 
-open class CBManager: NSObject { open var state: CBManagerState { .unknown } }
+public enum CBManagerAuthorization: Int { case notDetermined = 0, restricted, denied, allowedAlways }
+
+open class CBManager: NSObject {
+    open var state: CBManagerState { .unknown }
+    /// iOS 13.1+: the app's Bluetooth authorization (reading it never shows the permission prompt).
+    open class var authorization: CBManagerAuthorization { .allowedAlways }
+}
 
 open class CBCentralManager: CBManager {
     open weak var delegate: CBCentralManagerDelegate?

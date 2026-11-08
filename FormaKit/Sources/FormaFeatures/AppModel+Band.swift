@@ -240,7 +240,12 @@ extension AppModel {
     }
 
     func startEngine(on link: any PeripheralLink, services: [GATTServiceSummary]) {
-        guard let store = liveStore else { return }
+        guard let store = liveStore else {
+            // Nothing could be saved (the database did not open): release the link instead of leaving it
+            // unconsumed, which would only end in overflow and reconnect cycles.
+            central.disconnect()
+            return
+        }
         // Own band only: a link to any other peripheral — or any link while no band is selected — is never
         // collected or labelled as the selected band's. (Not disconnected either: that would cancel the
         // pending connection to the band the user did select.)
