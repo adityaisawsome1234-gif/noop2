@@ -89,7 +89,7 @@ struct DeviceHubView: View {
         } header: {
             Text("Collection")
         } footer: {
-            Text("While collection is on, iOS usually reconnects to the band when it is back in range, also in the background. It does not after Bluetooth is turned off in Settings, after a restart until the iPhone is unlocked once, or after you swipe Forma away in the app switcher; open Forma again then. Heart rate the band sends through the standard heart-rate service is recorded whenever it is connected. “Request live heart-rate stream” asks bands that support Forma's request to stream heart rate as well, only while Forma is open (a running workout keeps it on until you finish); other bands ignore it. Values from that stream are not validated yet, so they appear only in Diagnostics.")
+            Text("While collection is on, iOS usually reconnects to the band when it is back in range, also in the background. It does not after Bluetooth is turned off in Settings, after a restart until the iPhone is unlocked once, or after you swipe Forma away in the app switcher; open Forma again then. Heart rate the band sends through the standard heart-rate service is recorded whenever it is connected. “Request live heart-rate stream” asks bands that support Forma's request to stream heart rate as well, only while it is on and Forma is open (a running workout keeps the request in the background until you finish); other bands ignore it. Values from that stream are not validated yet, so they appear only in Diagnostics.")
         }
     }
 
@@ -112,7 +112,7 @@ struct DeviceHubView: View {
         } header: {
             Text("History")
         } footer: {
-            Text(model.historySyncMode.explanation)
+            Text(model.historySyncMode.explanation(acknowledging: model.historyAcknowledgementEnabled))
         }
     }
 }

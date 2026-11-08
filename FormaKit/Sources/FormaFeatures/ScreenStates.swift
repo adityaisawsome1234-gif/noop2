@@ -127,6 +127,31 @@ public struct ReadinessCardState: Hashable, Sendable {
     }
 }
 
+/// Rows stored in the user's own database (Settings → Data → Export, import and delete).
+public struct StoredDataSummary: Hashable, Sendable {
+    public var heartRateSamples: Int
+    public var beatIntervals: Int
+    public var motionEpochs: Int
+    /// Other measurements (battery level, skin temperature, …).
+    public var otherMeasurements: Int
+    /// Sleep windows and workouts, including candidates and deleted ones.
+    public var sessions: Int
+    /// `[oldest, newest + 1 ms)` of the measurement times; nil without measurements.
+    public var range: TimeRange?
+
+    public init(heartRateSamples: Int, beatIntervals: Int, motionEpochs: Int, otherMeasurements: Int, sessions: Int,
+                range: TimeRange?) {
+        self.heartRateSamples = heartRateSamples
+        self.beatIntervals = beatIntervals
+        self.motionEpochs = motionEpochs
+        self.otherMeasurements = otherMeasurements
+        self.sessions = sessions
+        self.range = range
+    }
+
+    public var totalMeasurements: Int { heartRateSamples + beatIntervals + motionEpochs + otherMeasurements }
+}
+
 public struct TodayState: Hashable, Sendable {
     public var day: LocalDay
     public var latestHeartRate: LatestHeartRate?
@@ -138,9 +163,15 @@ public struct TodayState: Hashable, Sendable {
     public var calibration: CalibrationProgress?
     /// False until any measurement exists in the active store (drives the empty state).
     public var hasAnyData: Bool
+    /// Band-history heart rate of the last 24 h is stored but has not passed validation (so it is not shown).
+    public var historyAwaitingValidation: Bool
+
+    /// What the heart-rate card says when band-history heart rate exists but awaits validation.
+    public static let historyAwaitingValidationNote = "Band-history heart rate is saved on this iPhone but has not passed field validation for your band's firmware, so Forma does not use it. Validation needs at least 10 minutes in which live heart rate from the standard heart-rate service overlaps it; Diagnostics → Field validation shows the result."
 
     public init(day: LocalDay, latestHeartRate: LatestHeartRate?, cards: [MetricCardState], readiness: ReadinessCardState?,
-                coverage24h: CoverageTimeline, pendingSleepReview: Session?, calibration: CalibrationProgress?, hasAnyData: Bool) {
+                coverage24h: CoverageTimeline, pendingSleepReview: Session?, calibration: CalibrationProgress?, hasAnyData: Bool,
+                historyAwaitingValidation: Bool = false) {
         self.day = day
         self.latestHeartRate = latestHeartRate
         self.cards = cards
@@ -149,6 +180,7 @@ public struct TodayState: Hashable, Sendable {
         self.pendingSleepReview = pendingSleepReview
         self.calibration = calibration
         self.hasAnyData = hasAnyData
+        self.historyAwaitingValidation = historyAwaitingValidation
     }
 }
 

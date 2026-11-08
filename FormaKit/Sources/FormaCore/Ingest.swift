@@ -56,11 +56,18 @@ public struct IngestResult: Hashable, Sendable {
     public var inserted: Int
     /// Records skipped because an identical record (same dedup key) already existed.
     public var duplicates: Int
+    /// Of `duplicates`, band records whose stored match is not clearly the same record: a stored row has
+    /// the same raw band time at a different stored time (beyond the clock tolerance), or the same stored
+    /// time with a different raw band time. After the band clock was set back such a record can be a
+    /// distinct one that reuses a band second, so it may not be stored: the sync engine never acknowledges
+    /// its chunk (the band keeps it).
+    public var ambiguousDuplicates: Int
 
-    public init(batchID: Int64, inserted: Int, duplicates: Int) {
+    public init(batchID: Int64, inserted: Int, duplicates: Int, ambiguousDuplicates: Int = 0) {
         self.batchID = batchID
         self.inserted = inserted
         self.duplicates = duplicates
+        self.ambiguousDuplicates = ambiguousDuplicates
     }
 }
 

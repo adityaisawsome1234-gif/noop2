@@ -62,7 +62,8 @@ public enum MetricCatalog {
     public static let heartRateSeries: MetricSpec = {
         let tolerance = HeartRateSeries.historyPrecedenceMillis / 1_000
         let span = HeartRateSeries.maxSpanMillis / 1_000
-        let gap = HeartRateSeries.defaultMaxGapMillis / 1_000
+        let chartGap = HeartRateSeries.chartMaxGapMillis / 1_000
+        let liveGap = HeartRateSeries.liveChartMaxGapMillis / 1_000
         let plausible = HeartRateSample.plausibleRange
         return MetricSpec(
             id: MetricID.heartRateSeries, name: "Heart rate", version: 2, status: .measured, unit: "bpm",
@@ -73,7 +74,7 @@ public enum MetricCatalog {
                 "Excluded: timestamps more than 2^52 ms from the Unix epoch (malformed)",
             ],
             method: "Usable samples from all sources are merged into one series. Band history wins wherever it exists: any other sample within ±\(tolerance) s (inclusive) of a usable history sample is dropped. Among the remaining samples each whole UTC second keeps only its best source: live vendor stream > backup import > standard Heart Rate Service > demo. The result is sorted with one sample per timestamp (exact ties: history > live > backup > standard > demo, then earliest receive time, then device ID, then the lower bpm). Each sample is assumed to represent the heart rate from its timestamp until the next sample, for at most \(span) s; coverage = covered ms / window ms, and window means are time-weighted over these spans.",
-            windowing: "Charts split the series into segments wherever consecutive samples are more than \(gap) s apart; gaps are drawn as gaps and never interpolated.",
+            windowing: "Charts break the line wherever consecutive samples are more than \(chartGap) s apart (\(liveGap) s in the live workout chart); gaps are drawn as gaps and never interpolated. Coverage counts every second not covered by a sample (see the 5 s span) as missing, so a shorter gap is missing data even where a chart line continues.",
             baseline: nil,
             limitations: [
                 "The \(span) s span is an assumption based on roughly once-per-second reporting; a silence longer than \(span) s counts as missing data.",
@@ -184,7 +185,7 @@ public enum MetricCatalog {
             windowing: "Non-overlapping \(dur(p.windowMillis)) windows aligned to the start of the analysis period; a trailing partial window is not analysed.",
             baseline: nil,
             limitations: [
-                "WHOOP provides optical pulse-to-pulse intervals (PPG), not ECG R-R intervals. Pulse arrival time varies with blood pressure and vascular tone, and motion or poor contact add error, so values can differ from ECG-based RMSSD, especially when HRV is high.",
+                "If a wrist band provides beat intervals at all, they are optical pulse-to-pulse intervals (PPG), not ECG R-R intervals (for WHOOP 5.0, Forma decodes none from the band's own data, and whether its standard heart-rate service sends any is untested). Pulse arrival time varies with blood pressure and vascular tone, and motion or poor contact add error, so values can differ from ECG-based RMSSD, especially when HRV is high.",
                 "Interval timestamps may be reconstructed from record or phone receive times.",
                 "The first \(p.ruleBMinimumReferences) accepted beats of each segment are not checked by rule B.",
                 "A single missed beat that leaves no gap above interval + \(num(p.dropoutToleranceMillis / 1_000, 0)) s is not detected by timing.",
@@ -378,6 +379,7 @@ public enum MetricCatalog {
         windowing: "The workout's time range.",
         baseline: nil,
         limitations: [
+            "Not shown in this version of the app: workouts show Forma Load (Edwards TRIMP) only, and the app does not ask for the sex this method needs. The specification documents the implemented calculation for a later version.",
             "The sex-specific weighting comes from small historical samples.",
             "Clamping at HRmax limits the effect of an underestimated HRmax.",
         ],

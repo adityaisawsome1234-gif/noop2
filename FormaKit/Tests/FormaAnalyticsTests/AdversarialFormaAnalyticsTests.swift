@@ -2265,7 +2265,7 @@ struct AdvCatalogInvariantTests {
 
     @Test func catalogTextStatesTheSpecNumbers() throws {
         let expectations: [(String, [String])] = [
-            ("forma.hr.series", ["5 s", "10 s", "outOfRange", "deviceMarkedInvalid", "noSensorContact", "clockUnmapped"]),
+            ("forma.hr.series", ["5 s", "60 s", "15 s", "outOfRange", "deviceMarkedInvalid", "noSensorContact", "clockUnmapped"]),
             ("forma.hr.zones", ["50%", "60%", "70%", "80%", "90%", "below zones", "Karvonen", "Set your max heart rate or birth year"]),
             ("forma.workout.summary", ["50%"]),
             ("forma.rhr.overnight", ["5 min", "1 min", "80%", "3 h", "60%", "5 h", "not a clinical"]),

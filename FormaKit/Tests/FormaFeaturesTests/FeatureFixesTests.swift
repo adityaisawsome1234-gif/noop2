@@ -354,6 +354,8 @@ struct FixesAppModelTests {
         let (model, _, _) = await make()
         await model.selectDevice(band("W-1", .whoop5))
         model.currentAdapter = Whoop5Adapter()
+        // Validation, like every computation, waits for an active UI scene.
+        await model.sceneBecameActive()
         let store = try #require(model.liveStore)
         try Adv.ingestHR(store, "W-1", from: Adv.now - 30 * Adv.minute, to: Adv.now - 10 * Adv.minute, every: 5_000, bpm: 63,
                          source: .deviceHistory, quality: [.unvalidatedField], adapter: "forma.whoop5")

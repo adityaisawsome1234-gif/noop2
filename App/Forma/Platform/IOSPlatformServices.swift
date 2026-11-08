@@ -24,12 +24,14 @@ final class IOSPlatformServices: PlatformServices, @unchecked Sendable {
         try StorageLocation.makeExportStagingDirectory()
     }
 
-    /// Zips a directory using the system's file coordinator (no third-party code).
+    /// Zips a directory using the system's file coordinator (no third-party code). The zip is returned
+    /// memory-mapped, so a large export is not read into memory (the mapping stays valid after the system
+    /// removes its temporary file).
     func archiveDirectory(_ url: URL) throws -> Data {
         var coordinationError: NSError?
         var result: Result<Data, Error> = .failure(CocoaError(.fileReadUnknown))
         NSFileCoordinator().coordinate(readingItemAt: url, options: [.forUploading], error: &coordinationError) { zipURL in
-            result = Result { try Data(contentsOf: zipURL) }
+            result = Result { try Data(contentsOf: zipURL, options: .alwaysMapped) }
         }
         if let coordinationError { throw coordinationError }
         return try result.get()

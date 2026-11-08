@@ -36,10 +36,10 @@ Forma is a local-first iPhone app. It reads data directly from the owner's WHOOP
 
 | Constraint | Enforcement in code/process |
 |---|---|
-| No WHOOP cloud/account/OAuth | The app contains no networking code (`URLSession`, `Network`, sockets, web views). A CI-style audit script greps for networking APIs (`Tools/audit-no-network.sh`). |
+| No WHOOP cloud/account/OAuth | The app contains no networking code (`URLSession`, `Network`, sockets, web views), no iCloud/CloudKit, Apple Health or MetricKit use and no links to external sites. A CI-style audit script greps for them and for entitlements that would allow them (`Tools/audit-no-network.sh`). |
 | Offline operation | All parsing, storage, analytics and charts run on the device. The app's Info.plist declares no network usage. |
-| No telemetry/ads/remote AI | There are no third-party runtime dependencies at all. FormaKit uses only Foundation and SQLite. |
-| Own device only | The user explicitly selects a device. The app never auto-connects to unknown bands. The device identity is shown everywhere data appears. |
+| No telemetry/ads/remote AI | There are no third-party runtime dependencies at all. FormaKit uses only Foundation, Observation and SQLite. |
+| Own device only | The user explicitly selects a device. The app never auto-connects to unknown bands. A link from any other peripheral is never collected or labelled as the selected band's, and every screen shows only the selected band's data. The band's name is shown in the Band sheet (opened from the connection control on every tab) and in Today's status footer while it is searched for or connected; Sleep, Activity and Trends do not name it. |
 | No firmware changes / no destructive commands | A **compile-time command allowlist** in `FormaProtocol` cannot express reset, erase, DFU, haptics or clock-write. Every command sent is logged in diagnostics. |
 | No defeating authentication | Forma uses only the link the band and iOS allow. If the band demands authentication Forma cannot legitimately satisfy, Forma reports "unsupported" instead of working around it. |
 | Honest metrics | `MetricValue` cannot carry a value without availability. Unavailable means `nil` (never 0). Every metric has a `MetricSpec`, and the Methodology screen renders those specs. |
@@ -61,7 +61,7 @@ The single user is the band's owner, technically capable and privacy-conscious.
 **Native iOS: Swift 6, SwiftUI, Swift Charts, Core Bluetooth and SQLite.** The deployment target is iOS 26.0, built with Xcode 27.x, which ships Swift 6.4. The single phone is an iPhone 16 Pro on iOS 27, so one excellent iOS implementation beats two partial apps.
 
 - **No PWA or browser layer**, because Web Bluetooth is not available in iOS Safari, and a web layer cannot use Core Bluetooth background modes or state restoration.
-- **Installation** uses developer signing from Xcode: a free Personal Team (re-sign every 7 days) or a paid Apple Developer Program membership (profiles valid for a year). Neither is an app subscription, and Forma itself has no subscription. Details are in `BUILD_AND_INSTALL.md`.
+- **Installation** uses developer signing from Xcode: a free Personal Team (re-sign every 7 days) or a paid Apple Developer Program membership (profiles commonly last about a year; Apple does not state it). Neither is an app subscription, and Forma itself has no subscription. Details are in `BUILD_AND_INSTALL.md`.
 
 ## 6. Features by release
 
@@ -74,7 +74,7 @@ Every metric below has a `MetricSpec` in code (`FormaAnalytics/MetricCatalog.swi
 | Live heart rate | measured | Shows the source (vendor stream or standard HR service) and the time of the last sample. When nothing is arriving, the screen says so instead of showing a stale number as live. |
 | HR history | measured | Device-timestamped band history is preferred over live samples. Gaps stay visible in charts and tables. |
 | Workout sessions | measured + estimate | Duration, time-weighted average HR, max HR, configurable zones (%HRmax or heart-rate reserve), time in zones and coverage. |
-| Resting HR (overnight) | estimate | Lowest 5-minute mean HR within a confirmed sleep window, with ≥80% window coverage and ≥3 h covered. Labeled a personal overnight estimate, not a clinical measurement. |
+| Resting HR (overnight) | estimate | Lowest 5-minute mean HR within a confirmed sleep window, with ≥80% window coverage and ≥3 h covered (windows under 5 h need ≥60 % coverage instead). Labeled a personal overnight estimate, not a clinical measurement. |
 | HRV (RMSSD) | estimate | Computed **only** from beat intervals the band itself emits. Artifact rules, 5-minute windows and minimum valid windows apply. It is never computed across gaps or from `60/BPM`. Raw and filtered series are kept separate. |
 | Trends 7/30/90 d | descriptive | Shown only when minimum days are met (4/7, 14/30, 45/90). No causal language. |
 
@@ -83,7 +83,7 @@ Every metric below has a `MetricSpec` in code (`FormaAnalytics/MetricCatalog.swi
 | Feature | Status class | Requirement |
 |---|---|---|
 | Sleep/wake candidates | estimate | Require motion data from the band. They are candidates until the user confirms them, they carry confidence and are editable, and manual windows are always available. They are never inferred from HR alone. |
-| Forma Load | estimate | Edwards TRIMP (zone-weighted minutes). Banister TRIMP is optional and needs HRrest, HRmax and sex. It is named as Forma's own load and is not "Strain". |
+| Forma Load | estimate | Edwards TRIMP (zone-weighted minutes). Banister TRIMP (needs HRrest, HRmax and sex) is specified and implemented but not shown in v1, so the app does not ask for sex. It is named as Forma's own load and is not "Strain". |
 | Readiness index | experimental | A baseline-relative composite of HRV, RHR and sleep duration z-scores. The weights are exposed, and the result is shown in SD units with a band. Calibration progress is shown. It never gives advice. |
 
 ### 6.3 Deferred and conditional

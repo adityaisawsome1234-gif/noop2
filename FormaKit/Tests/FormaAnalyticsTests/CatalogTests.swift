@@ -52,9 +52,10 @@ struct CatalogTests {
         #expect(HeartRateSeries.maxSpanMillis == 5_000)
         #expect(HeartRateSeries.historyPrecedenceMillis == 5_000)
         #expect(HeartRateSeries.defaultMaxGapMillis == 10_000)
+        #expect(HeartRateSeries.chartMaxGapMillis == 60_000 && HeartRateSeries.liveChartMaxGapMillis == 15_000)
         #expect(HeartRateSeries.excludedFlags == [.outOfRange, .deviceMarkedInvalid, .noSensorContact, .clockUnmapped,
                                                   .unvalidatedField, .nearClockDiscontinuity])
-        expectMentions(MetricCatalog.heartRateSeries, ["±5 s", "for at most 5 s", "more than 10 s apart", "25–240",
+        expectMentions(MetricCatalog.heartRateSeries, ["±5 s", "for at most 5 s", "more than 60 s apart", "15 s in the live workout chart", "25–240",
                                                        "live vendor stream > backup import > standard Heart Rate Service",
                                                        "clockUnmapped, nearClockDiscontinuity", "restart) or unvalidatedField"])
     }

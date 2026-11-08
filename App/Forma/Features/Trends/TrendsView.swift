@@ -56,7 +56,11 @@ struct TrendsView: View {
                 .font(Theme.Typeface.caption)
                 .foregroundStyle(Theme.textSecondary)
             if state.daysWithData == 0 {
-                AvailabilityNote(availability: .insufficientData(detail: "No days with a value in this period yet"))
+                if case .unsupportedSensor = state.availability {
+                    AvailabilityNote(availability: state.availability)
+                } else {
+                    AvailabilityNote(availability: .insufficientData(detail: "No days with a value in this period yet"))
+                }
             } else if showTable {
                 TrendTable(values: state.daily, unit: state.metric.unit, calendar: model.calendar)
             } else {

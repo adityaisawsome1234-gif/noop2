@@ -337,13 +337,15 @@ extension ConnectionSummary {
 
 // MARK: - Coverage bar
 
-/// Horizontal bar showing which parts of a window are recorded, pending sync, or unavailable.
+/// Horizontal bar showing which parts of a window are recorded, saved but awaiting validation, pending
+/// sync, or unavailable.
 ///
-/// Colour is never the only signal: the three states also differ in height (full bar, half bar, thin
-/// line), which survives grayscale and colour-blindness, and every mark is ≥ 5:1 against the card.
+/// Colour is never the only signal: the four states also differ in shape (full bar, outlined full bar,
+/// half bar, thin line), which survives grayscale and colour-blindness, and every mark is ≥ 5:1 against
+/// the card.
 struct CoverageBar: View {
     struct Segment: Identifiable, Hashable {
-        enum Kind: Hashable { case recorded, pendingSync, notRecorded }
+        enum Kind: Hashable { case recorded, awaitingValidation, pendingSync, notRecorded }
         let id: Int
         let fractionStart: Double
         let fractionEnd: Double
@@ -359,8 +361,7 @@ struct CoverageBar: View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 ForEach(segments) { s in
-                    Rectangle()
-                        .fill(Self.color(s.kind))
+                    Self.mark(s.kind)
                         .frame(width: max(1, geo.size.width * (s.fractionEnd - s.fractionStart)), height: Self.markHeight(s.kind))
                         .offset(x: geo.size.width * s.fractionStart)
                 }
@@ -372,9 +373,21 @@ struct CoverageBar: View {
         .accessibilityLabel(accessibilitySummary)
     }
 
+    /// The mark of one state: filled, except "awaiting validation", which is outlined (data that is stored
+    /// but not used yet).
+    @ViewBuilder
+    static func mark(_ kind: Segment.Kind) -> some View {
+        switch kind {
+        case .awaitingValidation:
+            Rectangle().strokeBorder(color(kind), lineWidth: 2)
+        case .recorded, .pendingSync, .notRecorded:
+            Rectangle().fill(color(kind))
+        }
+    }
+
     static func markHeight(_ kind: Segment.Kind) -> CGFloat {
         switch kind {
-        case .recorded: return height
+        case .recorded, .awaitingValidation: return height
         case .pendingSync: return height / 2
         case .notRecorded: return 2
         }
@@ -382,7 +395,7 @@ struct CoverageBar: View {
 
     static func color(_ kind: Segment.Kind) -> Color {
         switch kind {
-        case .recorded: return Theme.accent
+        case .recorded, .awaitingValidation: return Theme.accent
         case .pendingSync: return Theme.caution
         case .notRecorded: return Theme.textSecondary
         }

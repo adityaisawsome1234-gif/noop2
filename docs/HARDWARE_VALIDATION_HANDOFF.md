@@ -7,10 +7,10 @@ The software side is done and tested in replay. Several facts that matter for yo
 | Area | Verification |
 |---|---|
 | Frame format and checksums | Catalogue CRC check values; byte-exact match with the published hello frame and with command frames derived independently twice (research script and an adversarial test suite): range, request, acknowledgement, real-time toggle and clock read |
-| Frame recovery | Hostile-input tests: truncated frames, bogus headers, garbage, every split position and seeded fuzz. Genuine frames are always recovered, and the result does not depend on how notifications are split |
+| Frame recovery | Hostile-input tests: truncated frames, bogus headers, garbage, every split position and seeded fuzz. Genuine frames are always recovered, and the result does not depend on how notifications are split, except in the documented nested-frame case (a checksum-valid frame inside another can make the outer one look truncated, `ARCHITECTURE.md` §2) |
 | Decoder offsets | All 7 real WHOOP 5.0 payloads published by public research decode to the documented values (`Tools/verify-published-captures.sh`, 10/10) |
-| Sync safety | Replay tests show that Forma acts only on history transfers it requested, and that acknowledgements are off unless you enable them. When enabled, Forma acknowledges only intact chunks that it has fully saved and flushed to storage. It never acknowledges after a damaged or truncated frame, a failed save, an unmappable timestamp, an undecoded record kind or a missing token, or when you disconnect mid-transfer. It never sends an abort. Re-downloads never duplicate. Only allowlisted, adapter-encoded commands can be written |
-| Storage, analytics, presentation | Unit tests on Linux with Swift 6.4.2 (see `TEST_REPORT.md`) |
+| Sync safety | Replay tests show that Forma acts only on history transfers it requested, and that acknowledgements are off unless you enable them. When enabled, Forma acknowledges only intact chunks that it has fully saved and flushed to storage. It never acknowledges after a damaged or truncated frame, a failed save, an unmappable timestamp, an undecoded record kind, a record that matched a stored one only partly, or a missing token, or when you disconnect mid-transfer; the compatibility test never acknowledges. It never sends an abort. Re-downloads never duplicate. Only allowlisted, adapter-encoded commands can be written |
+| Storage, analytics, presentation | Unit tests on Linux with Swift 6.4.2 (see `TEST_REPORT.md`). Nothing has been compiled for or run on an Apple platform yet |
 
 ## What needs your band (in order)
 
@@ -28,14 +28,14 @@ The software side is done and tested in replay. Several facts that matter for yo
 
 ### Step 2: history download (safe: nothing is acknowledged)
 
-By default Forma downloads band history without acknowledging it, so the band and the official app keep their copy.
+By default Forma downloads band history without acknowledging it, so the band and the official app are expected to keep their copy (step 4 checks that Forma sees the same data again).
 
-1. Settings → History → **When I tap Sync**.
+1. Tap the connection control (top right of any tab) to open **Band**, then **History → Band history → When I tap Sync**.
 2. Take the band out of range for 1–2 hours (leave the phone elsewhere), then bring it back.
-3. Turn on **Record raw capture**, tap **Sync now**, wait until it ends, then export the capture. Note whether it ended **complete** or **stopped without finishing** (`HARDWARE_TEST_CHECKLIST.md` 5.1).
-4. Tap **Sync now** again: it should add 0 new records (5.2).
-5. Look at **Today → Last 24 hours**: the gap should now be "recorded".
-6. Run **Check band-history heart rate against live heart rate** in Diagnostics. It passes only if live standard heart rate overlapped with history for at least 10 minutes.
+3. Turn on **Record raw capture** (Band → Compatibility test and diagnostics), tap **Sync now**, wait until it ends, then export the capture. Note what the band did, from **Diagnostics → Vendor stream and history**: **Chunks received** and **Transfers the band finished** (1 = the band sent its completion marker). Also note the status line under Band. It reads "Last complete sync …", or "Last sync failed …" with a reason that starts "The band finished the transfer (N chunks), but it is not complete for Forma" (typically records of kind 21, which Forma does not decode: what was decoded is saved, the transfer just is not recorded as complete) or "The band stopped sending without finishing". The frame log and `forma-replay` ("history markers from the band: … transfer complete N") show the same markers (`HARDWARE_TEST_CHECKLIST.md` 5.1).
+4. Tap **Sync now** again and compare **History records saved (new)** and **History records already stored** in Diagnostics → Counters before and after: the second download should add 0 new records and count the rest as already stored (5.2).
+5. Run **Check band-history heart rate against live heart rate** in Diagnostics → Field validation (Forma also runs it after each download while your band and firmware have no result). It passes only if live standard heart rate (`180D`) overlapped with history for at least 10 minutes, so a band without `180D` cannot pass yet.
+6. Look at **Today → Last 24 hours**. Before the check passes, the downloaded period shows as **Saved, not validated** (outlined bar) and the heart-rate card says band-history heart rate is saved but not validated; after it passes, that period shows as **Recorded**. Gaps the band had no data for show **Not recorded** (or **Pending sync** after the last chunk saved intact).
 
 ### Step 2b: acknowledgement (only if you accept the trade-off)
 
@@ -63,13 +63,13 @@ Run `cd FormaKit && swift run forma-replay <capture>` on your Mac. It prints fra
 |---|---|---|
 | Is `180D` present, and does it carry RR? | Diagnostics counters "Standard HR notifications … with beat intervals" | None: HRV turns on automatically when real RR exists |
 | Do real band frames use the documented header (`AA 01 … 00 01`) and CRCs? | "Valid frames" vs "Malformed frames" | If malformed > 0, the frame codec in `Whoop5Adapter.swift` (`Whoop5Wire`) needs adjusting |
-| Is history byte 17 really bpm? | The field-validation result (agreement with live HR) | None if it passes. If it fails, stop decoding that byte (`Whoop5Decoder.decodeDataRecord`) |
+| Is history byte 17 really bpm? | The field-validation result (agreement with live HR) | None if it passes. If it fails, stop decoding that byte (`Whoop5Decoder.decodeHistoryRecord` / `heartRateOffset`) |
 | Hello response layout, data-range response, end-marker token length | The `rx` entries after each `tx` in the capture | Extend the decoder and update `docs/COMPATIBILITY.md` |
 | Result code 0: success or failure? Does the band echo Forma's sequence byte? | Response lines in the frame log; "Response sequence mismatches" counter | Adjust `Whoop5Adapter.status(ofResult:)`; enable strict sequence matching if the echo is confirmed |
-| Does the band send more than one chunk without acknowledgements, and finish the transfer? | Step 2 result: complete vs stopped without finishing; chunks saved | If it stalls after one chunk, history without acknowledgements only ever returns the oldest chunk. Document it, and decide whether to enable acknowledgements after 5.6 |
+| Does the band send more than one chunk without acknowledgements, and finish the transfer? | Step 2: **Chunks received** and **Transfers the band finished** in Diagnostics (not "Chunks saved intact", which leaves out every chunk holding a K21 record), or the history markers in the frame log and `forma-replay` | If it stalls after one chunk, history without acknowledgements only ever returns the oldest chunk. Document it, and decide whether to enable acknowledgements after 5.6 |
 | Does the acknowledgement work, and what does the band do afterwards? | Step 2b (5.6): accepted counter; whether acknowledged chunks are re-sent | If confirmed, mark the acknowledgement verified for this firmware in `COMPATIBILITY.md` |
 | What does TOGGLE_REALTIME_HR (cmd 3) start, and does `2A37` need it? | T3.4 and T4.3 | If real-time frames are confirmed and validated against `2A37`, extend field validation to the vendor live stream |
-| Record kinds the decoder does not store (K21, type 52, …) | "content not decoded" counts in `forma-replay` | Decode them once their meaning is established; until then their chunks are never acknowledged |
+| Record kinds the decoder does not store (K21, type 52, …) | "content not decoded" counts in `forma-replay`; "Records Forma does not decode yet" in Diagnostics | Decode them once their meaning is established; until then their chunks are never acknowledged and a transfer containing them is not recorded as complete |
 | Does the band still record and offload **without membership**? | Step 2 with the membership inactive (`HARDWARE_TEST_CHECKLIST.md` T10) | None. This is documentation of the result |
 | Advertised identifiers for AccessorySetupKit | Diagnostics → Advertisement | Info.plist keys (`BUILD_AND_INSTALL.md` §6) |
 | Motion scale (counts per g) | Capture of a still band vs a moving band | If confirmed, mark motion validated for this firmware and make sleep candidates available without the opt-in |

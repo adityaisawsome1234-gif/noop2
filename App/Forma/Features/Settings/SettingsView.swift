@@ -102,15 +102,6 @@ struct ProfileSection: View {
     var body: some View {
         Section {
             numberField("Birth year", text: $birthYearText, unit: nil, spokenUnit: nil)
-            Picker("Sex (optional)", selection: Binding(get: { model.profile.sex }, set: { s in
-                var p = model.profile
-                p.sex = s
-                Task { await model.setProfile(p) }
-            })) {
-                Text("Not specified").tag(UserProfile.Sex.unspecified)
-                Text("Female").tag(UserProfile.Sex.female)
-                Text("Male").tag(UserProfile.Sex.male)
-            }
             numberField("Max heart rate", text: $maxHRText, unit: "bpm", spokenUnit: "beats per minute")
             numberField("Resting heart rate", text: $restingHRText, unit: "bpm", spokenUnit: "beats per minute")
             Button("Save profile") { save() }
@@ -119,7 +110,7 @@ struct ProfileSection: View {
             Text("Profile")
         } footer: {
             Text(validationMessage ?? ((hasUnsavedChanges ? "Not saved yet: tap Save profile to use these values. " : "")
-                + "Used only for heart-rate zones and Forma Load. A max heart rate you enter is preferred over the age-based estimate (208 − 0.7 × age). Sex is used only by the optional Banister load and is never assumed."))
+                + "Used only for heart-rate zones and Forma Load. A max heart rate you enter is preferred over the age-based estimate (208 − 0.7 × age)."))
         }
         .onAppear {
             guard !loaded else { return }
@@ -191,6 +182,7 @@ struct DataManagementView: View {
     @State private var message: String?
     @State private var confirmDelete = false
     @State private var working = false
+    @State private var summary: StoredDataSummary?
 
     var body: some View {
         Form {
@@ -198,6 +190,24 @@ struct DataManagementView: View {
                 Section {
                     DemoModeNote(text: "Demo mode is on. Export and import below use your own band data only: demo data is never exported or imported. Delete all data also removes the demo data and turns Demo mode off.")
                 }
+            }
+            Section {
+                if let summary {
+                    LabeledContent("Heart-rate samples", value: "\(summary.heartRateSamples)")
+                    LabeledContent("Beat-to-beat intervals", value: "\(summary.beatIntervals)")
+                    LabeledContent("Motion epochs", value: "\(summary.motionEpochs)")
+                    LabeledContent("Other measurements", value: "\(summary.otherMeasurements)")
+                    LabeledContent("Sleep windows and workouts", value: "\(summary.sessions)")
+                    if let range = summary.range {
+                        LabeledContent("From – to", value: DisplayFormat.range(range, calendar: model.calendar))
+                    }
+                } else {
+                    Text("Counting…").foregroundStyle(Theme.textSecondary)
+                }
+            } header: {
+                Text("Stored on this iPhone")
+            } footer: {
+                Text("Your own band data only (never demo data), counted as stored rows.")
             }
             Section {
                 Button("Export CSV files…") { run { (try await model.exportCSVArchive(), "forma-csv.zip", .zip) } }
@@ -231,7 +241,7 @@ struct DataManagementView: View {
             Section {
                 Button("Delete all data", role: .destructive) { confirmDelete = true }
             } footer: {
-                Text("Erases every measurement, session, setting and capture stored by Forma on this iPhone, including demo data. This cannot be undone.")
+                Text("Erases every measurement, session, setting, capture and the connection history stored by Forma on this iPhone, including demo data. It keeps the selected band (its name and identity, so Forma still recognises it; use Forget band to remove it) and your app preferences, such as appearance, App Lock and collection; neither holds health data. This cannot be undone.")
             }
             if let message {
                 Section { Text(message).font(.subheadline) }
@@ -239,6 +249,7 @@ struct DataManagementView: View {
         }
         .formaListBackground()
         .navigationTitle("Your data")
+        .task(id: message) { summary = await model.storedDataSummary() }
         .disabled(working)
         .overlay { if working { ProgressView() } }
         .fileExporter(isPresented: Binding(get: { exportDocument != nil }, set: { if !$0 { exportDocument = nil } }),
@@ -292,11 +303,16 @@ struct DataManagementView: View {
 }
 
 struct AboutView: View {
+    @Environment(AppModel.self) private var model
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.m) {
                 Text("Forma")
                     .font(.largeTitle.weight(.semibold))
+                Text("Version \(model.appVersion)")
+                    .font(Theme.Typeface.label.monospacedDigit())
+                    .foregroundStyle(Theme.textSecondary)
                 Text("A local-first wellness app that reads your own band over Bluetooth and keeps everything on this iPhone. No account, no server, no tracking.")
                 Text("Independence")
                     .font(.headline)

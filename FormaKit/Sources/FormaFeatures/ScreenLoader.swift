@@ -83,17 +83,36 @@ public enum ScreenLoader {
     /// time, and fields still awaiting validation (band history only from batches whose adapter and
     /// firmware passed validation, see `HistoryHeartRatePolicy`; their unvalidated flag is cleared).
     static func heartRates(_ ctx: LoaderContext, in range: TimeRange) throws -> [HeartRateSample] {
+        try heartRatesAndAwaitingValidation(ctx, in: range).usable
+    }
+
+    /// `heartRates(_:in:)`, plus the times of stored band-history heart rate kept out only because its field
+    /// is not validated yet for its adapter and firmware (otherwise usable): coverage shows those as
+    /// "awaiting validation" instead of missing.
+    static func heartRatesAndAwaitingValidation(_ ctx: LoaderContext, in range: TimeRange) throws
+        -> (usable: [HeartRateSample], awaitingValidation: [EpochMillis]) {
         let raw = try ctx.store.heartRates(in: range, deviceID: ctx.deviceID)
-        return raw.compactMap { s in
-            guard !isExcluded(s.source, ctx), s.quality.isDisjoint(with: uncertainTimeFlags) else { return nil }
-            guard s.quality.contains(.unvalidatedField) else { return s }
-            guard s.source == .deviceHistory, historyAdmitted(batchID: s.batchID, ctx) else { return nil }
-            // Validated for this batch's adapter and firmware. Analytics exclude the flag everywhere, so it is
-            // cleared on the copy handed to them (storage keeps it as evidence).
-            var usable = s
-            usable.quality.remove(.unvalidatedField)
-            return usable
+        var usable: [HeartRateSample] = []
+        var awaiting: [EpochMillis] = []
+        usable.reserveCapacity(raw.count)
+        for s in raw {
+            guard !isExcluded(s.source, ctx), s.quality.isDisjoint(with: uncertainTimeFlags) else { continue }
+            guard s.quality.contains(.unvalidatedField) else {
+                usable.append(s)
+                continue
+            }
+            guard s.source == .deviceHistory else { continue }
+            if historyAdmitted(batchID: s.batchID, ctx) {
+                // Validated for this batch's adapter and firmware. Analytics exclude the flag everywhere, so it
+                // is cleared on the copy handed to them (storage keeps it as evidence).
+                var validated = s
+                validated.quality.remove(.unvalidatedField)
+                usable.append(validated)
+            } else if FieldValidator.isEvidence(s) {
+                awaiting.append(s.timestamp)
+            }
         }
+        return (usable, awaiting)
     }
 
     static func historyAdmitted(batchID: Int64?, _ ctx: LoaderContext) -> Bool {
@@ -163,7 +182,7 @@ public enum ScreenLoader {
     /// fewer gaps than points). Each point sits at the time of its first sample, so ids stay unique even
     /// when a gap splits a bucket.
     public static func series(_ samples: [HeartRateSample], window: TimeRange, maxPoints: Int = 600,
-                              maxGapMillis: Int64 = 60_000) -> SeriesDisplay {
+                              maxGapMillis: Int64 = HeartRateSeries.chartMaxGapMillis) -> SeriesDisplay {
         let canonical = HeartRateSeries.canonical(HeartRateSeries.usable(samples)).filter { window.contains($0.timestamp) }
         guard !canonical.isEmpty else { return .empty(unit: "bpm", window: window) }
         // Each gap can split one bucket in two, so the bucket budget leaves room for them.
@@ -369,7 +388,7 @@ public enum ScreenLoader {
         let day = LocalDay(ctx.now, calendar: ctx.calendar)
         let dayRange = day.range(calendar: ctx.calendar)
         let last24 = TimeRange(start: ctx.now - EpochMillis.millisPerDay, end: ctx.now)
-        let hr24 = try heartRates(ctx, in: last24)
+        let (hr24, awaiting24) = try heartRatesAndAwaitingValidation(ctx, in: last24)
         let usable24 = HeartRateSeries.usable(hr24)
         let hasAnyData = try ctx.store.dataBounds() != nil
         let latest = latestHeartRate(usable24, now: ctx.now)
@@ -459,7 +478,8 @@ public enum ScreenLoader {
 
         let coverage = CoverageTimeline.build(window: last24, sampleTimes: usable24.map(\.timestamp),
                                               bandKeepsHistory: ctx.bandKeepsHistory,
-                                              newestPersistedHistory: try newestPersistedHistory(ctx))
+                                              newestPersistedHistory: try newestPersistedHistory(ctx),
+                                              awaitingValidationTimes: awaiting24)
 
         let recent = try sessions(ctx, kind: .sleep, in: TimeRange(start: ctx.now - 36 * 3_600_000, end: ctx.now),
                                   includeCandidates: true)
@@ -469,7 +489,7 @@ public enum ScreenLoader {
         }
         return TodayState(day: day, latestHeartRate: latest, cards: cards, readiness: readinessCard, coverage24h: coverage,
                           pendingSleepReview: candidates.max(by: { $0.range.end < $1.range.end }), calibration: calibration,
-                          hasAnyData: hasAnyData)
+                          hasAnyData: hasAnyData, historyAwaitingValidation: !awaiting24.isEmpty)
     }
 
     /// Today's Forma Load. The daily gate needs heart rate for 30 % of the whole day, which a morning
@@ -537,7 +557,7 @@ public enum ScreenLoader {
         let newestHistory = try newestPersistedHistory(ctx)
         var states: [NightState] = []
         for s in visible {
-            let hr = try heartRates(ctx, in: s.range)
+            let (hr, awaiting) = try heartRatesAndAwaitingValidation(ctx, in: s.range)
             let mot = try motion(ctx, in: s.range)
             let summary = SleepSummary.fromConfirmedWindow(s.range, motion: mot, heartRate: hr)
             let motionWithheld = ctx.motionNeedsValidation && summary.sleepDurationEstimate.value == nil
@@ -554,7 +574,8 @@ public enum ScreenLoader {
             let rhr = RestingHeartRateEstimator.estimate(sleepWindow: s.range, series: HeartRateSeries(hr)).restingHeartRate
             let hrv = HRVAnalyzer.analyze(beats: try beats(ctx, in: s.range), range: s.range).rmssd
             let coverage = CoverageTimeline.build(window: s.range, sampleTimes: HeartRateSeries.usable(hr).map(\.timestamp),
-                                                  bandKeepsHistory: ctx.bandKeepsHistory, newestPersistedHistory: newestHistory)
+                                                  bandKeepsHistory: ctx.bandKeepsHistory, newestPersistedHistory: newestHistory,
+                                                  awaitingValidationTimes: awaiting)
             states.append(NightState(session: s, timeInBedHours: Double(s.range.durationMillis) / 3_600_000, sleepEstimate: sleepEst,
                                      continuity: continuity, restingHR: rhr, hrv: hrv,
                                      heartRate: series(hr, window: s.range), wakeBouts: summary.wakeBouts ?? [], coverage: coverage))
@@ -665,7 +686,8 @@ public enum ScreenLoader {
         return LiveWorkoutState(start: start, now: ctx.now, currentHR: stale ? nil : latest?.bpm,
                                 currentZone: stale ? nil : latest.flatMap { zones.zone(forBPM: Double($0.bpm)) },
                                 signalStale: stale, zones: zoneDisplays(summary.timeInZones, thresholds: summary.zoneThresholds),
-                                heartRate: series(usable, window: window, maxPoints: 300, maxGapMillis: 15_000), sourceLabel: sourceLabel)
+                                heartRate: series(usable, window: window, maxPoints: 300,
+                                                  maxGapMillis: HeartRateSeries.liveChartMaxGapMillis), sourceLabel: sourceLabel)
     }
 
     // MARK: Trends
@@ -712,7 +734,12 @@ public enum ScreenLoader {
         if let c = rvp.value {
             comparison = "Last 7 days averaged \(DisplayFormat.number(c.recentMean, digits: digits)) \(metric.unit) (\(c.recentDays) days), compared with \(DisplayFormat.number(c.priorMean, digits: digits)) \(metric.unit) over the 28 days before (\(c.priorDays) days): a difference of \(DisplayFormat.signed(c.difference, digits: digits)) \(metric.unit)."
         }
-        return TrendsState(metric: metric, period: period, daily: rows, availability: summary.statistics.availability,
+        var availability = summary.statistics.availability
+        if metric == .hrv, !ctx.beatIntervalsSupported, !rows.contains(where: { $0.value != nil }) {
+            // The band provides no beat-to-beat intervals: not "no data yet", but a sensor it does not have.
+            availability = .unsupportedSensor(sensor: "beat-to-beat intervals")
+        }
+        return TrendsState(metric: metric, period: period, daily: rows, availability: availability,
                            summary: summaryRows, comparison: comparison)
     }
 

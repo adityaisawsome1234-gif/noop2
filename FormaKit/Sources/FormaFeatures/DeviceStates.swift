@@ -3,9 +3,11 @@ import FormaCore
 
 /// Whether Forma downloads the band's stored history.
 ///
-/// Downloading never changes the band: Forma saves the data and, by default, does not acknowledge it,
-/// so the band keeps its copy (and another app, such as the official app, still receives it). Confirming
-/// receipt to the band is a separate, experimental setting (`AppModel.setHistoryAcknowledgement`).
+/// Downloading alone does not tell the band anything: Forma saves the data and, by default, does not
+/// acknowledge it, so the band is expected to keep its copy (and another app, such as the official app,
+/// to still receive it; not yet verified on hardware). Confirming receipt to the band is a separate,
+/// experimental setting (`AppModel.setHistoryAcknowledgement`); `explanation(acknowledging:)` says which
+/// applies.
 public enum HistorySyncMode: String, Hashable, Sendable, Codable, CaseIterable, Identifiable {
     /// Live data only. Forma never requests band history.
     case off
@@ -24,12 +26,16 @@ public enum HistorySyncMode: String, Hashable, Sendable, Codable, CaseIterable, 
         }
     }
 
-    public var explanation: String {
+    /// - Parameter acknowledging: the experimental "Confirm saved history to the band" setting is on.
+    public func explanation(acknowledging: Bool) -> String {
         switch self {
         case .off:
             return "Forma records only what the band sends live while connected. Gaps cannot be recovered later, and the band's stored history is left untouched."
         case .manual, .automatic:
-            return "Forma downloads the band's stored history and saves it on this iPhone. It does not confirm receipt to the band, so the band keeps its copy and may send the same period again next time; Forma skips what it already has."
+            if acknowledging {
+                return "Forma downloads the band's stored history and saves it on this iPhone. Confirming saved history to the band is on (Diagnostics, experimental): after a chunk arrived intact and was saved, Forma confirms it, and the band may then delete it, so the official app may never receive that period."
+            }
+            return "Forma downloads the band's stored history and saves it on this iPhone. It does not confirm receipt to the band, so the band is expected to keep its copy (not yet verified on your band) and may send the same period again next time; Forma skips what it already has."
         }
     }
 }
@@ -98,7 +104,7 @@ public struct CompatibilityCheck: Hashable, Sendable, Identifiable, Codable {
         CompatibilityCheck(id: "liveHR", title: "Live heart rate", status: .pending,
                            detail: "Plausible heart-rate values arrive at least every few seconds."),
         CompatibilityCheck(id: "history", title: "Stored history", status: .pending,
-                           detail: "Only runs if you enabled history sync: transfer, save, then acknowledge."),
+                           detail: "Only runs if you enabled history sync: one transfer, saved on this iPhone. The test never confirms receipt to the band, even when the experimental acknowledgement is on."),
         CompatibilityCheck(id: "clock", title: "Band clock", status: .pending,
                            detail: "Compare the band's clock with this iPhone's clock (read-only)."),
         CompatibilityCheck(id: "fieldAgreement", title: "Field validation", status: .pending,
@@ -170,12 +176,22 @@ public struct DiagnosticsCounters: Hashable, Sendable, Codable {
     public var historyRecordsUndecoded: Int = 0
     public var historyRecordsUnsolicited: Int = 0
     public var historyTimeCollisions: Int = 0
+    /// End-of-chunk markers of Forma's transfers, and the chunks among them saved intact (eligible for
+    /// acknowledgement).
+    public var historyChunksReceived: Int = 0
     public var historyChunksSaved: Int = 0
     public var historyChunksAcknowledged: Int = 0
+    /// Completion markers the band sent for Forma's transfers (the band's own outcome).
+    public var historyTransfersFinishedByBand: Int = 0
+    /// Records skipped as duplicates of stored band records they matched only partly (never acknowledged).
+    public var historyAmbiguousDuplicates: Int = 0
     public var acknowledgementsAccepted: Int = 0
     public var acknowledgementsRejected: Int = 0
     public var responseSequenceMismatches: Int = 0
     public var notificationGaps: Int = 0
+    /// Band-history records newly saved, and those already stored (skipped as duplicates).
+    public var historyRecordsSaved: Int = 0
+    public var historyRecordsAlreadyStored: Int = 0
 
     public init() {}
 }
@@ -191,11 +207,13 @@ public struct DiagnosticsState: Hashable, Sendable {
     public var firmware: String?
     public var adapterID: String?
     public var parserVersion: String?
+    /// The last battery level the band reported (percent), nil before any.
+    public var batteryPercent: Int?
 
     public init(checks: [CompatibilityCheck] = CompatibilityCheck.plan, services: [GATTServiceSummary] = [],
                 advertisement: [String: String] = [:], counters: DiagnosticsCounters = DiagnosticsCounters(),
                 recentFrames: [FrameLogLine] = [], captureEnabled: Bool = false, capturedEntries: Int = 0,
-                firmware: String? = nil, adapterID: String? = nil, parserVersion: String? = nil) {
+                firmware: String? = nil, adapterID: String? = nil, parserVersion: String? = nil, batteryPercent: Int? = nil) {
         self.checks = checks
         self.services = services
         self.advertisement = advertisement
@@ -206,6 +224,7 @@ public struct DiagnosticsState: Hashable, Sendable {
         self.firmware = firmware
         self.adapterID = adapterID
         self.parserVersion = parserVersion
+        self.batteryPercent = batteryPercent
     }
 }
 

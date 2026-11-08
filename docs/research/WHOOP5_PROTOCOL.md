@@ -63,7 +63,7 @@ AA 01 LEN(u16 LE) 00 01 HCRC(u16 LE) | PAYLOAD | PCRC(u32 LE)
 | 34 | GET_DATA_RANGE | none | GooseBLEClient.swift:422-453 | Read-only. A success answer carries at least 25 body bytes; the reference client treats a shorter one as invalid |
 | 22 | SEND_HISTORICAL_DATA | none | same | Starts a transfer |
 | 23 | HISTORICAL_DATA_RESULT | `01` + payload bytes 13–20 of the history-end marker (only when the marker is longer than 21 bytes) | GooseBLEClient+Parsing.swift:833-842, where a comment says it mirrors the official Android app's builder | **contested**: an unpublished fixture expects `00 00 00 00`. Its effect on band storage is **open** |
-| 3 | TOGGLE_REALTIME_HR | `01` on, `00` off | GooseBLEClient.swift:529-547 | What the band then sends is **open**. The reference client always sends it together with cmd 63 SEND_R10_R11_REALTIME_ON (same lines); Forma sends only cmd 3 (63 is not in its allowlist), so whether cmd 3 alone starts a stream is **open** (hardware test T3) |
+| 3 | TOGGLE_REALTIME_HR | `01` on, `00` off | GooseBLEClient.swift:529-547 | What the band then sends is **open**. The reference client always sends it together with cmd 63 SEND_R10_R11_REALTIME_ON (same lines); Forma sends only cmd 3 (63 is not in its allowlist), so whether cmd 3 alone starts a stream is **open** (hardware tests T3.4 and T4.3) |
 
 Command frames re-derived independently twice (Forma's tests and an adversarial suite):
 

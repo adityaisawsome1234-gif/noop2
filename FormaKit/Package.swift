@@ -1,7 +1,8 @@
 // swift-tools-version: 6.0
 //
 // FormaKit: the platform-independent core of Forma.
-// Everything here compiles and is unit-tested on Linux and Apple platforms.
+// Everything here compiles and is unit-tested on Linux (Swift 6.4.2). Apple-platform builds are untested
+// until the package is built in Xcode or by the CI workflow's macOS job.
 // The iOS app target (../App) adds SwiftUI + Core Bluetooth on top.
 
 import PackageDescription
@@ -55,7 +56,8 @@ let package = Package(
             dependencies: ["FormaCore", "FormaProtocol", "FormaSync", "FormaStore"]
         ),
 
-        // Prints METHODOLOGY.md from the analytics MetricCatalog (documentation generated from code).
+        // Prints METHODOLOGY_SPECS.md from the analytics MetricCatalog (documentation generated from code;
+        // MethodologyDocumentTests fails while docs/METHODOLOGY_SPECS.md is out of date).
         .executableTarget(name: "FormaDocsCLI", dependencies: ["FormaCore", "FormaAnalytics"]),
 
         .testTarget(name: "FormaProtocolTests", dependencies: ["FormaProtocol"], resources: [.copy("Fixtures")]),

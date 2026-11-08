@@ -155,10 +155,11 @@ enum PreviewStates {
                          message: "Turn on Bluetooth in Control Center to reconnect to your band.")
             DemoBanner()
             CoverageBar(segments: [
-                .init(id: 0, fractionStart: 0, fractionEnd: 0.55, kind: .recorded),
-                .init(id: 1, fractionStart: 0.55, fractionEnd: 0.7, kind: .notRecorded),
-                .init(id: 2, fractionStart: 0.7, fractionEnd: 1, kind: .pendingSync),
-            ], accessibilitySummary: "55% recorded, 30% waiting to sync, 15% not recorded")
+                .init(id: 0, fractionStart: 0, fractionEnd: 0.45, kind: .recorded),
+                .init(id: 1, fractionStart: 0.45, fractionEnd: 0.55, kind: .awaitingValidation),
+                .init(id: 2, fractionStart: 0.55, fractionEnd: 0.7, kind: .notRecorded),
+                .init(id: 3, fractionStart: 0.7, fractionEnd: 1, kind: .pendingSync),
+            ], accessibilitySummary: "45% recorded, 10% saved from the band, awaiting validation, 30% waiting to sync from the band, 15% not recorded")
             CoverageLegend()
         }
         .padding()

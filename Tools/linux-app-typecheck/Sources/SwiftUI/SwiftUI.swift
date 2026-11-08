@@ -286,6 +286,7 @@ extension View {
     public func clipShape<S: Shape>(_ s: S) -> some View { ModifiedView<Self>() }
     public func refreshable(action: @escaping () async -> Void) -> some View { ModifiedView<Self>() }
     public func task(_ action: @escaping () async -> Void) -> some View { ModifiedView<Self>() }
+    public func task<T: Equatable>(id value: T, _ action: @escaping () async -> Void) -> some View { ModifiedView<Self>() }
     public func onAppear(perform: (() -> Void)? = nil) -> some View { ModifiedView<Self>() }
     public func onDisappear(perform: (() -> Void)? = nil) -> some View { ModifiedView<Self>() }
     public func toolbar<C: View>(@ViewBuilder content: () -> C) -> some View { ModifiedView<Self>() }

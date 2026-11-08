@@ -79,7 +79,7 @@ extension AppModel {
         guard !isDemo else { return }
         liveWorkoutStart = timeSource.now()
         liveWorkoutSamples.removeAll()
-        // The workout requests the real-time stream for its duration; the user's setting is left as it is.
+        // With "Request live heart-rate stream" on, the workout keeps the request while Forma is in the background.
         await applyEngineOptions()
         startTicking()
         updateLiveWorkout()
@@ -171,7 +171,8 @@ extension AppModel {
     // MARK: Export, import, delete
 
     /// CSV files for every table of the user's own (live) data, archived (zip on iOS). Demo data is never
-    /// exported. Returns the archive bytes for a user-chosen destination.
+    /// exported. Returns the archive bytes for a user-chosen destination (memory-mapped by the platform,
+    /// see `PlatformServices.archiveDirectory`).
     public func exportCSVArchive() async throws -> Data {
         guard let store = liveStore else { throw AppModelError.storeUnavailable }
         let platform = self.platform
@@ -185,6 +186,10 @@ extension AppModel {
 
     /// Versioned NDJSON backup of the user's own (live) data. Demo data is never exported, also not while
     /// Demo mode is showing, so a backup can always be trusted to hold real records.
+    ///
+    /// The file is written as a stream; its bytes are returned memory-mapped, not read into memory, so a
+    /// long history does not have to fit in RAM (the staging file is removed at once; the mapping keeps its
+    /// contents readable until the returned data is released).
     public func exportBackup() async throws -> Data {
         guard let store = liveStore else { throw AppModelError.storeUnavailable }
         let platform = self.platform
@@ -193,17 +198,19 @@ extension AppModel {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("forma-backup.jsonl")
             _ = try store.exportBackup(to: url)
-            return try Data(contentsOf: url)
+            return try Data(contentsOf: url, options: .alwaysMapped)
         }.value
     }
 
     /// Imports a backup into the live store and returns a human-readable report.
     ///
     /// - A file containing demo records is refused as a whole: demo data never mixes with live data.
-    /// - Per-phone choices in the backup (history sync, unvalidated motion, field-validation verdicts) are
-    ///   never applied: history sync stays opt-in on this iPhone.
+    /// - Per-phone choices in the backup (history download and acknowledgement, unvalidated motion,
+    ///   field-validation verdicts) are never applied: the store withholds them inside each chunk's
+    ///   transaction, so not even an import that stops midway, or one run again, can switch them on.
     /// - Other settings the backup adds (profile, zone method, readiness) take effect immediately, and
-    ///   cached values they or the new records affect are recomputed.
+    ///   cached values they or the new records affect are recomputed. When the import stops midway, what
+    ///   it applied so far stays (records, ordinary settings) and every cached value is recomputed.
     public func importBackup(from url: URL) async -> String {
         guard let store = liveStore else { return "The database is not open." }
         #if canImport(Darwin)
@@ -214,31 +221,45 @@ extension AppModel {
             if try await Task.detached(operation: { try BackupInspector.containsDemoData(at: url) }).value {
                 return "This file contains Forma demo data. Demo data is never added to your own records, so nothing was imported."
             }
-            let keysBefore = Set(try store.allSettings().keys)
-            let report = try await Task.detached { try store.importBackup(from: url) }.value
-            var withheld = 0
-            for key in try store.allSettings().keys where !keysBefore.contains(key) && SettingKey.isPerPhoneChoice(key) {
-                if try store.removeSetting(forKey: key) { withheld += 1 }
-            }
-            let settingsAdded = (report.inserted[.setting] ?? 0) > withheld
-            if settingsAdded {
+        } catch {
+            return "Import failed: \(error)"
+        }
+        do {
+            let report = try await Task.detached {
+                try store.importBackup(from: url, withholdingSettings: SettingKey.isPerPhoneChoice)
+            }.value
+            if (report.inserted[.setting] ?? 0) > 0 {
                 invalidateAllDerived()
             } else if let range = report.importedRange {
                 invalidateDerived(in: store, overlapping: Self.affectedByRecords(in: range))
             }
             loadSettingsFromStore()
-            await engine?.setOptions(syncOptions())
+            await applyEngineOptions()
             await refreshNow()
-            var text = "Imported \(report.totalInserted - withheld) records; \(report.totalDuplicates) were already present."
-            if report.invalidLines > 0 { text += " \(report.invalidLines) invalid lines were skipped." }
-            if !report.cursorsNotApplied.isEmpty { text += " Sync positions from the backup were not applied to your band." }
-            if withheld > 0 {
-                text += " History sync, unvalidated-motion and field-validation choices in the backup were not applied; they are made on each iPhone."
-            }
-            return text
+            return Self.importSummary(report)
         } catch {
-            return "Import failed: \(error)"
+            // Earlier chunks stay applied: show what they changed.
+            invalidateAllDerived()
+            loadSettingsFromStore()
+            await applyEngineOptions()
+            await refreshNow()
+            return "Import failed: \(error). Anything imported before the error was kept; importing the file again is safe, because records already present are skipped."
         }
+    }
+
+    /// The message shown after an import.
+    nonisolated static func importSummary(_ report: ImportReport) -> String {
+        var text = "Imported \(report.totalInserted) records; \(report.totalDuplicates) were already present."
+        if report.invalidLines > 0 {
+            text += " \(report.invalidLines) invalid line\(report.invalidLines == 1 ? " was" : "s were") skipped"
+            let shown = report.errors.prefix(3)
+            text += shown.isEmpty ? "." : " (\(shown.joined(separator: "; "))\(report.errors.count > shown.count || report.invalidLines > shown.count ? "; …" : ""))."
+        }
+        if !report.cursorsNotApplied.isEmpty { text += " Sync positions from the backup were not applied to your band." }
+        if report.settingsWithheld > 0 {
+            text += " History download and acknowledgement, unvalidated-motion and field-validation choices in the backup were not applied; they are made on each iPhone."
+        }
+        return text
     }
 
     /// Erases everything Forma stores on this iPhone — the live and the demo database files, the raw
@@ -250,6 +271,8 @@ extension AppModel {
             liveWorkoutSamples.removeAll()
             startTicking()
         }
+        // The connection stays up for the next engine: switch off a real-time stream nobody wants first.
+        await applyEngineOptions()
         stopEngine()
         beginNewDataContext()
         let wasDemo = isDemo
@@ -314,6 +337,21 @@ extension AppModel {
         }
         return "All Forma data on this iPhone was deleted.\(demoNote)"
     }
+
+    /// What "Your data" lists: rows of the user's own (live) database. Counting reads every table, so it
+    /// runs off the main actor; nil when the database is not open.
+    public func storedDataSummary() async -> StoredDataSummary? {
+        guard let store = liveStore else { return nil }
+        return await Task.detached(priority: .userInitiated) { () -> StoredDataSummary? in
+            guard let counts = try? store.tableCounts() else { return nil }
+            return StoredDataSummary(heartRateSamples: counts["hr_sample"] ?? 0, beatIntervals: counts["beat_interval"] ?? 0,
+                                     motionEpochs: counts["motion_epoch"] ?? 0, otherMeasurements: counts["aux_measurement"] ?? 0,
+                                     sessions: counts["session"] ?? 0, range: (try? store.dataBounds()) ?? nil)
+        }.value
+    }
+
+    /// The app's version and build, as shown in About (and written into capture headers).
+    public var appVersion: String { platform.appVersion }
 
     // MARK: Connection history
 

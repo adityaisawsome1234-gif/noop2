@@ -271,7 +271,7 @@ struct BackupTests {
         let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n").map(String.init)
         #expect(lines[0] == #"{"format":"forma-backup","formatVersion":1,"schemaVersion":2,"exportedAt":\#(t0 + 7),"app":"Forma"}"#)
         #expect(lines.contains(#"{"type":"cursor","data":{"device_id":"band-A","adapter_id":"whoop5","opaque":"AQID","newest_record_ms":null,"last_complete_ms":null,"updated_at":\#(t0)}}"#))
-        #expect(lines.contains(#"{"type":"hr","data":{"device_id":"band-A","ts_ms":\#(t0),"bpm":61,"source":2,"device_time_raw":null,"received_at":\#(t0 + 5_000),"clock_offset_ms":null,"quality":0}}"#))
+        #expect(lines.contains(#"{"type":"hr","data":{"device_id":"band-A","ts_ms":\#(t0),"bpm":61,"source":2,"device_time_raw":null,"received_at":\#(t0 + 5_000),"clock_offset_ms":null,"quality":0,"adapter_id":"whoop5","firmware":"50.1.2"}}"#))
         for line in lines {
             let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
             #expect(object != nil)
