@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import FormaCore
+import FormaProtocol
 @testable import FormaSync
 
 @Suite struct ClockMapperTests {
@@ -85,7 +86,7 @@ import FormaCore
         var events: [LinkEvent] = []
         for await e in link.events { events.append(e) }
         #expect(events.count == 4)
-        #expect(events[1] == .notification(characteristic: UUIDText.normalize("2A37"), bytes: [0x00, 0x48], receivedAt: 1))
+        #expect(events[1] == .notification(characteristic: UUIDs.normalize("2A37"), bytes: [0x00, 0x48], receivedAt: 1))
         if case .disconnected = events.last {} else { Issue.record("expected disconnect at end") }
         await #expect(throws: LinkError.notConnected) { try await link.write([1], characteristic: "x", withResponse: true) }
     }
@@ -103,7 +104,7 @@ import FormaCore
     }
 
     @Test func uuidNormalization() {
-        #expect(UUIDText.normalize(" 2a37 ") == "00002A37-0000-1000-8000-00805F9B34FB")
-        #expect(UUIDText.equal("fd4b0001-cce1-4033-93ce-002d5875f58a", "FD4B0001-CCE1-4033-93CE-002D5875F58A"))
+        #expect(UUIDs.normalize(" 2a37 ") == "00002A37-0000-1000-8000-00805F9B34FB")
+        #expect(UUIDs.equal("fd4b0001-cce1-4033-93ce-002d5875f58a", "FD4B0001-CCE1-4033-93CE-002D5875F58A"))
     }
 }

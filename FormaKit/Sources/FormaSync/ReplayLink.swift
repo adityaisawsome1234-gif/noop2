@@ -1,5 +1,6 @@
 import Foundation
 import FormaCore
+import FormaProtocol
 
 /// A `PeripheralLink` that plays back a `CaptureFile`. Received entries become notifications in their
 /// recorded order; written commands are recorded for assertions.
@@ -42,7 +43,7 @@ public final class ReplayLink: PeripheralLink, @unchecked Sendable {
             switch e.dir {
             case .rx:
                 guard let bytes = Self.hexBytes(e.d) else { continue }
-                continuation.yield(.notification(characteristic: UUIDText.normalize(e.c), bytes: bytes, receivedAt: e.t))
+                continuation.yield(.notification(characteristic: UUIDs.normalize(e.c), bytes: bytes, receivedAt: e.t))
             case .event:
                 if (e.note ?? "").lowercased().hasPrefix("disconnect") {
                     continuation.yield(.disconnected(reason: e.note, at: e.t))
@@ -67,8 +68,8 @@ public final class ReplayLink: PeripheralLink, @unchecked Sendable {
         let reaction: [LinkEvent] = try lock.withLock {
             if closed { throw LinkError.notConnected }
             if let limit = failWritesAfter, writes.count >= limit { throw LinkError.writeFailed("scripted failure") }
-            writes.append((UUIDText.normalize(characteristic), bytes, withResponse))
-            return responder?(bytes, UUIDText.normalize(characteristic)) ?? []
+            writes.append((UUIDs.normalize(characteristic), bytes, withResponse))
+            return responder?(bytes, UUIDs.normalize(characteristic)) ?? []
         }
         for event in reaction {
             continuation.yield(event)
