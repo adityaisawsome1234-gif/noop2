@@ -107,9 +107,35 @@ Pure functions over FormaCore values. Each result is a `MetricValue` carrying:
 - Screen models in `FormaFeatures` compute display state from the store and analytics. They are testable off-device, and SwiftUI views are thin renderers.
 - Every card renders from `Availability`, so these states all have explicit copy: disconnected, syncing, partial, calibrating, insufficient quality, unsupported sensor, empty and error.
 
-## 7. Background operation (iOS 27)
+## 7. Background operation on iOS 27: what is and is not guaranteed
 
-See §7 in `docs/ARCHITECTURE_BACKGROUND.md`. That section is written from Apple's current documentation (TN3115, Core Bluetooth background guide, AccessorySetupKit) and lists exactly what iOS does and does not guarantee.
+The primary sources are Apple's TN3115 (revised 2025-09-15 for iOS 26), the Core Bluetooth background guide, the AccessorySetupKit documentation and WWDC24 10203, the Accessory Design Guidelines (R32 Update 1), and Apple-staff forum answers from 2025–2026. The full notes with quotes and URLs are in `docs/research/IOS_BLE_RULES.md`.
+
+**What Forma relies on**
+- **`bluetooth-central` mode.** Subscribed notifications, connects and disconnects wake a suspended Forma. Each wake has about 10 s of runtime. Forma parses the frames, commits one short SQLite transaction inside `beginBackgroundTask`, and returns. This avoids `0xdead10cc` kills from locks held during suspension. Analytics never run on a background wake.
+- **Pending `connect()` never times out.** After any disconnect, Forma immediately calls `connect()` again on the remembered peripheral, so iOS reconnects when the band comes back into range. At launch Forma first uses `retrievePeripherals(withIdentifiers:)`. It also uses `retrieveConnectedPeripherals(withServices:)`, which finds the band when another app, such as the official app, already holds the link.
+- **State restoration.** There is one `CBCentralManager`, created at process start with a constant restore identifier. iOS 27 SDK apps must use the scene life cycle, where launch options are `nil`, so the identifier is never read from launch options. `willRestoreState` re-attaches delegates and reuses already-discovered characteristics.
+- **Background scanning.** It only works with a service-UUID filter, and only on UUIDs in the primary advertising PDU. Forma prefers pending connects over scanning. It scans only in the foreground during device selection, filtered and time-boxed.
+
+**When iOS relaunches a terminated Forma (TN3115)**
+
+| Situation | Relaunched? |
+|---|---|
+| Removed from memory / crashed | Yes, if a connect, notification or scan was pending |
+| Device restarted | Yes, but **only after the first unlock** when a passcode is set |
+| Airplane Mode toggled | Yes, unless Airplane Mode also turns Bluetooth off |
+| Bluetooth toggled in **Settings** | **No**. Open Forma again |
+| **Force-quit by the user** (swiped away) | **No** for plain Core Bluetooth apps. iOS 26+ relaunches only apps that set the accessory up with **AccessorySetupKit**, and field reports about that are mixed |
+| Control Center Bluetooth button | Per TN3115 note 5, guaranteed only for AccessorySetupKit apps on iOS 26+ |
+| App update, Low Power Mode, permission revoked | Not documented. Treat as **not guaranteed**. Forma records these states next to gaps |
+
+**AccessorySetupKit (ASK) decision.** ASK gives per-accessory consent and is the documented way to survive force-quit on iOS 26+. However, Apple staff state that ASK and generic Core Bluetooth use are mutually exclusive within an app. ASK also needs the band to advertise a matching service UUID or company identifier in its primary advertising packet, and that is not yet verified for WHOOP 5.0. So **v1 ships with plain Core Bluetooth**, and the diagnostics screen records the band's advertisement (service UUIDs, manufacturer data, company ID, name). With those values, ASK can be turned on through Info.plist keys (`NSAccessorySetupKitSupports` and friends). `docs/BUILD_AND_INSTALL.md` describes that step. Forma never calls `removeAccessory`, because that would unpair the band system-wide, including from the official app.
+
+**Bonding.** Bonds are system-level: an app cannot unpair, and an existing bond made by the official app is expected to be reused. If the band demands pairing, the first subscribe happens in the foreground so the system prompt can appear. `insufficientAuthentication` or `insufficientEncryption` responses are reported as "pairing needed or declined", and Forma never works around them.
+
+**Coexistence.** Several apps can hold the same peripheral at once. Whether the band tolerates two GATT clients sending commands, especially during a history transfer, must be verified on hardware (`HARDWARE_TEST_CHECKLIST.md` T11).
+
+**What this means for coverage.** Gaps from disconnects, force-quits or Bluetooth toggles are recovered from the band's own history on the next sync, **if** the band still holds it. The coverage timeline marks such periods "pending sync" until then, and "not recorded" once a sync has passed them.
 
 ## 8. Testing strategy
 
