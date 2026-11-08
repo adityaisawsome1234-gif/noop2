@@ -133,10 +133,7 @@ public protocol IngestSink: Sendable {
     func finishSyncRun(_ run: SyncRunRecord) throws
     /// Make every committed transaction durable on storage (survives power loss and OS crashes).
     /// The sync engine calls this after saving a history chunk and before acknowledging it to the band.
+    /// Deliberately has no default implementation: every sink must state how it is durable.
     func ensureDurable() throws
 }
 
-public extension IngestSink {
-    /// Default for sinks whose commits are already durable (or that hold nothing across crashes).
-    func ensureDurable() throws {}
-}

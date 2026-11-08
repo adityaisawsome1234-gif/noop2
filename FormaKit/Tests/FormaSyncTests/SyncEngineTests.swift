@@ -62,6 +62,7 @@ final class RecordingSink: IngestSink, @unchecked Sendable {
     func recordRawFrame(_ frame: RawFrameRecord) throws {}
     func beginSyncRun(_ run: SyncRunRecord) throws -> Int64 { lock.withLock { runs.append(run); return Int64(runs.count) } }
     func finishSyncRun(_ run: SyncRunRecord) throws { lock.withLock { runs.append(run) } }
+    func ensureDurable() throws { log.append("durable") }
     var currentCursor: SyncCursor? { lock.withLock { cursor } }
 }
 
@@ -202,6 +203,8 @@ func runScript(_ engine: SyncEngine, link: ReplayLink, settle: @escaping @Sendab
         let lastHistoryIngest = entries.lastIndex(where: { $0 == "ingest:history" })
         #expect(ackIndex != nil, "an acknowledgement should be sent: \(entries)")
         #expect(lastHistoryIngest != nil && lastHistoryIngest! < ackIndex!, "history must be persisted before the ack: \(entries)")
+        let durable = entries.lastIndex(of: "durable")
+        #expect(durable != nil && lastHistoryIngest! < durable! && durable! < ackIndex!, "made durable between save and ack: \(entries)")
         #expect(sink.hr.count == 5)
         #expect(sink.hr.allSatisfy { $0.source == .deviceHistory && $0.quality.contains(.unvalidatedField) })
         #expect(sink.currentCursor?.opaque == Data([0xAB, 0xCD]))

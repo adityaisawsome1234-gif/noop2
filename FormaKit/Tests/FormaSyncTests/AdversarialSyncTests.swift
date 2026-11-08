@@ -290,6 +290,7 @@ fileprivate final class AdvSink: IngestSink, @unchecked Sendable {
     func recordRawFrame(_ frame: RawFrameRecord) throws { lock.withLock { _raw.append(frame) } }
     func beginSyncRun(_ run: SyncRunRecord) throws -> Int64 { lock.withLock { _begun.append(run); return Int64(_begun.count) } }
     func finishSyncRun(_ run: SyncRunRecord) throws { lock.withLock { _finished.append(run) } }
+    func ensureDurable() throws {}
 
     var hr: [HeartRateSample] { lock.withLock { _hr } }
     var historyHR: [HeartRateSample] { lock.withLock { _hr.filter { $0.source == .deviceHistory } } }
@@ -1254,11 +1255,12 @@ fileprivate let advEverything = TimeRange(start: 0, end: .max)
         #expect(flagged.isEmpty, "a re-requested transfer is not a device restart: \(flagged.map(\.deviceTimeRaw))")
     }
 
-    /// IMPLEMENTATION BUG (sync × dedup design): "Re-downloads ... never duplicate" and PRD acceptance 2
-    /// ("interrupted sync without duplicates"). The HR/motion dedup key is the *corrected* timestamp, and the
-    /// engine applies whatever clock offset the current connection measured. A record saved unacknowledged in
-    /// one session (no clock reading) and re-sent in the next (band clock read 10 s behind) maps to a different
-    /// timestamp and is stored twice.
+    /// "Re-downloads ... never duplicate" and PRD acceptance 2 ("interrupted sync without duplicates"): a record
+    /// saved unacknowledged in an interrupted session is re-sent in the next one and stored once. Note: neither
+    /// session reads the clock (`advEngine` defaults to `readClock: false`), so no correction is applied. The case
+    /// where the correction really changes between downloads (here: the scripted 10 s) still stores the record
+    /// twice, because the HR/motion dedup key is the corrected time; that store-level issue is tracked as a known
+    /// issue in ReviewFixClockTests (and a jittering correction for a steady clock is covered there too).
     @Test func clockOffsetChangeBetweenDownloadsDoesNotDuplicateHistory() async throws {
         let store = try FormaStore(path: nil, timeSource: ManualTimeSource(advNow))
         // Session 1: the band does not answer the clock read; the link drops mid-chunk (nothing acknowledged).

@@ -22,6 +22,8 @@ final class ProtectedSink: IngestSink, @unchecked Sendable {
     func recordRawFrame(_ frame: RawFrameRecord) throws { try platform.runProtected("forma.raw") { try store.recordRawFrame(frame) } }
     func beginSyncRun(_ run: SyncRunRecord) throws -> Int64 { try platform.runProtected("forma.run") { try store.beginSyncRun(run) } }
     func finishSyncRun(_ run: SyncRunRecord) throws { try platform.runProtected("forma.run") { try store.finishSyncRun(run) } }
+    /// Forwarded, never skipped: the engine acknowledges band history only after this returns.
+    func ensureDurable() throws { try platform.runProtected("forma.durable") { try store.ensureDurable() } }
 }
 
 extension AppModel {

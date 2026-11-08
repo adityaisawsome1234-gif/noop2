@@ -544,7 +544,8 @@ fileprivate func advIsCanonicalUUID(_ s: String) -> Bool {
     }
 
     @Test func unpaddedFramesFromTheBandAreAccepted() {
-        // The public "live identity" K24 payload is 162 bytes (162 % 4 == 2): the band does not always pad.
+        // Whether the band pads payloads is open (the public 162-byte "live identity" K24 payload is most likely a
+        // truncated extraction); either way an unpadded frame must decode, since the declared length decides.
         let p = advRecord(k: 24, counter: 3_871, seconds: 1_779_773_861, length: 162, set: [17: 151])
         let frame = advFrame(p, pad: false)
         #expect(frame.count == 8 + 162 + 4)
