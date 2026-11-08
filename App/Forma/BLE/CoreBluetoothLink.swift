@@ -28,9 +28,9 @@ final class CoreBluetoothLink: PeripheralLink, @unchecked Sendable {
         self.queue = queue
         self.characteristics = characteristics
         var cont: AsyncStream<LinkEvent>.Continuation!
-        // Bounded buffer: if the consumer stalls, the oldest notifications are dropped (and counted as a gap)
-        // rather than growing memory without limit.
-        self.events = AsyncStream(bufferingPolicy: .bufferingNewest(10_000)) { cont = $0 }
+        // Unbounded: dropping a notification silently could hide a gap inside a history chunk. The engine
+        // consumes on its own actor, and notifications are small (≤ 512 B).
+        self.events = AsyncStream(bufferingPolicy: .unbounded) { cont = $0 }
         self.continuation = cont
     }
 
@@ -57,7 +57,8 @@ final class CoreBluetoothLink: PeripheralLink, @unchecked Sendable {
         continuation.finish()
     }
 
-    func write(_ bytes: [UInt8], characteristic: String, withResponse: Bool) async throws {
+    func write(_ command: EncodedCommand, characteristic: String, withResponse: Bool) async throws {
+        let bytes = command.bytes
         let key = UUIDs.normalize(characteristic)
         guard let c = characteristics[key] else { throw LinkError.characteristicNotFound(key) }
         if lock.withLock({ closed }) { throw LinkError.notConnected }

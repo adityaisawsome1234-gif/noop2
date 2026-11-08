@@ -142,6 +142,6 @@ Acceptance criteria (verification method in brackets):
 |---|---|---|
 | The WHOOP 5.0 protocol differs on the owner's firmware from what public work describes | Vendor data path fails | Adapter isolation, a diagnostics capture/export flow, replay tooling, and the standard HR service as a fallback |
 | The band requires authentication Forma cannot legitimately perform | Vendor path unavailable | Report unsupported and fall back to the standard HR service if the band broadcasts it. No circumvention |
-| The official WHOOP app competes for the connection or the band's history pointer | Missing or duplicated history | Document coexistence, use dedup keys, and acknowledge history only after durable persistence |
+| The official WHOOP app competes for the connection or the band's history pointer | Missing or duplicated history | Document coexistence and use dedup keys. Act only on transfers Forma requested. Leave acknowledgements off by default; when enabled, acknowledge only intact chunks after a durable save |
 | iOS background limits | Gaps | Backfill from band history, honest coverage, documented relaunch rules |
 | Optical beat-interval quality | Noisy HRV | Artifact rules, minimum valid windows, coverage and confidence labels, overnight-only default |
