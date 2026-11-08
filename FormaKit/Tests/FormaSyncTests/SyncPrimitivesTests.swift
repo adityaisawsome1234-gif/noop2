@@ -1,8 +1,13 @@
 import Foundation
 import Testing
 import FormaCore
-import FormaProtocol
+@testable import FormaProtocol
 @testable import FormaSync
+
+/// Test helper: an encoded command with arbitrary bytes (only tests can build one).
+func testCommand(_ bytes: [UInt8]) -> EncodedCommand {
+    EncodedCommand(command: .identify, sequence: 0, bytes: bytes)
+}
 
 @Suite struct ClockMapperTests {
     let now: EpochMillis = 1_762_560_000_000
@@ -17,7 +22,7 @@ import FormaProtocol
 
     @Test func appliesLargeOffsetWithFlag() {
         var m = ClockMapper()
-        m.add(DeviceClockReading(deviceSeconds: UInt32(now / 1_000) - 300, phoneTime: now)) // band 5 min slow
+        m.add(DeviceClockReading(deviceSeconds: UInt32(now / 1_000) - 300, subsecondMillis: 0, phoneTime: now)) // band 5 min slow
         let mapped = m.map(deviceSeconds: UInt32(now / 1_000) - 360, now: now)
         #expect(mapped.timestamp == now - 60_000)
         #expect(mapped.flags.contains(.clockOffsetApplied))
@@ -88,14 +93,14 @@ import FormaProtocol
         #expect(events.count == 4)
         #expect(events[1] == .notification(characteristic: UUIDs.normalize("2A37"), bytes: [0x00, 0x48], receivedAt: 1))
         if case .disconnected = events.last {} else { Issue.record("expected disconnect at end") }
-        await #expect(throws: LinkError.notConnected) { try await link.write([1], characteristic: "x", withResponse: true) }
+        await #expect(throws: LinkError.notConnected) { try await link.write(testCommand([1]), characteristic: "x", withResponse: true) }
     }
 
     @Test func responderScriptsReactions() async throws {
         let link = ReplayLink(entries: [], services: [:], responder: { bytes, _ in
             bytes == [0x01] ? [.notification(characteristic: "AA", bytes: [0x02], receivedAt: 5)] : []
         })
-        try await link.write([0x01], characteristic: "bb", withResponse: true)
+        try await link.write(testCommand([0x01]), characteristic: "bb", withResponse: true)
         link.finish()
         var events: [LinkEvent] = []
         for await e in link.events { events.append(e) }

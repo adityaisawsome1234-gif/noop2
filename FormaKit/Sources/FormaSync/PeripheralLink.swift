@@ -29,6 +29,7 @@ public protocol PeripheralLink: AnyObject, Sendable {
     var peripheralID: String { get }
     /// Single-consumer stream of link events for the lifetime of this connection.
     var events: AsyncStream<LinkEvent> { get }
-    /// Writes bytes to a characteristic. Implementations must deliver writes in call order.
-    func write(_ bytes: [UInt8], characteristic: String, withResponse: Bool) async throws
+    /// Writes an adapter-encoded command to a characteristic. Implementations must deliver writes in
+    /// call order. Only `EncodedCommand` is accepted: raw bytes cannot be written through a link.
+    func write(_ command: EncodedCommand, characteristic: String, withResponse: Bool) async throws
 }

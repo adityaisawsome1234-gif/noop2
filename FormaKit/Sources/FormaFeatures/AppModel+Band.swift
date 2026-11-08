@@ -130,6 +130,14 @@ extension AppModel {
         await engine?.setOptions(syncOptions())
     }
 
+    /// Experimental: confirm intact, durably saved history chunks to the band. Off by default because
+    /// the acknowledgement format is not verified on hardware and the band may then free that data.
+    public func setHistoryAcknowledgement(_ on: Bool) async {
+        historyAcknowledgementEnabled = on
+        setStoreSetting(on ? "1" : "0", "historyAcknowledgement")
+        await engine?.setOptions(syncOptions())
+    }
+
     public func syncNow() async {
         guard historySyncMode != .off else { return }
         await engine?.requestHistorySync()
@@ -144,7 +152,8 @@ extension AppModel {
         case .manual: policy = .manual
         case .automatic: policy = .automatic
         }
-        return SyncOptions(history: policy, liveHeartRate: liveHeartRateEnabled, rawCapture: diagnostics.captureEnabled)
+        return SyncOptions(history: policy, acknowledgeHistory: historyAcknowledgementEnabled, liveHeartRate: liveHeartRateEnabled,
+                           rawCapture: diagnostics.captureEnabled)
     }
 
     func startEngine(on link: any PeripheralLink, services: [GATTServiceSummary]) {
@@ -209,10 +218,18 @@ extension AppModel {
             connection.sync = .syncingHistory(recordsReceived: records, newestRecord: newest)
         case .historyChunkSaved:
             break
-        case .historyComplete(let at):
+        case .historyComplete(let at, let chunks, let acknowledged):
             connection.sync = .idle
             connection.lastCompletedSync = at
-            updateCheck("history", .passed, "History transferred, saved, then acknowledged.")
+            let detail: String
+            if chunks == 0 {
+                detail = "The band reported no stored history to transfer."
+            } else if acknowledged == 0 {
+                detail = "History transferred and saved (\(chunks) chunk\(chunks == 1 ? "" : "s")). Not acknowledged, so the band keeps its copy."
+            } else {
+                detail = "History transferred and saved; \(acknowledged) of \(chunks) chunk\(chunks == 1 ? "" : "s") acknowledged after saving."
+            }
+            updateCheck("history", .passed, detail)
             scheduleRefresh()
         case .historyStopped(let reason, let at):
             connection.sync = .failed(message: reason, at: at)
@@ -228,6 +245,10 @@ extension AppModel {
         case .clockOffset(let millis):
             updateCheck("clock", abs(millis) <= 2_000 ? .passed : .unverified,
                         "Band clock differs from this iPhone by \(DisplayFormat.number(Double(millis) / 1_000, digits: 1)) s.")
+        case .clockImplausible(let offset):
+            let days = DisplayFormat.number(Double(abs(offset)) / 86_400_000, digits: 1)
+            updateCheck("clock", .failed,
+                        "The band's clock is off by about \(days) days. Forma never sets the band's clock, so band history can't be placed in time and is left on the band. Opening the official app once usually corrects the band's clock.")
         case .pairingRequired:
             alertMessage = "The band asked for a paired connection. Accept the iOS pairing prompt; Forma never bypasses pairing."
         case .commandSent:

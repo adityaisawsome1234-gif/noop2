@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import FormaCore
-import FormaProtocol
+@testable import FormaProtocol
 @testable import FormaSync
 
 // MARK: - Test doubles
@@ -82,17 +82,20 @@ struct ToyAdapter: DeviceAdapter {
 
     func supports(_ command: AllowedCommand) -> Bool { supported.contains(command.name) }
 
-    func encode(_ command: AllowedCommand, sequence: UInt8) throws -> [UInt8] {
+    func encode(_ command: AllowedCommand, sequence: UInt8) throws -> EncodedCommand {
         guard supports(command) else { throw CommandEncodingError.unsupported(command.name) }
+        let bytes: [UInt8]
         switch command {
-        case .identify: return [0x10, sequence]
-        case .readClock: return [0x11, sequence]
-        case .requestHistory: return [0x12, sequence]
-        case .acknowledgeHistory(let token): return [0x13, sequence] + token
-        case .abortHistory: return [0x14, sequence]
-        case .setRealtimeHeartRate(let on): return [on ? 0x15 : 0x16, sequence]
+        case .identify: bytes = [0x10, sequence]
+        case .readClock: bytes = [0x11, sequence]
+        case .requestHistory: bytes = [0x12, sequence]
+        case .acknowledgeHistory(let token): bytes = [0x13, sequence] + token
+        case .abortHistory: bytes = [0x14, sequence]
+        case .setRealtimeHeartRate(let on): bytes = [on ? 0x15 : 0x16, sequence]
+        case .readHistoryRange: bytes = [0x17, sequence]
         default: throw CommandEncodingError.unsupported(command.name)
         }
+        return EncodedCommand(command: command, sequence: sequence, bytes: bytes)
     }
 
     func makeDecoder() -> any DeviceDecoder { ToyDecoder() }
@@ -120,7 +123,20 @@ final class ToyDecoder: DeviceDecoder {
         case 0x04: return [.historyMarker(HistoryMarker(kind: .end, ackToken: bytes.count > 1 ? Array(bytes.dropFirst()) : nil, receivedAt: receivedAt))]
         case 0x05: return [.historyMarker(HistoryMarker(kind: .complete, ackToken: nil, receivedAt: receivedAt))]
         case 0x06: return [.malformed(reason: "bad crc", byteCount: bytes.count, characteristic: characteristic, receivedAt: receivedAt)]
-        case 0x07: return [.clockReading(deviceSeconds: u32(1), receivedAt: receivedAt)]
+        case 0x07: return [.clockReading(deviceSeconds: u32(1), subsecondMillis: nil, receivedAt: receivedAt)]
+        case 0x09:
+            // Command response: [0x09, command opcode, result]; result 1 success, 2 pending, else rejected.
+            let kinds: [UInt8: AllowedCommand.Kind] = [0x10: .identify, 0x11: .readClock, 0x12: .requestHistory, 0x13: .acknowledgeHistory,
+                                                      0x15: .setRealtimeHeartRate, 0x16: .setRealtimeHeartRate, 0x17: .readHistoryRange]
+            let status: CommandStatus = bytes[2] == 1 ? .success : (bytes[2] == 2 ? .pending : .rejected)
+            return [.commandResponse(CommandResponse(command: bytes[1], sequence: 0, originSequence: nil, resultCode: bytes[2],
+                                                     data: Array(bytes.dropFirst(3)), receivedAt: receivedAt,
+                                                     answers: kinds[bytes[1]], status: status))]
+        case 0x0A:
+            // History record of a kind the toy adapter does not decode.
+            return [.historyRecord(HistoryRecord(kind: 99, counter: u32(1), deviceSeconds: u32(5), subseconds: 0, receivedAt: receivedAt,
+                                                 heartRate: nil, heartRateStatus: .unvalidated, beatIntervalsMillis: [],
+                                                 motion: nil, payloadLength: bytes.count, contentDecoded: false))]
         default: return [.unknownPacket(packetType: type, length: bytes.count, characteristic: characteristic, receivedAt: receivedAt)]
         }
     }
@@ -152,10 +168,12 @@ func historyLink(log: OrderLog, chunk: [[UInt8]], endToken: [UInt8]? = [0xAB, 0x
 }
 
 func makeEngine(sink: RecordingSink, adapter: ToyAdapter = ToyAdapter(), history: HistoryPolicy = .automatic,
-                now: EpochMillis = Int64(baseSeconds) * 1_000 + 3_600_000) -> SyncEngine {
+                acknowledge: Bool = true, now: EpochMillis = Int64(baseSeconds) * 1_000 + 3_600_000,
+                timeSource: ManualTimeSource? = nil, readClock: Bool = false) -> SyncEngine {
     let device = DeviceRecord(id: "dev-1", family: .unknown, name: "Toy", firstSeen: 0)
-    return SyncEngine(adapter: adapter, sink: sink, device: device, timeSource: ManualTimeSource(now),
-                      options: SyncOptions(history: history, liveHeartRate: false, rawCapture: true, liveFlushIntervalMillis: 0),
+    return SyncEngine(adapter: adapter, sink: sink, device: device, timeSource: timeSource ?? ManualTimeSource(now),
+                      options: SyncOptions(history: history, acknowledgeHistory: acknowledge, liveHeartRate: false, rawCapture: true,
+                                           liveFlushIntervalMillis: 0, readClockOnConnect: readClock, timerIntervalMillis: 0),
                       recorder: CaptureRecorder())
 }
 
@@ -191,7 +209,7 @@ func runScript(_ engine: SyncEngine, link: ReplayLink, settle: @escaping @Sendab
         #expect(link.writtenCommands.contains { $0.bytes == [0x13, $0.bytes[1], 0xAB, 0xCD] })
     }
 
-    @Test func persistenceFailureMeansNoAckAndAbort() async {
+    @Test func persistenceFailureMeansNoAckAndNoAbort() async {
         let log = OrderLog()
         let sink = RecordingSink(log: log)
         sink.failIngestWhen = { $0.provenance.note == "history" }
@@ -200,7 +218,7 @@ func runScript(_ engine: SyncEngine, link: ReplayLink, settle: @escaping @Sendab
         _ = await runScript(engine, link: link)
         let writes = log.all.filter { $0.hasPrefix("write:") }
         #expect(!writes.contains("write:13"), "no ack after a failed save: \(writes)")
-        #expect(writes.contains("write:14"), "transfer aborted: \(writes)")
+        #expect(!writes.contains("write:14"), "Forma never sends an abort; the band keeps the data: \(writes)")
         #expect(sink.currentCursor?.lastCompleteSyncAt == nil)
     }
 
@@ -262,6 +280,147 @@ func runScript(_ engine: SyncEngine, link: ReplayLink, settle: @escaping @Sendab
         #expect(!log.all.contains("write:13"))
         #expect(sink.hr.count == 1)
         #expect(run.status == .interrupted)
+    }
+
+    @Test func acknowledgementsAreOffByDefault() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        let engine = makeEngine(sink: sink, acknowledge: false)
+        let link = historyLink(log: log, chunk: (0..<3).map { historyRecord(counter: UInt32($0), seconds: baseSeconds + UInt32($0), hr: 60) })
+        let run = await runScript(engine, link: link)
+        #expect(log.all.contains("write:12"), "history is still downloaded")
+        #expect(!log.all.contains("write:13"), "but never acknowledged unless enabled")
+        #expect(sink.hr.count == 3)
+        #expect(sink.currentCursor?.lastCompleteSyncAt == 2_001, "a fully saved transfer is complete even without acks")
+        #expect(sink.currentCursor?.opaque == nil, "no token is recorded when nothing was acknowledged")
+        #expect(run.status == .completed)
+    }
+
+    @Test func chunkWithUndecodedRecordsIsSavedButNotAcknowledged() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        let engine = makeEngine(sink: sink)
+        let link = historyLink(log: log, chunk: [historyRecord(counter: 1, seconds: baseSeconds, hr: 60), [0x0A] + le32(2) + le32(baseSeconds + 1)])
+        let run = await runScript(engine, link: link)
+        #expect(!log.all.contains("write:13"), "the band must keep records Forma cannot store")
+        #expect(sink.hr.count == 1)
+        #expect(await engine.currentCounters.historyRecordsUndecoded == 1)
+        #expect(run.status == .failed)
+    }
+
+    @Test func historyFromAnotherAppIsNeverAcknowledged() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        // Manual policy: Forma does not request history, but the band streams a chunk (another app asked).
+        let engine = makeEngine(sink: sink, history: .manual)
+        let link = ReplayLink(entries: [
+            CaptureEntry(t: 1_000, dir: .rx, c: toyData, d: "03"),
+            CaptureEntry(t: 1_001, dir: .rx, c: toyData, d: hexString(historyRecord(counter: 1, seconds: baseSeconds, hr: 60))),
+            CaptureEntry(t: 1_002, dir: .rx, c: toyData, d: "04abcd"),
+            CaptureEntry(t: 1_003, dir: .rx, c: toyData, d: "05"),
+        ], services: [:])
+        _ = await engine.run(link: link)
+        #expect(link.writtenCommands.allSatisfy { $0.bytes.first == 0x10 }, "only identify may be written: \(link.writtenCommands.map(\.bytes))")
+        #expect(sink.hr.count == 1, "stored passively because history is enabled")
+        #expect(sink.currentCursor == nil, "the sync cursor belongs to Forma's own transfers")
+        #expect(await engine.currentCounters.historyRecordsUnsolicited == 1)
+    }
+
+    @Test func rangeIsRequestedFirstAndPendingIsWaitedOut() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        var adapter = ToyAdapter()
+        adapter.supported.insert("readHistoryRange")
+        let clock = ManualTimeSource(Int64(baseSeconds) * 1_000 + 3_600_000)
+        let engine = makeEngine(sink: sink, adapter: adapter, timeSource: clock)
+        let body = [UInt8](repeating: 0, count: 25)
+        let link = ReplayLink(entries: [], services: [:], responder: { bytes, _ in
+            log.append("write:\(String(format: "%02x", bytes[0]))")
+            switch bytes[0] {
+            case 0x17 where !log.all.contains("pending-sent"):
+                log.append("pending-sent")
+                return [.notification(characteristic: toyData, bytes: [0x09, 0x17, 2], receivedAt: 1_000)]
+            case 0x17:
+                return [.notification(characteristic: toyData, bytes: [0x09, 0x17, 1] + body, receivedAt: 1_000)]
+            case 0x12:
+                return [.notification(characteristic: toyData, bytes: [0x09, 0x12, 1], receivedAt: 1_001),
+                        .notification(characteristic: toyData, bytes: [0x03], receivedAt: 1_002),
+                        .notification(characteristic: toyData, bytes: historyRecord(counter: 1, seconds: baseSeconds, hr: 60), receivedAt: 1_003),
+                        .notification(characteristic: toyData, bytes: [0x04, 0xAB], receivedAt: 1_004),
+                        .notification(characteristic: toyData, bytes: [0x05], receivedAt: 1_005)]
+            default:
+                return []
+            }
+        })
+        _ = await runScript(engine, link: link, settle: {
+            // The first range answer is PENDING: nothing more happens until the grace period runs out…
+            #expect(!log.all.contains("write:12"))
+            clock.advance(byMillis: 26_000)
+            await engine.checkDeadlines()          // grace over → retry scheduled 1 s later
+            #expect(!log.all.contains("write:12"))
+            clock.advance(byMillis: 1_100)
+            await engine.checkDeadlines()          // retry sent → SUCCESS → history requested
+            for _ in 0..<20 { await Task.yield() }
+        })
+        let writes = log.all.filter { $0.hasPrefix("write:") }
+        // …then the range request is retried, answered with SUCCESS, and only then is history requested.
+        #expect(writes == ["write:10", "write:17", "write:17", "write:12", "write:13"], "\(writes)")
+        #expect(sink.hr.count == 1)
+    }
+
+    @Test func historyWaitsForTheClockReading() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        let now = Int64(baseSeconds) * 1_000 + 3_600_000
+        let engine = makeEngine(sink: sink, now: now, readClock: true)
+        let link = ReplayLink(entries: [], services: [:], responder: { bytes, _ in
+            log.append("write:\(String(format: "%02x", bytes[0]))")
+            switch bytes[0] {
+            case 0x11:
+                // The band's clock runs 10 s behind the phone.
+                return [.notification(characteristic: toyData, bytes: [0x07] + le32(UInt32(now / 1_000) - 10), receivedAt: now)]
+            case 0x12:
+                return [.notification(characteristic: toyData, bytes: [0x03], receivedAt: now),
+                        .notification(characteristic: toyData, bytes: historyRecord(counter: 1, seconds: baseSeconds, hr: 60), receivedAt: now),
+                        .notification(characteristic: toyData, bytes: [0x04, 0xAB], receivedAt: now),
+                        .notification(characteristic: toyData, bytes: [0x05], receivedAt: now)]
+            default:
+                return []
+            }
+        })
+        _ = await runScript(engine, link: link)
+        let writes = log.all.filter { $0.hasPrefix("write:") }
+        #expect(writes.firstIndex(of: "write:11")! < writes.firstIndex(of: "write:12")!)
+        #expect(sink.hr.count == 1)
+        // Offset ≈ +10 s (phone ahead of band) is applied and recorded.
+        #expect(sink.hr[0].quality.contains(.clockOffsetApplied))
+        #expect(abs(sink.hr[0].timestamp - (Int64(baseSeconds) * 1_000 + 10_000)) <= 1_000)
+    }
+
+    @Test func implausibleBandClockLeavesHistoryOnTheBand() async {
+        let log = OrderLog()
+        let sink = RecordingSink(log: log)
+        let now = Int64(baseSeconds) * 1_000 + 3_600_000
+        let engine = makeEngine(sink: sink, now: now, readClock: true)
+        let link = ReplayLink(entries: [], services: [:], responder: { bytes, _ in
+            log.append("write:\(String(format: "%02x", bytes[0]))")
+            switch bytes[0] {
+            case 0x11:
+                // The band's clock is three days behind: it was reset and set to a wrong date.
+                return [.notification(characteristic: toyData, bytes: [0x07] + le32(UInt32(now / 1_000) - 3 * 86_400), receivedAt: now)]
+            case 0x12:
+                return [.notification(characteristic: toyData, bytes: [0x03], receivedAt: now),
+                        .notification(characteristic: toyData, bytes: historyRecord(counter: 1, seconds: baseSeconds, hr: 60), receivedAt: now),
+                        .notification(characteristic: toyData, bytes: [0x04, 0xAB], receivedAt: now),
+                        .notification(characteristic: toyData, bytes: [0x05], receivedAt: now)]
+            default:
+                return []
+            }
+        })
+        _ = await runScript(engine, link: link)
+        #expect(sink.hr.isEmpty, "records cannot be placed in time")
+        #expect(!log.all.contains("write:13"))
+        #expect(await engine.currentCounters.historyRecordsUnmapped == 1)
     }
 
     @Test func unsupportedCommandsAreNeverWritten() async {

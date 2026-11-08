@@ -59,20 +59,6 @@ final class SummarySink: IngestSink, @unchecked Sendable {
     func finishSyncRun(_ run: SyncRunRecord) throws {}
 }
 
-func hexBytes(_ text: String) -> [UInt8]? {
-    let clean = text.filter { $0.isHexDigit }
-    guard clean.count % 2 == 0 else { return nil }
-    var out: [UInt8] = []
-    var i = clean.startIndex
-    while i < clean.endIndex {
-        let j = clean.index(i, offsetBy: 2)
-        guard let b = UInt8(clean[i..<j], radix: 16) else { return nil }
-        out.append(b)
-        i = j
-    }
-    return out
-}
-
 func describe(_ e: DecodedEvent) -> String {
     switch e {
     case .standardHeartRate(let bpm, let contact, let rr, _, _): return "standard HR \(bpm.map(String.init) ?? "none") bpm, contact \(contact.rawValue), \(rr.count) RR"
@@ -81,12 +67,13 @@ func describe(_ e: DecodedEvent) -> String {
         var s = "history K\(r.kind) counter \(r.counter) t=\(r.deviceSeconds) (\(Date(timeIntervalSince1970: TimeInterval(r.deviceSeconds)))) len \(r.payloadLength)"
         if let hr = r.heartRate { s += " HR-candidate \(hr) (\(r.heartRateStatus.rawValue))" }
         if let m = r.motion { s += String(format: " motion n=%d |a|=%.1f activity=%.2f (device counts)", m.sampleCount, m.meanMagnitude, m.activity) }
+        if !r.contentDecoded { s += " (content not decoded by Forma)" }
         return s
     case .historyMarker(let m): return "history \(m.kind.rawValue)\(m.ackToken.map { " token \($0.map { String(format: "%02x", $0) }.joined())" } ?? "")"
     case .commandResponse(let r): return "response cmd \(r.command) seq \(r.originSequence.map(String.init) ?? "?") result \(r.resultCode.map(String.init) ?? "?") data \(r.data.count) B"
     case .deviceEvent(let ev): return "event \(ev.name) (\(ev.eventID)) \(ev.data.count) B"
     case .batteryLevel(let p, _): return "battery \(p)%"
-    case .clockReading(let s, _): return "clock \(s)"
+    case .clockReading(let s, let ms, _): return "clock \(s)\(ms.map { String(format: ".%03d", $0) } ?? "") (\(Date(timeIntervalSince1970: TimeInterval(s))))"
     case .deviceInformation(let f, let v): return "\(f): \(v)"
     case .unknownPacket(let t, let n, let c, _): return "unknown packet type \(t) (\(n) B) on \(c)"
     case .malformed(let r, let n, let c, _): return "MALFORMED \(r) (\(n) B) on \(c)"
@@ -95,12 +82,21 @@ func describe(_ e: DecodedEvent) -> String {
 }
 
 func decodePayloadFile(_ path: String, json: Bool) -> Bool {
-    guard let text = try? String(contentsOfFile: path, encoding: .utf8), let payload = hexBytes(text) else {
-        FileHandle.standardError.write(Data("cannot read hex payload from \(path)\n".utf8))
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+        FileHandle.standardError.write(Data("cannot read \(path)\n".utf8))
+        return false
+    }
+    guard let payload = HexCodec.decodeLoose(text), !payload.isEmpty else {
+        FileHandle.standardError.write(Data("\(path): not hex (allowed: hex digits, whitespace, commas, colons, dashes, 0x prefixes)\n".utf8))
+        return false
+    }
+    let framed: [UInt8]
+    do { framed = try Whoop5Adapter.frame(payload: payload) } catch {
+        FileHandle.standardError.write(Data("\(path): \(error)\n".utf8))
         return false
     }
     let decoder = Whoop5Decoder()
-    let events = decoder.decode(characteristic: Whoop5Adapter.dataFromStrap, bytes: Whoop5Adapter.frame(payload: payload), receivedAt: 0)
+    let events = decoder.decode(characteristic: Whoop5Adapter.dataFromStrap, bytes: framed, receivedAt: 0)
     if json {
         let lines = events.map { describe($0) }
         if let data = try? JSONSerialization.data(withJSONObject: ["file": path, "events": lines], options: [.prettyPrinted, .sortedKeys]) {
@@ -127,38 +123,60 @@ func replayCapture(_ path: String, json: Bool) async -> Bool {
     guard let adapter = AdapterRegistry.adapter(for: header.deviceFamily) ?? AdapterRegistry.adapter(forDiscoveredServices: []) ?? Optional(Whoop5Adapter()) else {
         return false
     }
-    // Per-event listing (decoder only), then the full pipeline for totals.
-    let decoder = adapter.makeDecoder()
+    // Per-event listing (decoder only, one decoder per connection), then the full pipeline for totals.
+    let segments = ReplayLink.segments(of: decoded.file.entries)
     var typeCounts: [String: Int] = [:]
     var listing: [String] = []
-    for e in decoded.file.entries where e.dir == .rx {
-        guard let bytes = hexBytes(e.d) else { continue }
-        for ev in decoder.decode(characteristic: e.c, bytes: bytes, receivedAt: e.t) {
-            let d = describe(ev)
-            typeCounts[String(d.split(separator: " ").first ?? "?"), default: 0] += 1
-            if listing.count < 2_000 { listing.append("\(e.t) \(d)") }
+    for segment in segments {
+        let decoder = adapter.makeDecoder()
+        for e in segment where e.dir == .rx {
+            guard let bytes = HexCodec.decode(e.d) else { continue }
+            for ev in decoder.decode(characteristic: e.c, bytes: bytes, receivedAt: e.t) {
+                let d = describe(ev)
+                typeCounts[String(d.split(separator: " ").first ?? "?"), default: 0] += 1
+                if listing.count < 2_000 { listing.append("\(e.t) \(d)") }
+            }
         }
     }
     let sink = SummarySink()
-    // History acknowledgements are never replayed: the replay link has no band to talk to.
-    let link = ReplayLink(entries: decoded.file.entries, services: [:])
-    let device = DeviceRecord(id: "replay", family: header.deviceFamily, name: header.deviceName ?? "replay",
-                              firmwareVersion: header.firmwareVersion, firstSeen: header.createdAt)
-    let engine = SyncEngine(adapter: adapter, sink: sink, device: device, timeSource: SystemTimeSource(),
-                            options: SyncOptions(history: .off, liveHeartRate: false, rawCapture: false, liveFlushIntervalMillis: 0,
-                                                 identifyOnConnect: false))
-    _ = await engine.run(link: link)
-    let counters = await engine.currentCounters
+    // One engine per recorded connection. The policy lets history that arrives be decoded and stored,
+    // but nothing is ever requested or acknowledged: the replay link has no band to talk to.
+    var counters = SyncCounters()
+    for segment in segments {
+        let link = ReplayLink(entries: segment, services: [:])
+        let device = DeviceRecord(id: "replay", family: header.deviceFamily, name: header.deviceName ?? "replay",
+                                  firmwareVersion: header.firmwareVersion, firstSeen: header.createdAt)
+        let engine = SyncEngine(adapter: adapter, sink: sink, device: device, timeSource: SystemTimeSource(),
+                                options: SyncOptions(history: .manual, acknowledgeHistory: false, liveHeartRate: false, rawCapture: false,
+                                                     liveFlushIntervalMillis: 0, identifyOnConnect: false, readClockOnConnect: false,
+                                                     timerIntervalMillis: 0))
+        _ = await engine.run(link: link)
+        let c = await engine.currentCounters
+        counters.framesValid += c.framesValid
+        counters.framesMalformed += c.framesMalformed
+        counters.bytesDiscarded += c.bytesDiscarded
+        counters.unknownPackets += c.unknownPackets
+        counters.standardHRNotifications += c.standardHRNotifications
+        counters.standardHRWithRR += c.standardHRWithRR
+        counters.historyRecords += c.historyRecords
+        counters.historyRecordsUnmapped += c.historyRecordsUnmapped
+        counters.historyRecordsUndecoded += c.historyRecordsUndecoded
+        counters.realtimeHRPackets += c.realtimeHRPackets
+    }
     let hrValues = sink.hr.map(\.bpm)
     let summary: [String: Any] = [
         "file": path,
         "header": ["family": header.deviceFamily.rawValue, "firmware": header.firmwareVersion ?? "", "adapter": adapter.adapterID,
-                   "parserVersion": adapter.parserVersion, "entries": decoded.file.entries.count, "skippedLines": decoded.skippedLines.count],
+                   "parserVersion": adapter.parserVersion, "entries": decoded.file.entries.count, "skippedLines": decoded.skippedLines.count,
+                   "connections": segments.count],
         "counters": ["framesValid": counters.framesValid, "framesMalformed": counters.framesMalformed, "bytesDiscarded": counters.bytesDiscarded,
                      "unknownPackets": counters.unknownPackets, "standardHR": counters.standardHRNotifications,
                      "standardHRWithRR": counters.standardHRWithRR, "historyRecords": counters.historyRecords,
-                     "historyRecordsUnmapped": counters.historyRecordsUnmapped],
-        "heartRate": ["samples": hrValues.count, "min": hrValues.min() ?? 0, "max": hrValues.max() ?? 0,
+                     "historyRecordsUnmapped": counters.historyRecordsUnmapped, "historyRecordsUndecoded": counters.historyRecordsUndecoded,
+                     "realtimeHRPackets": counters.realtimeHRPackets],
+        // No samples → null, never a fabricated 0.
+        "heartRate": ["samples": hrValues.count, "min": hrValues.min().map { $0 as Any } ?? NSNull(),
+                      "max": hrValues.max().map { $0 as Any } ?? NSNull(),
                       "unvalidated": sink.hr.filter { $0.quality.contains(.unvalidatedField) }.count],
         "beatIntervals": sink.beats.count,
         "motionEpochs": sink.motion.count,
@@ -171,10 +189,10 @@ func replayCapture(_ path: String, json: Bool) async -> Bool {
     } else {
         print("Capture \(path)")
         print("  family \(header.deviceFamily.rawValue), firmware \(header.firmwareVersion ?? "unknown"), adapter \(adapter.adapterID) \(adapter.parserVersion)")
-        print("  entries \(decoded.file.entries.count) (skipped lines: \(decoded.skippedLines.count))")
+        print("  entries \(decoded.file.entries.count) in \(segments.count) connection(s) (skipped lines: \(decoded.skippedLines.count))")
         print("  frames valid \(counters.framesValid), malformed \(counters.framesMalformed), discarded bytes \(counters.bytesDiscarded), unknown packets \(counters.unknownPackets)")
         print("  standard HR notifications \(counters.standardHRNotifications) (with RR: \(counters.standardHRWithRR))")
-        print("  history records \(counters.historyRecords) (unmapped clock: \(counters.historyRecordsUnmapped))")
+        print("  history records \(counters.historyRecords) (unmapped clock: \(counters.historyRecordsUnmapped); content not decoded: \(counters.historyRecordsUndecoded))")
         print("  heart-rate samples \(hrValues.count)" + (hrValues.isEmpty ? "" : " range \(hrValues.min()!)–\(hrValues.max()!) bpm; unvalidated \(sink.hr.filter { $0.quality.contains(.unvalidatedField) }.count)"))
         print("  beat intervals \(sink.beats.count), motion epochs \(sink.motion.count)")
         print("  decoded events:")

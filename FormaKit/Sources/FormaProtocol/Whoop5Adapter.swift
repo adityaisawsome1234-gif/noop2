@@ -2,7 +2,7 @@ import Foundation
 import FormaCore
 
 /// Adapter for the WHOOP 5.0 / MG generation, written from publicly documented interoperability facts
-/// (see docs/research/SPEC_WHOOP5.md and docs/COMPATIBILITY.md). No third-party code is used.
+/// (see docs/COMPATIBILITY.md and docs/LICENSE_AUDIT.md). No third-party code is used.
 ///
 /// Wire format (all integers little-endian):
 /// ```
@@ -22,8 +22,16 @@ public struct Whoop5Adapter: DeviceAdapter {
     public static let dataFromStrap = "FD4B0005-CCE1-4033-93CE-002D5875F58A"
     public static let memfault = "FD4B0007-CCE1-4033-93CE-002D5875F58A"
 
-    /// Command ids (payload byte 2 of a COMMAND packet). Only read-only, stream and history ids appear here.
-    public enum CommandID: UInt8, Sendable {
+    /// Command ids (payload byte 2 of a COMMAND packet). Only read-only, stream and history ids appear
+    /// here; nothing that resets, erases, updates firmware, writes the clock or changes persistent
+    /// configuration can be expressed.
+    public enum CommandID: UInt8, Sendable, CaseIterable {
+        /// TOGGLE_REALTIME_HR, data `01` on / `00` off (non-destructive stream toggle).
+        case toggleRealtimeHR = 3
+        /// GET_CLOCK, no data. Response body: u32 Unix seconds + u32 sub-seconds in 1/32768 s.
+        case getClock = 11
+        /// ABORT_HISTORICAL_TRANSMITS. Encodable for completeness but NOT supported: the only live
+        /// reference client never sends it and its effect on the band's history pointer is unverified.
         case abortHistoricalTransmits = 20
         case sendHistoricalData = 22
         case historicalDataResult = 23
@@ -44,8 +52,12 @@ public struct Whoop5Adapter: DeviceAdapter {
         case historicalIMU = 52
     }
 
+    /// Result byte of a COMMAND_RESPONSE (payload[4]) as used by the public reference client.
+    public static let resultSuccess: UInt8 = 1
+    public static let resultPending: UInt8 = 2
+
     public let adapterID = "forma.whoop5"
-    public let parserVersion = "whoop5-0.1.0"
+    public let parserVersion = "whoop5-0.2.0"
     public let family = DeviceFamily.whoop5
 
     public init() {}
@@ -67,14 +79,14 @@ public struct Whoop5Adapter: DeviceAdapter {
     /// upgrades entries to `.verifiedOnHardware` only after the matching hardware check passes.
     public var capabilities: [Capability: CapabilityStatus] {
         [
-            .standardHeartRate: .documentedUnverified,
-            .liveHeartRate: .unsupported,           // vendor real-time toggle payload not documented
-            .history: .documentedUnverified,
+            .standardHeartRate: .unknown,           // whether 5.0 exposes/enables 180D/2A37 is not established
+            .liveHeartRate: .candidateUnvalidated,  // vendor real-time frames: HR byte decoded, meaning unvalidated
+            .history: .documentedUnverified,        // download flow from the public reference client
             .historyHeartRate: .candidateUnvalidated,
             .beatIntervals: .unsupported,           // no validated beat-interval field on this generation
-            .motion: .candidateUnvalidated,         // raw accelerometer counts, scale unpublished
-            .battery: .documentedUnverified,        // via the standard Battery Service
-            .clockRead: .unsupported,               // clock-read response layout not documented
+            .motion: .candidateUnvalidated,         // raw accelerometer counts, scale and rate unpublished
+            .battery: .unknown,                     // standard Battery Service, presence on 5.0 second-hand only
+            .clockRead: .documentedUnverified,      // GET_CLOCK layout from the public reference client
             .skinTemperature: .unsupported,
             .spo2: .unsupported,
         ]
@@ -82,16 +94,17 @@ public struct Whoop5Adapter: DeviceAdapter {
 
     public func supports(_ command: AllowedCommand) -> Bool {
         switch command {
-        case .identify, .readHistoryRange, .requestHistory, .abortHistory: return true
+        case .identify, .readClock, .readHistoryRange, .requestHistory, .setRealtimeHeartRate: return true
         case .acknowledgeHistory(let token): return token.count == Self.ackTokenLength
-        case .readBattery, .readClock, .setRealtimeHeartRate: return false
+        // Battery comes from the standard Battery Service; abort is never sent (see CommandID).
+        case .readBattery, .abortHistory: return false
         }
     }
 
     /// Length of the opaque token copied from a HistoryEnd marker into the acknowledgement.
     public static let ackTokenLength = 8
 
-    public func encode(_ command: AllowedCommand, sequence: UInt8) throws -> [UInt8] {
+    public func encode(_ command: AllowedCommand, sequence: UInt8) throws -> EncodedCommand {
         guard supports(command) else { throw CommandEncodingError.unsupported(command.name) }
         let id: CommandID
         var data: [UInt8] = []
@@ -99,27 +112,62 @@ public struct Whoop5Adapter: DeviceAdapter {
         case .identify:
             id = .getHello
             data = [0x01]
+        case .readClock:
+            id = .getClock
         case .readHistoryRange:
             id = .getDataRange
         case .requestHistory:
             id = .sendHistoricalData
-        case .abortHistory:
-            id = .abortHistoricalTransmits
+        case .setRealtimeHeartRate(let on):
+            id = .toggleRealtimeHR
+            data = [on ? 0x01 : 0x00]
         case .acknowledgeHistory(let token):
             guard token.count == Self.ackTokenLength else { throw CommandEncodingError.invalidArgument("ack token must be \(Self.ackTokenLength) bytes") }
             id = .historicalDataResult
             data = [0x01] + token   // 0x01 = success, followed by the HistoryEnd token
-        default:
+        case .readBattery, .abortHistory:
             throw CommandEncodingError.unsupported(command.name)
         }
-        return Whoop5Wire.frame(payload: [PacketType.command.rawValue, sequence, id.rawValue] + data)
+        let bytes = try Whoop5Wire.frame(payload: [PacketType.command.rawValue, sequence, id.rawValue] + data)
+        return EncodedCommand(command: command, sequence: sequence, bytes: bytes)
     }
 
     public func makeDecoder() -> any DeviceDecoder { Whoop5Decoder() }
 
-    /// Wraps a bare payload in a WHOOP 5.0 frame. Used by tools and tests to feed payload-only
-    /// captures through the normal decoder.
-    public static func frame(payload: [UInt8]) -> [UInt8] { Whoop5Wire.frame(payload: payload) }
+    /// Wraps a bare payload in a WHOOP 5.0 frame so tools and tests can feed payload-only captures
+    /// through the normal decoder. The result is plain bytes: it cannot be written to a band, because
+    /// links accept only adapter-encoded commands.
+    public static func frame(payload: [UInt8]) throws -> [UInt8] { try Whoop5Wire.frame(payload: payload) }
+
+    /// Which allowlisted command a response's command id answers.
+    static func answeredCommand(_ id: UInt8) -> AllowedCommand.Kind? {
+        switch CommandID(rawValue: id) {
+        case .getHello: return .identify
+        case .getClock: return .readClock
+        case .getDataRange: return .readHistoryRange
+        case .sendHistoricalData: return .requestHistory
+        case .historicalDataResult: return .acknowledgeHistory
+        case .toggleRealtimeHR: return .setRealtimeHeartRate
+        case .abortHistoricalTransmits: return .abortHistory
+        case .none: return nil
+        }
+    }
+
+    /// 1 success and 2 pending are agreed by every public source. 0 is contested (the reference client
+    /// calls it FAILURE, the reference emulator counts it as success), so it is `.unknown`; Forma only
+    /// proceeds on an explicit success. Anything else (3 UNSUPPORTED, …) is a refusal.
+    static func status(ofResult result: UInt8) -> CommandStatus {
+        switch result {
+        case resultSuccess: return .success
+        case resultPending: return .pending
+        case 0: return .unknown
+        default: return .rejected
+        }
+    }
+}
+
+public enum FrameBuildError: Error, Equatable, Sendable {
+    case payloadTooLarge(bytes: Int, maximum: Int)
 }
 
 // MARK: - Wire helpers (CRCs, little-endian reads, frame building)
@@ -127,8 +175,10 @@ public struct Whoop5Adapter: DeviceAdapter {
 enum Whoop5Wire {
     static let startOfFrame: UInt8 = 0xAA
     static let headerLength = 8
-    /// Largest declared length Forma accepts (the largest public record is ~2 KB).
-    static let maxDeclaredLength = 16_384
+    /// The declared length is a u16; every value from 4 up is structurally possible.
+    static let maxDeclaredLength = Int(UInt16.max)
+    /// Largest payload the builder accepts (padded payload + 4 must fit the u16 length field).
+    static let maxPayloadLength = maxDeclaredLength - 4 - 3
 
     /// CRC-16/MODBUS: poly 0x8005 reflected (0xA001), init 0xFFFF, no final xor.
     static func crc16Modbus<C: Collection>(_ bytes: C) -> UInt16 where C.Element == UInt8 {
@@ -170,7 +220,10 @@ enum Whoop5Wire {
     }
 
     /// Builds a frame: pads the payload with zeros to a multiple of 4, then adds header and CRCs.
-    static func frame(payload: [UInt8]) -> [UInt8] {
+    static func frame(payload: [UInt8]) throws -> [UInt8] {
+        guard payload.count <= maxPayloadLength else {
+            throw FrameBuildError.payloadTooLarge(bytes: payload.count, maximum: maxPayloadLength)
+        }
         var padded = payload
         while padded.count % 4 != 0 { padded.append(0) }
         let declared = UInt16(padded.count + 4)
@@ -187,8 +240,16 @@ enum Whoop5Wire {
 // MARK: - Frame reassembly
 
 /// Reassembles WHOOP 5.0 frames from notification chunks for one characteristic.
-/// The header CRC is checked BEFORE the declared length is trusted, so a stray 0xAA inside data cannot
-/// desynchronize the stream. The buffer is bounded.
+///
+/// - The header CRC is checked BEFORE the declared length is trusted.
+/// - A frame whose payload CRC fails costs only its start byte: scanning resumes at the next byte, so
+///   genuine frames inside a bogus or truncated span are recovered (each has its own two CRCs).
+/// - While a long frame is still arriving, the bytes after its start are searched for a complete
+///   frame that passes both CRCs; finding one proves the pending frame was truncated, and its start byte
+///   is dropped. Frames and reported counts are the same however notifications split the stream.
+/// - Each frame carries the receive time of the notification that held its first byte.
+/// - The buffer holds at most one pending frame (≤ 8 + 65 535 bytes) plus the latest chunk; garbage
+///   without a start byte is discarded immediately. Bytes are consumed through a read index (linear time).
 struct Whoop5Deframer {
     enum Output: Equatable {
         case frame(payload: [UInt8], receivedAt: EpochMillis)
@@ -197,71 +258,146 @@ struct Whoop5Deframer {
     }
 
     private var buffer: [UInt8] = []
-    private var firstChunkTime: EpochMillis?
-    static let maxBuffer = Whoop5Wire.maxDeclaredLength * 2
+    private var start = 0
+    /// (buffer index of a chunk's first byte, its receive time), ascending.
+    private var chunkTimes: [(index: Int, at: EpochMillis)] = []
+    /// Where the truncation look-ahead resumes for the current pending frame.
+    private var lookaheadFrom: Int?
+
+    var pendingByteCount: Int { buffer.count - start }
 
     mutating func append(_ chunk: [UInt8], receivedAt: EpochMillis) -> [Output] {
-        if buffer.isEmpty { firstChunkTime = receivedAt }
+        guard !chunk.isEmpty else { return [] }
+        compact()
+        chunkTimes.append((buffer.count, receivedAt))
         buffer.append(contentsOf: chunk)
         var out: [Output] = []
-        while true {
+        while start < buffer.count {
             // 1. Skip to the next start-of-frame byte.
-            guard let sof = buffer.firstIndex(of: Whoop5Wire.startOfFrame) else {
-                if !buffer.isEmpty { out.append(.discarded(byteCount: buffer.count)) }
-                buffer.removeAll()
-                firstChunkTime = nil
+            guard let sof = buffer[start...].firstIndex(of: Whoop5Wire.startOfFrame) else {
+                out.append(.discarded(byteCount: buffer.count - start))
+                consume(to: buffer.count)
                 break
             }
-            if sof > 0 {
-                out.append(.discarded(byteCount: sof))
-                buffer.removeFirst(sof)
+            if sof > start {
+                out.append(.discarded(byteCount: sof - start))
+                consume(to: sof)
             }
             // 2. Need a full header.
-            guard buffer.count >= Whoop5Wire.headerLength else { break }
-            let storedHeaderCRC = Whoop5Wire.u16(buffer, 6) ?? 0
-            let computed = Whoop5Wire.crc16Modbus(buffer[0..<6])
-            guard storedHeaderCRC == computed else {
+            guard buffer.count - start >= Whoop5Wire.headerLength else { break }
+            guard headerIsValid(at: start) else {
                 // Not a real header: drop this 0xAA and resynchronize.
                 out.append(.discarded(byteCount: 1))
-                buffer.removeFirst()
+                consume(to: start + 1)
                 continue
             }
-            let declared = Int(Whoop5Wire.u16(buffer, 2) ?? 0)
-            guard declared >= 4, declared <= Whoop5Wire.maxDeclaredLength else {
-                out.append(.malformed(reason: "declared length \(declared) out of range", byteCount: Whoop5Wire.headerLength))
-                buffer.removeFirst(Whoop5Wire.headerLength)
+            let declared = Int(Whoop5Wire.u16(buffer, start + 2) ?? 0)
+            guard declared >= 4 else {
+                out.append(.malformed(reason: "declared length \(declared) out of range", byteCount: 1))
+                consume(to: start + 1)
                 continue
             }
             let total = Whoop5Wire.headerLength + declared
-            // 3. Wait for the whole frame.
-            guard buffer.count >= total else {
-                if buffer.count > Self.maxBuffer {
-                    out.append(.discarded(byteCount: buffer.count))
-                    buffer.removeAll()
-                    firstChunkTime = nil
+            // 3. Complete frame: check the payload CRC.
+            if buffer.count - start >= total {
+                lookaheadFrom = nil
+                if payloadIsValid(at: start, total: total) {
+                    let payload = Array(buffer[(start + Whoop5Wire.headerLength)..<(start + total - 4)])
+                    out.append(.frame(payload: payload, receivedAt: time(of: start)))
+                    consume(to: start + total)
+                } else {
+                    out.append(.malformed(reason: "payload CRC mismatch", byteCount: 1))
+                    consume(to: start + 1)
                 }
-                break
+                continue
             }
-            let payload = Array(buffer[Whoop5Wire.headerLength..<(total - 4)])
-            let storedCRC = Whoop5Wire.u32(buffer, total - 4) ?? 0
-            let at = firstChunkTime ?? receivedAt
-            if Whoop5Wire.crc32(payload) == storedCRC {
-                out.append(.frame(payload: payload, receivedAt: at))
-            } else {
-                out.append(.malformed(reason: "payload CRC mismatch", byteCount: total))
+            // 4. Still arriving: a complete valid frame starting inside the pending span means it was truncated.
+            //    Like a CRC failure, that costs only the start byte; rescanning then reaches the valid frame
+            //    (so the outcome does not depend on how notifications split the stream).
+            if completeFrameStart(after: start) != nil {
+                out.append(.malformed(reason: "frame truncated (declared \(declared) bytes)", byteCount: 1))
+                consume(to: start + 1)
+                lookaheadFrom = nil
+                continue
             }
-            buffer.removeFirst(total)
-            firstChunkTime = buffer.isEmpty ? nil : receivedAt
+            break
         }
         return out
     }
 
     /// Drops any partial frame (disconnect). Returns the number of bytes discarded.
     mutating func reset() -> Int {
-        let n = buffer.count
+        let n = buffer.count - start
         buffer.removeAll()
-        firstChunkTime = nil
+        start = 0
+        chunkTimes.removeAll()
+        lookaheadFrom = nil
         return n
+    }
+
+    // MARK: Helpers
+
+    private func headerIsValid(at i: Int) -> Bool {
+        guard let stored = Whoop5Wire.u16(buffer, i + 6) else { return false }
+        return Whoop5Wire.crc16Modbus(buffer[i..<(i + 6)]) == stored
+    }
+
+    private func payloadIsValid(at i: Int, total: Int) -> Bool {
+        guard let stored = Whoop5Wire.u32(buffer, i + total - 4) else { return false }
+        return Whoop5Wire.crc32(buffer[(i + Whoop5Wire.headerLength)..<(i + total - 4)]) == stored
+    }
+
+    /// First index after `pending` where a complete frame passing both CRCs starts, if any. Candidates
+    /// that are not complete yet are revisited on the next append (the search resumes at the first one).
+    private mutating func completeFrameStart(after pending: Int) -> Int? {
+        var j = max(pending + 1, lookaheadFrom ?? 0)
+        var firstUndecided: Int?
+        while j + Whoop5Wire.headerLength <= buffer.count, let k = buffer[j...].firstIndex(of: Whoop5Wire.startOfFrame) {
+            j = k
+            guard j + Whoop5Wire.headerLength <= buffer.count else { break }
+            if headerIsValid(at: j) {
+                let declared = Int(Whoop5Wire.u16(buffer, j + 2) ?? 0)
+                let total = Whoop5Wire.headerLength + declared
+                if declared >= 4 {
+                    if j + total <= buffer.count {
+                        if payloadIsValid(at: j, total: total) { return j }
+                    } else if firstUndecided == nil {
+                        firstUndecided = j
+                    }
+                }
+            }
+            j += 1
+        }
+        lookaheadFrom = firstUndecided ?? max(pending + 1, buffer.count - Whoop5Wire.headerLength + 1)
+        return nil
+    }
+
+    private func time(of index: Int) -> EpochMillis {
+        var at = chunkTimes.first?.at ?? 0
+        for entry in chunkTimes {
+            if entry.index <= index { at = entry.at } else { break }
+        }
+        return at
+    }
+
+    private mutating func consume(to index: Int) {
+        start = min(index, buffer.count)
+        // Keep only the chunk entry that covers `start` and later ones.
+        while chunkTimes.count > 1, chunkTimes[1].index <= start { chunkTimes.removeFirst() }
+        if start == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+            start = 0
+            chunkTimes.removeAll()
+            lookaheadFrom = nil
+        }
+    }
+
+    private mutating func compact() {
+        guard start > 0 else { return }
+        buffer.removeFirst(start)
+        chunkTimes = chunkTimes.map { (max(0, $0.index - start), $0.at) }
+        if let l = lookaheadFrom { lookaheadFrom = max(0, l - start) }
+        start = 0
     }
 }
 
@@ -280,7 +416,15 @@ public final class Whoop5Decoder: DeviceDecoder {
         98: "HIGH_FREQ_SYNC_DISABLED", 109: "BATTERY_PACK_INFO", 123: "GENERIC_FIRMWARE_EVENT",
     ]
 
+    /// Record kinds whose content Forma decodes (heart-rate candidate and/or motion summary).
+    static let decodedKinds: Set<UInt8> = [7, 9, 10, 12, 18, 24]
+
     public init() {}
+
+    public func pendingPartialBytes(excluding characteristic: String) -> Int {
+        let excluded = UUIDs.normalize(characteristic)
+        return deframers.reduce(0) { $0 + ($1.key == excluded ? 0 : $1.value.pendingByteCount) }
+    }
 
     public func decode(characteristic: String, bytes: [UInt8], receivedAt: EpochMillis) -> [DecodedEvent] {
         let c = UUIDs.normalize(characteristic)
@@ -311,7 +455,7 @@ public final class Whoop5Decoder: DeviceDecoder {
 
     public func reset(at time: EpochMillis) -> [DecodedEvent] {
         var events: [DecodedEvent] = []
-        for (c, var d) in deframers {
+        for (c, var d) in deframers.sorted(by: { $0.key < $1.key }) {
             let n = d.reset()
             if n > 0 { events.append(.discarded(byteCount: n, characteristic: c, receivedAt: time)) }
         }
@@ -326,8 +470,18 @@ public final class Whoop5Decoder: DeviceDecoder {
         switch Whoop5Adapter.PacketType(rawValue: typeByte) {
         case .commandResponse:
             guard p.count >= 5 else { return [.malformed(reason: "response shorter than 5 bytes", byteCount: p.count, characteristic: characteristic, receivedAt: receivedAt)] }
-            return [.commandResponse(CommandResponse(command: p[2], sequence: p[1], originSequence: p[3], resultCode: p[4],
-                                                     data: Array(p[5...]), receivedAt: receivedAt))]
+            let data = Array(p[5...])
+            let response = CommandResponse(command: p[2], sequence: p[1], originSequence: p[3], resultCode: p[4], data: data,
+                                           receivedAt: receivedAt, answers: Whoop5Adapter.answeredCommand(p[2]),
+                                           status: Whoop5Adapter.status(ofResult: p[4]))
+            var events: [DecodedEvent] = [.commandResponse(response)]
+            if p[2] == Whoop5Adapter.CommandID.getClock.rawValue, p[4] == Whoop5Adapter.resultSuccess,
+               let seconds = Whoop5Wire.u32(data, 0), let sub = Whoop5Wire.u32(data, 4) {
+                // Sub-seconds are 1/32768 s per the reference client; anything out of range is ignored.
+                let subMillis: Int? = sub < 32_768 ? Int(sub) * 1_000 / 32_768 : nil
+                events.append(.clockReading(deviceSeconds: seconds, subsecondMillis: subMillis, receivedAt: receivedAt))
+            }
+            return events
         case .event:
             guard let id = Whoop5Wire.u16(p, 2) else { return [.malformed(reason: "event shorter than 4 bytes", byteCount: p.count, characteristic: characteristic, receivedAt: receivedAt)] }
             // The event timestamp layout is not confirmed by real captures, so it is not used.
@@ -345,54 +499,83 @@ public final class Whoop5Decoder: DeviceDecoder {
             default: return [.unknownPacket(packetType: typeByte, length: p.count, characteristic: characteristic, receivedAt: receivedAt)]
             }
         case .historicalData:
-            return [decodeDataRecord(p, characteristic: characteristic, receivedAt: receivedAt)].compactMap { $0 }
-        case .realtimeData, .realtimeRawData, .realtimeIMU, .historicalIMU, .command, .consoleLogs, .none:
+            return [decodeHistoryRecord(p, characteristic: characteristic, receivedAt: receivedAt)]
+        case .historicalIMU:
+            // Part of a history transfer, but Forma does not store raw IMU streams: reported as undecoded
+            // history so a chunk containing it is never acknowledged.
+            guard p.count >= 13, let counter = Whoop5Wire.u32(p, 3), let seconds = Whoop5Wire.u32(p, 7), let sub = Whoop5Wire.u16(p, 11) else {
+                return [.malformed(reason: "history IMU frame shorter than its 13-byte header", byteCount: p.count, characteristic: characteristic, receivedAt: receivedAt)]
+            }
+            return [.historyRecord(HistoryRecord(kind: p[1], counter: counter, deviceSeconds: seconds, subseconds: sub, receivedAt: receivedAt,
+                                                 heartRate: nil, heartRateStatus: .unvalidated, beatIntervalsMillis: [], motion: nil,
+                                                 payloadLength: p.count, contentDecoded: false))]
+        case .realtimeData, .realtimeRawData, .realtimeIMU:
+            if p.count >= 13, let seconds = Whoop5Wire.u32(p, 7), let bpm = Self.heartRateCandidate(p) {
+                return [.realtimeHeartRate(bpm: bpm, deviceSeconds: seconds, status: .unvalidated, receivedAt: receivedAt)]
+            }
+            return [.unknownPacket(packetType: typeByte, length: p.count, characteristic: characteristic, receivedAt: receivedAt)]
+        case .command, .consoleLogs, .none:
             return [.unknownPacket(packetType: typeByte, length: p.count, characteristic: characteristic, receivedAt: receivedAt)]
         }
     }
 
+    /// Heart-rate candidate byte by record kind (public research; meaning unvalidated). 0 means "no reading".
+    static func heartRateCandidate(_ p: [UInt8]) -> Int? {
+        guard p.count >= 2 else { return nil }
+        let offset: Int
+        switch p[1] {
+        case 9, 10, 12, 24: offset = 17
+        case 18: offset = 14
+        case 7: offset = 27
+        default: return nil
+        }
+        guard offset < p.count, p[offset] != 0 else { return nil }
+        return Int(p[offset])
+    }
+
     /// Common 13-byte data header, then per-kind body fields.
-    func decodeDataRecord(_ p: [UInt8], characteristic: String, receivedAt: EpochMillis) -> DecodedEvent? {
+    func decodeHistoryRecord(_ p: [UInt8], characteristic: String, receivedAt: EpochMillis) -> DecodedEvent {
         guard p.count >= 13, let counter = Whoop5Wire.u32(p, 3), let seconds = Whoop5Wire.u32(p, 7), let sub = Whoop5Wire.u16(p, 11) else {
             return .malformed(reason: "data record shorter than its 13-byte header", byteCount: p.count, characteristic: characteristic, receivedAt: receivedAt)
         }
         let kind = p[1]
-        var heartRate: Int?
-        var motion: MotionSummary?
-        let hrOffset: Int?
-        switch kind {
-        case 9, 12, 24: hrOffset = 17
-        case 18: hrOffset = 14
-        case 7: hrOffset = 27
-        case 10: hrOffset = 17
-        default: hrOffset = nil
-        }
-        if let o = hrOffset, o < p.count, p[o] != 0 { heartRate = Int(p[o]) }
-        if kind == 10 { motion = Self.motionSummaryK10(p) }
+        let decoded = Self.decodedKinds.contains(kind)
         return .historyRecord(HistoryRecord(kind: kind, counter: counter, deviceSeconds: seconds, subseconds: sub, receivedAt: receivedAt,
-                                            heartRate: heartRate, heartRateStatus: .unvalidated, beatIntervalsMillis: [],
-                                            motion: motion, payloadLength: p.count))
+                                            heartRate: decoded ? Self.heartRateCandidate(p) : nil, heartRateStatus: .unvalidated,
+                                            beatIntervalsMillis: [], motion: kind == 10 ? Self.motionSummaryK10(p) : nil,
+                                            payloadLength: p.count, contentDecoded: decoded))
     }
 
+    /// Samples per axis in a K10 record (payload byte 18 holds this count in every public capture).
+    static let k10SamplesPerAxis = 100
+    /// ASSUMPTION (unverified): 50 Hz sampling, so 100 samples span 2 s. No public source states the
+    /// rate; it only matters when the user lets unvalidated motion feed sleep candidates.
+    static let k10AssumedSpanMillis: Int64 = 2_000
+
     /// K10: 100 × i16 accelerometer samples per axis at payload offsets 85 (x), 285 (y), 485 (z).
-    /// Returns nil when the record is too short to contain all three axes.
+    /// Returns nil (no measurement) when the record is too short, its sample-count byte is not 100,
+    /// or the block is zero-filled: a working accelerometer always measures gravity, so zero vectors
+    /// are absent samples, not stillness.
     static func motionSummaryK10(_ p: [UInt8]) -> MotionSummary? {
-        let count = 100
+        let count = k10SamplesPerAxis
         let offsets = [85, 285, 485]
-        guard offsets.allSatisfy({ $0 + count * 2 <= p.count }) else { return nil }
+        guard p.count > 18, Int(p[18]) == count, offsets.allSatisfy({ $0 + count * 2 <= p.count }) else { return nil }
         var magnitudes: [Double] = []
         magnitudes.reserveCapacity(count)
+        var zeroVectors = 0
         for i in 0..<count {
             guard let x = Whoop5Wire.i16(p, offsets[0] + 2 * i), let y = Whoop5Wire.i16(p, offsets[1] + 2 * i),
                   let z = Whoop5Wire.i16(p, offsets[2] + 2 * i) else { return nil }
+            if x == 0, y == 0, z == 0 { zeroVectors += 1 }
             let dx = Double(x), dy = Double(y), dz = Double(z)
             magnitudes.append((dx * dx + dy * dy + dz * dz).squareRoot())
         }
+        guard zeroVectors <= 2 else { return nil }
         let sorted = magnitudes.sorted()
         let median = (sorted[count / 2 - 1] + sorted[count / 2]) / 2
         let mean = magnitudes.reduce(0, +) / Double(count)
         let activity = magnitudes.reduce(0) { $0 + abs($1 - median) } / Double(count)
-        return MotionSummary(sampleCount: count, meanMagnitude: mean, activity: activity)
+        return MotionSummary(sampleCount: count, meanMagnitude: mean, activity: activity, spanMillis: k10AssumedSpanMillis)
     }
 }
 
@@ -447,9 +630,19 @@ enum StandardServiceParsing {
         case UUIDs.manufacturerName: field = "manufacturer"
         default: field = "software"
         }
-        let text = String(decoding: b.prefix(64), as: UTF8.self).trimmingCharacters(in: .controlCharacters.union(.whitespaces))
-        guard !text.isEmpty else { return [] }
+        guard let text = sanitizedText(b) else { return [] }
         return [.deviceInformation(field: field, value: text)]
+    }
+
+    /// Device-information strings become keys and provenance, so they are reduced to printable ASCII:
+    /// cut at the first NUL, every other character outside U+0020…U+007E removed (control, format,
+    /// bidi and replacement characters included), whitespace trimmed, at most 64 characters.
+    static func sanitizedText(_ b: [UInt8]) -> String? {
+        let prefix = b.prefix { $0 != 0 }
+        let printable = prefix.filter { (0x20...0x7E).contains($0) }
+        let text = String(decoding: printable, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        return String(text.prefix(64))
     }
 }
 
@@ -480,7 +673,7 @@ public struct StandardHeartRateAdapter: DeviceAdapter {
 
     public func supports(_ command: AllowedCommand) -> Bool { false }
 
-    public func encode(_ command: AllowedCommand, sequence: UInt8) throws -> [UInt8] {
+    public func encode(_ command: AllowedCommand, sequence: UInt8) throws -> EncodedCommand {
         throw CommandEncodingError.unsupported(command.name)
     }
 

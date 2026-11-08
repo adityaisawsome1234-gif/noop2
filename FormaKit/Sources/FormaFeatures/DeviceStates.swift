@@ -1,12 +1,13 @@
 import Foundation
 import FormaCore
 
-/// Whether Forma downloads and acknowledges the band's stored history.
+/// Whether Forma downloads the band's stored history.
 ///
-/// Acknowledging a history transfer can let the band free that data. If the official app is also in
-/// use, it may then never receive that period. Forma therefore asks the user to choose explicitly.
+/// Downloading never changes the band: Forma saves the data and, by default, does not acknowledge it,
+/// so the band keeps its copy (and another app, such as the official app, still receives it). Confirming
+/// receipt to the band is a separate, experimental setting (`AppModel.setHistoryAcknowledgement`).
 public enum HistorySyncMode: String, Hashable, Sendable, Codable, CaseIterable, Identifiable {
-    /// Live data only. Forma never requests or acknowledges band history.
+    /// Live data only. Forma never requests band history.
     case off
     /// Download history only when the user taps "Sync now".
     case manual
@@ -28,7 +29,7 @@ public enum HistorySyncMode: String, Hashable, Sendable, Codable, CaseIterable, 
         case .off:
             return "Forma records only what the band sends live while connected. Gaps cannot be recovered later, and the band's stored history is left untouched."
         case .manual, .automatic:
-            return "Forma downloads the band's stored history and confirms receipt to the band only after saving it on this iPhone. After confirmation the band may free that data, so another app (such as the official app) may no longer receive the same period."
+            return "Forma downloads the band's stored history and saves it on this iPhone. It does not confirm receipt to the band, so the band keeps its copy and may send the same period again next time; Forma skips what it already has."
         }
     }
 }

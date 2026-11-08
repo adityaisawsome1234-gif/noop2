@@ -11,18 +11,27 @@ import FormaProtocol
 public final class ReplayLink: PeripheralLink, @unchecked Sendable {
     public typealias Responder = @Sendable (_ written: [UInt8], _ characteristic: String) -> [LinkEvent]
 
+    /// One written command as the link saw it.
+    public struct Write: Hashable, Sendable {
+        public var characteristic: String
+        public var command: EncodedCommand
+        public var withResponse: Bool
+        public var bytes: [UInt8] { command.bytes }
+    }
+
     public let peripheralID: String
     public let events: AsyncStream<LinkEvent>
     private let continuation: AsyncStream<LinkEvent>.Continuation
     private let lock = NSLock()
-    private var writes: [(characteristic: String, bytes: [UInt8], withResponse: Bool)] = []
+    private var writes: [Write] = []
     private var closed = false
     private let responder: Responder?
     private let failWritesAfter: Int?
 
     /// - Parameters:
-    ///   - entries: capture entries; `.rx` become notifications, `.event` entries whose note starts with
-    ///     "disconnect" end the stream, `.tx` entries are ignored (they were our own writes).
+    ///   - entries: capture entries of ONE connection; `.rx` become notifications, an `.event` entry whose
+    ///     note starts with "disconnect" ends the stream, `.tx` entries are ignored (they were our own
+    ///     writes). Split multi-connection captures with `ReplayLink.segments(of:)` first.
     ///   - services: what `.ready` reports first.
     ///   - endWithDisconnect: append a disconnect after the last entry (default true).
     ///   - responder: scripted reactions to writes, emitted immediately after each write.
@@ -42,7 +51,7 @@ public final class ReplayLink: PeripheralLink, @unchecked Sendable {
             lastTime = e.t
             switch e.dir {
             case .rx:
-                guard let bytes = Self.hexBytes(e.d) else { continue }
+                guard let bytes = HexCodec.decode(e.d) else { continue }
                 continuation.yield(.notification(characteristic: UUIDs.normalize(e.c), bytes: bytes, receivedAt: e.t))
             case .event:
                 if (e.note ?? "").lowercased().hasPrefix("disconnect") {
@@ -64,19 +73,26 @@ public final class ReplayLink: PeripheralLink, @unchecked Sendable {
         }
     }
 
-    public func write(_ bytes: [UInt8], characteristic: String, withResponse: Bool) async throws {
+    public func write(_ command: EncodedCommand, characteristic: String, withResponse: Bool) async throws {
         let reaction: [LinkEvent] = try lock.withLock {
             if closed { throw LinkError.notConnected }
             if let limit = failWritesAfter, writes.count >= limit { throw LinkError.writeFailed("scripted failure") }
-            writes.append((UUIDs.normalize(characteristic), bytes, withResponse))
-            return responder?(bytes, UUIDs.normalize(characteristic)) ?? []
+            writes.append(Write(characteristic: UUIDs.normalize(characteristic), command: command, withResponse: withResponse))
+            return responder?(command.bytes, UUIDs.normalize(characteristic)) ?? []
         }
         for event in reaction {
-            continuation.yield(event)
             if case .disconnected = event {
-                finish()
+                // The link goes down exactly once: mark it closed before yielding the scripted disconnect.
+                let wasClosed = lock.withLock { () -> Bool in
+                    let was = closed
+                    closed = true
+                    return was
+                }
+                if !wasClosed { continuation.yield(event) }
+                continuation.finish()
                 break
             }
+            continuation.yield(event)
         }
     }
 
@@ -93,31 +109,25 @@ public final class ReplayLink: PeripheralLink, @unchecked Sendable {
         continuation.finish()
     }
 
-    /// Everything written so far (characteristic, bytes, with-response flag).
-    public var writtenCommands: [(characteristic: String, bytes: [UInt8], withResponse: Bool)] {
+    /// Everything written so far, in order.
+    public var writtenCommands: [Write] {
         lock.withLock { writes }
     }
 
-    static func hexBytes(_ hex: String) -> [UInt8]? {
-        let chars = Array(hex.utf8)
-        guard chars.count % 2 == 0 else { return nil }
-        var out: [UInt8] = []
-        out.reserveCapacity(chars.count / 2)
-        var i = 0
-        while i < chars.count {
-            guard let hi = nibble(chars[i]), let lo = nibble(chars[i + 1]) else { return nil }
-            out.append(hi << 4 | lo)
-            i += 2
+    /// Splits a capture into one entry list per connection. Each segment ends with its "disconnect"
+    /// event (if any); "ready" events start nothing on their own. Entries after the last disconnect form
+    /// a final segment.
+    public static func segments(of entries: [CaptureEntry]) -> [[CaptureEntry]] {
+        var out: [[CaptureEntry]] = []
+        var current: [CaptureEntry] = []
+        for e in entries {
+            current.append(e)
+            if e.dir == .event, (e.note ?? "").lowercased().hasPrefix("disconnect") {
+                out.append(current)
+                current = []
+            }
         }
+        if current.contains(where: { $0.dir != .event }) { out.append(current) }
         return out
-    }
-
-    private static func nibble(_ c: UInt8) -> UInt8? {
-        switch c {
-        case 48...57: return c - 48
-        case 65...70: return c - 55
-        case 97...102: return c - 87
-        default: return nil
-        }
     }
 }

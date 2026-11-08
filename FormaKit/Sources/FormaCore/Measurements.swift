@@ -143,7 +143,9 @@ public struct MotionEpoch: Hashable, Sendable, Codable {
     public var deviceID: String
     public var timestamp: EpochMillis
     public var epochMillis: Int64
-    /// Mean of |acceleration magnitude − 1 g| over the epoch, in g (ENMO-like, truncated at 0).
+    /// Movement intensity over the epoch, in source-specific units (for WHOOP 5.0 band history: mean
+    /// absolute deviation of the accelerometer magnitude from its median, in raw device counts — scale
+    /// unpublished). Analytics use only thresholds relative to the user's own data, never absolute units.
     public var activity: Double
     /// Number of raw accelerometer samples that contributed (0 means no motion data for the epoch).
     public var sampleCount: Int

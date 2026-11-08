@@ -95,6 +95,41 @@ public enum AllowedCommand: Hashable, Sendable {
         case .abortHistory: return "abortHistory"
         }
     }
+
+    /// The command without its arguments (used to match responses to requests).
+    public enum Kind: String, Hashable, Sendable, Codable, CaseIterable {
+        case identify, readBattery, readClock, readHistoryRange, setRealtimeHeartRate, requestHistory, acknowledgeHistory, abortHistory
+    }
+
+    public var kind: Kind {
+        switch self {
+        case .identify: return .identify
+        case .readBattery: return .readBattery
+        case .readClock: return .readClock
+        case .readHistoryRange: return .readHistoryRange
+        case .setRealtimeHeartRate: return .setRealtimeHeartRate
+        case .requestHistory: return .requestHistory
+        case .acknowledgeHistory: return .acknowledgeHistory
+        case .abortHistory: return .abortHistory
+        }
+    }
+}
+
+/// The bytes an adapter produced for one allowlisted command.
+///
+/// Only code inside FormaProtocol (the adapters) can create a value: the initializer is internal. The
+/// sync engine and every `PeripheralLink` accept only `EncodedCommand`, so arbitrary bytes — a reset,
+/// erase or firmware command built by hand — cannot reach a band's command characteristic.
+public struct EncodedCommand: Hashable, Sendable {
+    public let command: AllowedCommand
+    public let sequence: UInt8
+    public let bytes: [UInt8]
+
+    init(command: AllowedCommand, sequence: UInt8, bytes: [UInt8]) {
+        self.command = command
+        self.sequence = sequence
+        self.bytes = bytes
+    }
 }
 
 public enum CommandEncodingError: Error, Equatable, Sendable {
@@ -113,6 +148,8 @@ public enum CapabilityStatus: String, Hashable, Sendable, Codable {
     case documentedUnverified
     /// A decoded field exists but its meaning is not validated; data is stored as evidence and not used in metrics.
     case candidateUnvalidated
+    /// Public evidence neither confirms nor rules it out for this family; only the hardware check can tell.
+    case unknown
     /// Not available on this family/firmware as far as Forma knows.
     case unsupported
 }
@@ -151,11 +188,15 @@ public struct MotionSummary: Hashable, Sendable {
     /// Mean absolute deviation of the vector magnitude from its median, in device counts. Scale-free
     /// with respect to gravity and orientation; used as the "activity" value of a motion epoch.
     public var activity: Double
+    /// Time span the samples cover, in ms. Adapters state how they know it (see the adapter's docs);
+    /// an assumed sample rate must be documented there.
+    public var spanMillis: Int64
 
-    public init(sampleCount: Int, meanMagnitude: Double, activity: Double) {
+    public init(sampleCount: Int, meanMagnitude: Double, activity: Double, spanMillis: Int64) {
         self.sampleCount = sampleCount
         self.meanMagnitude = meanMagnitude
         self.activity = activity
+        self.spanMillis = spanMillis
     }
 }
 
@@ -177,9 +218,14 @@ public struct HistoryRecord: Hashable, Sendable {
     public var beatIntervalsMillis: [Double]
     public var motion: MotionSummary?
     public var payloadLength: Int
+    /// False when the adapter recognises the frame as stored history but does not decode its content
+    /// (an unknown record kind or a history stream Forma does not store). The sync engine never
+    /// acknowledges a chunk containing such records, so the band keeps that data.
+    public var contentDecoded: Bool
 
     public init(kind: UInt8, counter: UInt32, deviceSeconds: UInt32, subseconds: UInt16, receivedAt: EpochMillis,
-                heartRate: Int?, heartRateStatus: FieldStatus, beatIntervalsMillis: [Double], motion: MotionSummary?, payloadLength: Int) {
+                heartRate: Int?, heartRateStatus: FieldStatus, beatIntervalsMillis: [Double], motion: MotionSummary?, payloadLength: Int,
+                contentDecoded: Bool = true) {
         self.kind = kind
         self.counter = counter
         self.deviceSeconds = deviceSeconds
@@ -190,6 +236,7 @@ public struct HistoryRecord: Hashable, Sendable {
         self.beatIntervalsMillis = beatIntervalsMillis
         self.motion = motion
         self.payloadLength = payloadLength
+        self.contentDecoded = contentDecoded
     }
 }
 
@@ -207,6 +254,18 @@ public struct HistoryMarker: Hashable, Sendable {
     }
 }
 
+/// How the device answered a command, as interpreted by the adapter.
+public enum CommandStatus: Hashable, Sendable {
+    /// The device accepted or completed the command.
+    case success
+    /// The device is still working on it; a final answer follows.
+    case pending
+    /// The device refused or failed the command.
+    case rejected
+    /// The adapter cannot interpret the result.
+    case unknown
+}
+
 public struct CommandResponse: Hashable, Sendable {
     public var command: UInt8
     public var sequence: UInt8
@@ -214,14 +273,20 @@ public struct CommandResponse: Hashable, Sendable {
     public var resultCode: UInt8?
     public var data: [UInt8]
     public var receivedAt: EpochMillis
+    /// The allowlisted command this response answers, when the adapter recognises the command id.
+    public var answers: AllowedCommand.Kind?
+    public var status: CommandStatus
 
-    public init(command: UInt8, sequence: UInt8, originSequence: UInt8?, resultCode: UInt8?, data: [UInt8], receivedAt: EpochMillis) {
+    public init(command: UInt8, sequence: UInt8, originSequence: UInt8?, resultCode: UInt8?, data: [UInt8], receivedAt: EpochMillis,
+                answers: AllowedCommand.Kind? = nil, status: CommandStatus = .unknown) {
         self.command = command
         self.sequence = sequence
         self.originSequence = originSequence
         self.resultCode = resultCode
         self.data = data
         self.receivedAt = receivedAt
+        self.answers = answers
+        self.status = status
     }
 }
 
@@ -252,7 +317,8 @@ public enum DecodedEvent: Hashable, Sendable {
     case commandResponse(CommandResponse)
     case deviceEvent(DeviceEventRecord)
     case batteryLevel(percent: Int, receivedAt: EpochMillis)
-    case clockReading(deviceSeconds: UInt32, receivedAt: EpochMillis)
+    /// The band's real-time clock: Unix seconds plus, when the adapter knows the unit, the sub-second part in ms.
+    case clockReading(deviceSeconds: UInt32, subsecondMillis: Int?, receivedAt: EpochMillis)
     case deviceInformation(field: String, value: String)
     /// A valid frame of a packet type the decoder does not interpret.
     case unknownPacket(packetType: UInt8, length: Int, characteristic: String, receivedAt: EpochMillis)
@@ -270,6 +336,17 @@ public protocol DeviceDecoder: AnyObject {
     func decode(characteristic: String, bytes: [UInt8], receivedAt: EpochMillis) -> [DecodedEvent]
     /// Drop partial frames (call on disconnect). Returns events describing what was discarded.
     func reset(at time: EpochMillis) -> [DecodedEvent]
+    /// Bytes held as an incomplete frame on characteristics other than `characteristic`. Checked when a
+    /// history end marker arrives on `characteristic`: bytes still pending elsewhere mean part of the
+    /// chunk is missing, so the chunk must not be acknowledged. (On the marker's own characteristic,
+    /// pending bytes belong to the NEXT frame; a truncated frame before the marker is already reported
+    /// as malformed by the reassembler.)
+    func pendingPartialBytes(excluding characteristic: String) -> Int
+}
+
+public extension DeviceDecoder {
+    /// Decoders without frame reassembly never hold partial frames.
+    func pendingPartialBytes(excluding characteristic: String) -> Int { 0 }
 }
 
 /// Everything family-specific. Adding a band means adding an adapter; nothing else changes.
@@ -282,6 +359,6 @@ public protocol DeviceAdapter: Sendable {
     /// Whether `encode` will produce bytes for this command on this adapter.
     func supports(_ command: AllowedCommand) -> Bool
     /// Encodes an allowed command. Throws `CommandEncodingError.unsupported` for anything not supported.
-    func encode(_ command: AllowedCommand, sequence: UInt8) throws -> [UInt8]
+    func encode(_ command: AllowedCommand, sequence: UInt8) throws -> EncodedCommand
     func makeDecoder() -> any DeviceDecoder
 }

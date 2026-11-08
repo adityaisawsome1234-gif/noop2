@@ -87,6 +87,8 @@ public struct CaptureFile: Sendable {
 
     /// Maximum accepted line length (bytes) — bounds memory when reading untrusted files.
     public static let maxLineBytes = 256 * 1024
+    /// Entry times outside this range (ms since 1970 up to 2100-01-01) are rejected as malformed.
+    public static let plausibleTimes: ClosedRange<EpochMillis> = 0...4_102_444_800_000
 
     public func encoded() throws -> Data {
         let encoder = JSONEncoder()
@@ -133,8 +135,11 @@ public struct CaptureFile: Sendable {
         for (index, line) in nonEmpty.dropFirst() {
             do {
                 let entry = try decoder.decode(CaptureEntry.self, from: line)
-                guard entry.d.count % 2 == 0, entry.d.allSatisfy({ $0.isHexDigit }) else {
-                    throw CaptureFileError.invalidEntry(line: index + 1, reason: "payload is not hex")
+                guard HexCodec.decode(entry.d) != nil else {
+                    throw CaptureFileError.invalidEntry(line: index + 1, reason: "payload is not ASCII hex")
+                }
+                guard Self.plausibleTimes.contains(entry.t) else {
+                    throw CaptureFileError.invalidEntry(line: index + 1, reason: "time \(entry.t) outside 1970–2100")
                 }
                 entries.append(entry)
             } catch {
@@ -149,10 +154,12 @@ public struct CaptureFile: Sendable {
     }
 }
 
-/// Collects a bounded capture in memory during a diagnostics session.
+/// Collects a bounded capture in memory during a diagnostics session. Recording is O(1): a ring
+/// buffer keeps the newest `maxEntries` entries.
 public final class CaptureRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var entries: [CaptureEntry] = []
+    private var ring: [CaptureEntry] = []
+    private var head = 0          // index of the oldest entry once the ring is full
     private var droppedCount = 0
     public let maxEntries: Int
 
@@ -162,11 +169,19 @@ public final class CaptureRecorder: @unchecked Sendable {
 
     public func record(_ entry: CaptureEntry) {
         lock.lock(); defer { lock.unlock() }
-        if entries.count >= maxEntries {
-            entries.removeFirst(entries.count - maxEntries + 1)
+        if ring.count < maxEntries {
+            ring.append(entry)
+        } else {
+            ring[head] = entry
+            head = (head + 1) % maxEntries
             droppedCount += 1
         }
-        entries.append(entry)
+    }
+
+    /// Entries currently held (cheap; for UI counters).
+    public var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return ring.count
     }
 
     public var dropped: Int {
@@ -176,12 +191,14 @@ public final class CaptureRecorder: @unchecked Sendable {
 
     public func snapshot(header: CaptureHeader) -> CaptureFile {
         lock.lock(); defer { lock.unlock() }
-        return CaptureFile(header: header, entries: entries)
+        let ordered = head == 0 ? ring : Array(ring[head...] + ring[..<head])
+        return CaptureFile(header: header, entries: ordered)
     }
 
     public func clear() {
         lock.lock(); defer { lock.unlock() }
-        entries.removeAll()
+        ring.removeAll()
+        head = 0
         droppedCount = 0
     }
 }

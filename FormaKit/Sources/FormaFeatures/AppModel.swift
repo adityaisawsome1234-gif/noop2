@@ -66,6 +66,8 @@ public final class AppModel {
     public internal(set) var collectionEnabled: Bool
     public internal(set) var liveHeartRateEnabled: Bool
     public internal(set) var historySyncMode: HistorySyncMode = .off
+    /// Experimental and off by default; see `setHistoryAcknowledgement(_:)`.
+    public internal(set) var historyAcknowledgementEnabled = false
     public internal(set) var connectionEvents: [ConnectionEvent] = []
     public internal(set) var isRunningCompatibilityTest = false
     public internal(set) var profile = UserProfile()
@@ -151,6 +153,7 @@ public final class AppModel {
         guard let s = liveStore else { return }
         profile = (try? s.userProfile()) ?? UserProfile()
         historySyncMode = HistorySyncMode(rawValue: (try? s.setting(forKey: "historySyncMode")) ?? "" ) ?? .off
+        historyAcknowledgementEnabled = ((try? s.setting(forKey: "historyAcknowledgement")) ?? nil) == "1"
         zoneMethod = ZoneMethodChoice(rawValue: (try? s.setting(forKey: "zoneMethod")) ?? "") ?? .percentOfMax
         showExperimentalReadiness = ((try? s.setting(forKey: "showReadiness")) ?? "1") == "1"
         allowUnvalidatedMotion = ((try? s.setting(forKey: "allowUnvalidatedMotion")) ?? "0") == "1"
