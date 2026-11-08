@@ -15,6 +15,7 @@ let package = Package(
             targets: ["FormaCore", "FormaProtocol", "FormaSync", "FormaStore", "FormaAnalytics", "FormaFeatures"]
         ),
         .executable(name: "forma-replay", targets: ["FormaReplayCLI"]),
+        .executable(name: "forma-docs", targets: ["FormaDocsCLI"]),
     ],
     targets: [
         // Shared value types: time, measurements, provenance, quality flags, metric results.
@@ -53,6 +54,9 @@ let package = Package(
             name: "FormaReplayCLI",
             dependencies: ["FormaCore", "FormaProtocol", "FormaSync", "FormaStore"]
         ),
+
+        // Prints METHODOLOGY.md from the analytics MetricCatalog (documentation generated from code).
+        .executableTarget(name: "FormaDocsCLI", dependencies: ["FormaCore", "FormaAnalytics"]),
 
         .testTarget(name: "FormaProtocolTests", dependencies: ["FormaProtocol"], resources: [.copy("Fixtures")]),
         .testTarget(name: "FormaSyncTests", dependencies: ["FormaSync", "FormaStore", "FormaProtocol"]),
